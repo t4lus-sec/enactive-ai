@@ -1,0 +1,46 @@
+[package]
+name = "s0ma"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The terminal's flow control and job-control signals (tty_guard.rs). Already in
+# the tree under crossterm.
+libc = "0.2"
+memchr = "2"
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls",
+] }
+
+# Already in the tree under reqwest. Used directly for the model's streamed
+# calls, so a wait on the server can be given up on (llm::Stream).
+tokio = { version = "1.54", default-features = false, features = ["rt", "time"] }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+# The operator's time zone by name (/tz America/Denver), daylight saving included.
+chrono-tz = "0.10"
+crossterm = "0.29.0"
+reedline = { version = "0.51", features = [
+    "idle_callback"
+] }
+base64 = "0.22.1"
+ctrlc = "3.4"
+unicode-width = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+sha2 = "0.10"
+# /mistake: the call store's compressed blobs, and the review window's diff.
+zstd = "0.13"
+similar = { version = "2", features = ["inline"] }
+# The editor's syntax colours (editor_highlight.rs): its bundled grammars,
+# with the pure-Rust regex engine (no C library to build).
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy", "parsing"] }
+
+# The call store hashes the running binary once (harness_version). Unoptimised,
+# sha2 takes over 10 s on a ~200 MB debug test binary, which outlasts the call
+# store tests' writer wait. Optimising just this crate keeps debug builds quick.
+[profile.dev.package.sha2]
+opt-level = 3
