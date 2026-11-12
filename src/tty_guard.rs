@@ -1,22 +1,22 @@
-//! Keys that would stop or freeze s0ma from outside, made harmless.
+//! Keys that would stop or freeze the agent from outside, made harmless.
 //!
-//! In raw mode every key reaches s0ma as a key. Between raw stretches (a
+//! In raw mode every key reaches the agent as a key. Between raw stretches (a
 //! moment between the prompt and a turn, a command being handled, a strike
 //! being settled), the terminal is in its ordinary mode for a moment, and
 //! two keys act on the process from outside:
 //!
-//! - **Ctrl+Z** stopped s0ma (SIGTSTP). The shell took the screen back,
-//!   s0ma's page and all, and since bash does not put raw mode back on
+//! - **Ctrl+Z** stopped the agent (SIGTSTP). The shell took the screen back,
+//!   The agent's page and all, and since bash does not put raw mode back on
 //!   `fg`, what came back read keys a line at a time and echoed them: a soft
-//!   lock that only a restart got out of. SIGTSTP is now ignored, in s0ma
+//!   lock that only a restart got out of. SIGTSTP is now ignored, in the agent
 //!   and in what it runs.
 //! - **Ctrl+S** froze the terminal's output (XOFF) until Ctrl+Q, which looks
-//!   the same as a hang. Output flow control (IXON, IXOFF) is off while s0ma
+//!   the same as a hang. Output flow control (IXON, IXOFF) is off while the agent
 //!   runs, and put back as it was when it ends.
 //!
-//! Something can still stop s0ma: SIGSTOP cannot be ignored (nano's ^T^Z
-//! sends it to its whole process group, s0ma included). On being continued,
-//! s0ma puts its raw mode back if it had it, and draws everything again: a
+//! Something can still stop the agent: SIGSTOP cannot be ignored (nano's ^T^Z
+//! sends it to its whole process group, the agent included). On being continued,
+//! the agent puts its raw mode back if it had it, and draws everything again: a
 //! SIGWINCH to itself, which every screen already answers with a full
 //! redraw.
 
@@ -66,7 +66,7 @@ fn flow_off() -> Option<libc::tcflag_t> {
     (unsafe { libc::tcsetattr(0, libc::TCSANOW, &modes) } == 0).then_some(was)
 }
 
-/// At exit: flow control as it was before s0ma.
+/// At exit: flow control as it was before the agent.
 extern "C" fn put_back() {
     let Some(flow) = ORIGINAL_FLOW.lock().ok().and_then(|original| *original) else { return };
     // SAFETY: as in `flow_off`.
@@ -89,7 +89,7 @@ extern "C" fn on_continue(_: libc::c_int) {
     }
 }
 
-/// A thread that puts the terminal right each time s0ma is continued after
+/// A thread that puts the terminal right each time the agent is continued after
 /// a stop.
 fn watch_continue() {
     let mut fds = [0 as libc::c_int; 2];
@@ -122,7 +122,7 @@ fn watch_continue() {
 }
 
 /// Continued after a stop: the shell left the terminal in its ordinary mode
-/// and its own text on s0ma's screen.
+/// and its own text on the agent's screen.
 fn resumed() {
     let _ = flow_off();
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {

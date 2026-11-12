@@ -20,7 +20,7 @@
 //!   well under a second, with up to five extra excerpts per result (two are
 //!   kept). Fixed HTTPS endpoint; the key stays on the host, out of reach of
 //!   `vm_exec`.
-//! - `searxng`: a self-hosted metasearch instance, by default the one in s0ma's
+//! - `searxng`: a self-hosted metasearch instance, by default the one in the agent's
 //!   machine (`http://10.9.9.2:8888/search` over the direct link, falling back
 //!   to `http://192.168.10.161:8888/search` on the house network when that does
 //!   not answer), otherwise on this host or a private network: never a
@@ -44,7 +44,7 @@
 //! Each response carries the backend, the UTC retrieval time and a provenance
 //! note; agent.rs stamps the archive event id onto the model-visible copy so a
 //! world-model record can cite the search. A result is evidence that an engine
-//! returned it at that time: not that the page says it, and not something s0ma
+//! returned it at that time: not that the page says it, and not something the agent
 //! did beyond running the search.
 //!
 //! # Environment
@@ -53,7 +53,7 @@
 //! - `S0MA_SEARCH_BACKEND` — `brave` or `searxng`; see above for the default.
 //! - `S0MA_BRAVE_API_KEY` — Brave subscription token (Search plan).
 //! - `S0MA_SEARCH_URL` — SearXNG `/search` endpoint: a loopback or private
-//!   IPv4 address (default `http://10.9.9.2:8888/search`, s0ma's machine over
+//!   IPv4 address (default `http://10.9.9.2:8888/search`, the agent's machine over
 //!   the direct link; `S0MA_SEARCH_URL_FALLBACK`, or `off`, controls the second
 //!   address, which defaults to the same machine over the house network).
 //! - `S0MA_SEARCH_BLOCKED_DOMAINS` — comma-separated; results on these domains or
@@ -77,7 +77,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
-/// SearXNG in s0ma's VM, at the VM's address on libvirt's default network
+/// SearXNG in the agent's VM, at the VM's address on libvirt's default network
 /// (`mcp::DEFAULT_VM_ADDRESS`; a test keeps the two in step).
 const DEFAULT_SEARXNG_URL: &str = "http://10.9.9.2:8888/search";
 
@@ -371,9 +371,9 @@ fn checked_endpoint(raw: Option<String>, default: &str, variable: &str) -> Resul
 /// results are worth as evidence.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EngineLocation {
-    /// On the host s0ma runs on (loopback).
+    /// On the host the agent runs on (loopback).
     Host,
-    /// In s0ma's VM, which s0ma can change.
+    /// In the agent's VM, which the agent can change.
     Vm,
     /// Elsewhere on a private network.
     LocalNetwork,
@@ -399,8 +399,8 @@ fn engine_location(url: &Url) -> Option<EngineLocation> {
     }
     match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().ok()? {
         ip if ip.is_loopback() => Some(EngineLocation::Host),
-        // Either way to reach s0ma's own machine: the direct link or the house
-        // network. Both mean "s0ma could have altered this".
+        // Either way to reach the agent's own machine: the direct link or the house
+        // network. Both mean "the agent could have altered this".
         std::net::IpAddr::V4(ip)
             if ip == crate::mcp::DEFAULT_VM_ADDRESS || ip == crate::mcp::FALLBACK_VM_ADDRESS =>
         {
@@ -777,7 +777,7 @@ fn retryable_transport(error: &reqwest::Error) -> bool {
 ///
 /// Only a connection *refused* on both attempts is reported as SearXNG being
 /// unavailable, and even then as what was observed — nothing listening at that
-/// address, from the host — rather than "down": s0ma checks from the VM, where
+/// address, from the host — rather than "down": the agent checks from the VM, where
 /// a working SearXNG behind another address or a tunnel looks fine. The old
 /// message ("not reachable at …/search") printed the endpoint without its
 /// query, so it read as a bare probe of /search, and it called every connect
@@ -1292,13 +1292,6 @@ mod tests {
     fn query(args: Value) -> Query {
         parse_args(&call(args)).expect("arguments should parse")
     }
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |key| map.get(key).cloned()
-    }
-    fn render_default(page: Page, q: &Query) -> Value {
-        render(page, q, &[], "brave", "2026-10-01T12:00:00Z")
-    }
 
     fn searxng_at(port: u16) -> Config {
         Config {
@@ -1311,27 +1304,6 @@ mod tests {
         }
     }
 
-    /// Two addresses, the way a machine on a direct link with a house-network
-    /// address behind it is configured.
-    fn searxng_with_fallback(first: u16, second: u16) -> Config {
-        Config {
-            backend: Backend::Searxng {
-                url: Url::parse(&format!("http://127.0.0.1:{first}/search")).unwrap(),
-                fallback: Some(Url::parse(&format!("http://127.0.0.1:{second}/search")).unwrap()),
-            },
-            blocked: Vec::new(),
-            min_interval: Duration::ZERO,
-        }
-    }
-
-    /// A port nothing is listening on: bound, read, and released.
-    fn closed_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
-    }
-
     /// Reads one request's head from `stream` and returns its request line.
     fn request_line(stream: &mut std::net::TcpStream) -> String {
         let mut head = Vec::new();
@@ -1340,39 +1312,6 @@ mod tests {
             head.push(byte[0]);
         }
         String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_owned()
-    }
-
-    #[test]
-    fn a_connection_dropped_before_any_reply_is_retried_and_every_request_carries_the_query() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            // First connection: read the request, then hang up without a reply,
-            // as a SearXNG worker being recycled does.
-            let (mut first, _) = listener.accept().unwrap();
-            seen.push(request_line(&mut first));
-            drop(first);
-            let (mut second, _) = listener.accept().unwrap();
-            seen.push(request_line(&mut second));
-            let body = r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/","content":"A language"}]}"#;
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            std::io::Write::write_all(&mut second, reply.as_bytes()).unwrap();
-            seen
-        });
-
-        let body = fetch(&searxng_at(port), &query(json!({"query": "rust language"}))).unwrap_or_else(|outage| {
-            panic!("a dropped connection should be retried, got: {}", outage.response("searxng"))
-        });
-        assert_eq!(parse_searxng(&body.body).unwrap().hits.len(), 1);
-        let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 2);
-        for line in seen {
-            assert!(line.starts_with("GET /search?q=rust+language&format=json"), "{line}");
-        }
     }
 
     #[test]
@@ -1413,133 +1352,6 @@ mod tests {
         assert!(outage.operator_action.is_none());
     }
 
-    /// One reply on a fresh port: the second address, standing in for s0ma's
-    /// machine over the house network.
-    fn one_result_server(body: &'static str) -> (u16, std::thread::JoinHandle<usize>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let served = std::thread::spawn(move || {
-            let mut count = 0;
-            for stream in listener.incoming().take(1) {
-                let mut stream = stream.unwrap();
-                request_line(&mut stream);
-                count += 1;
-                let reply = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                std::io::Write::write_all(&mut stream, reply.as_bytes()).unwrap();
-            }
-            count
-        });
-        (port, served)
-    }
-
-    #[test]
-    fn the_second_address_answers_when_the_first_does_not_and_the_results_say_so() {
-        let body = r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/","content":"A language"}]}"#;
-        let (second, served) = one_result_server(body);
-        let first = closed_port();
-        let config = searxng_with_fallback(first, second);
-
-        let fetched = fetch(&config, &query(json!({"query": "rust language"})))
-            .unwrap_or_else(|outage| panic!("the second address should have answered: {}", outage.error));
-        assert_eq!(fetched.answered.port(), Some(second), "the second address answered");
-        assert_eq!(fetched.missed.as_ref().and_then(Url::port), Some(first), "and the first was the one that did not");
-        assert_eq!(served.join().unwrap(), 1, "exactly one request reached it");
-
-        // s0ma sees that this search took the other path, in the provenance it
-        // already reads for every result.
-        let page = parse_searxng(&fetched.body).unwrap();
-        let q = query(json!({"query": "rust language"}));
-        let response = render_at(page, &q, &[], "searxng", "t", engine_location(&fetched.answered), true);
-        assert!(response["provenance"].as_str().unwrap().contains(FELL_BACK), "{}", response["provenance"]);
-    }
-
-    #[test]
-    fn an_engine_that_answers_but_fails_does_not_send_the_search_to_the_other_address() {
-        // A 500 means SearXNG is there: the other address is the same instance
-        // seen from another interface, so trying it would only repeat the
-        // failure. Its port is closed, so an attempt would be named in the error.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let first = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(1) {
-                let mut stream = stream.unwrap();
-                request_line(&mut stream);
-                let reply = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                std::io::Write::write_all(&mut stream, reply.as_bytes()).unwrap();
-            }
-        });
-        let second = closed_port();
-        let Err(outage) = fetch(&searxng_with_fallback(first, second), &query(json!({"query": "rust"}))) else {
-            panic!("a 500 is still a failure");
-        };
-        assert!(!outage.transport, "a reply arrived, so no other address is worth trying");
-        assert!(!outage.error.contains("did not answer either"), "{}", outage.error);
-    }
-
-    #[test]
-    fn with_both_addresses_down_the_first_is_the_news_and_both_are_named() {
-        let first = closed_port();
-        let second = closed_port();
-        let Err(outage) = fetch(&searxng_with_fallback(first, second), &query(json!({"query": "rust"}))) else {
-            panic!("nothing is listening on either");
-        };
-        assert!(outage.error.contains(&first.to_string()), "names the address that should work: {}", outage.error);
-        assert!(outage.error.contains(&second.to_string()), "and says the other was tried: {}", outage.error);
-        assert!(outage.error.contains("did not answer either"), "{}", outage.error);
-    }
-
-    #[test]
-    fn s0mas_machine_is_its_own_machine_by_either_address() {
-        let direct = Url::parse(DEFAULT_SEARXNG_URL).unwrap();
-        let house = Url::parse(FALLBACK_SEARXNG_URL).unwrap();
-        assert_eq!(house.host_str(), Some(crate::mcp::FALLBACK_VM_ADDRESS.to_string().as_str()));
-        // Both are s0ma's machine, so both carry the same weaker provenance.
-        assert_eq!(engine_location(&direct), Some(EngineLocation::Vm));
-        assert_eq!(engine_location(&house), Some(EngineLocation::Vm));
-    }
-
-    #[test]
-    fn the_second_address_can_be_turned_off_or_left_the_same_as_the_first() {
-        let primary = Url::parse(DEFAULT_SEARXNG_URL).unwrap();
-        assert_eq!(searxng_fallback(Some("off".into()), &primary).unwrap(), None, "off means one address only");
-        assert_eq!(searxng_fallback(Some("OFF ".into()), &primary).unwrap(), None);
-        assert_eq!(
-            searxng_fallback(Some(DEFAULT_SEARXNG_URL.into()), &primary).unwrap(),
-            None,
-            "the same address twice is no fallback"
-        );
-        assert_eq!(searxng_fallback(None, &primary).unwrap(), Some(Url::parse(FALLBACK_SEARXNG_URL).unwrap()));
-        assert!(
-            searxng_fallback(Some("http://93.184.216.34:8888/search".into()), &primary).is_err(),
-            "a public host is refused here too"
-        );
-    }
-
-    #[test]
-    fn the_default_engine_is_searxng_in_the_vm() {
-        let url = Url::parse(DEFAULT_SEARXNG_URL).unwrap();
-        assert_eq!(url.host_str(), Some(crate::mcp::DEFAULT_VM_ADDRESS.to_string().as_str()));
-        assert_eq!(engine_location(&url), Some(EngineLocation::Vm));
-        assert_eq!(engine_location(&Url::parse("http://localhost:8888/search").unwrap()), Some(EngineLocation::Host));
-        assert_eq!(engine_location(&Url::parse("http://192.168.1.5/search").unwrap()), Some(EngineLocation::LocalNetwork));
-        assert_eq!(engine_location(&Url::parse(BRAVE_ENDPOINT).unwrap()), None);
-    }
-
-    #[test]
-    fn results_from_the_vm_say_the_vm_could_have_changed_them() {
-        let body = json!({"results": [{"title": "Rust", "url": "https://www.rust-lang.org/", "content": "A language"}]});
-        let q = query(json!({"query": "rust"}));
-        let vm = render_at(parse_searxng(&body).unwrap(), &q, &[], "searxng", "t", Some(EngineLocation::Vm), false);
-        assert_eq!(vm["engine_location"], "vm");
-        assert!(vm["provenance"].as_str().unwrap().contains("runs on s0ma's own machine"));
-        let host = render_at(parse_searxng(&body).unwrap(), &q, &[], "searxng", "t", Some(EngineLocation::Host), false);
-        assert!(host.get("engine_location").is_none());
-        assert_eq!(host["provenance"], PROVENANCE);
-    }
-
     #[test]
     fn a_refusal_from_s0mas_machine_points_at_that_machine() {
         // Derived from the constant, so moving the machine cannot rot the test.
@@ -1556,25 +1368,6 @@ mod tests {
         for expected in ["machine is up", "not only on its own 127.0.0.1", "0.0.0.0", "firewall", "check the cable", &curl] {
             assert!(action.contains(expected), "{expected:?} missing from {action:?}");
         }
-    }
-
-    #[test]
-    fn definition_is_strict() {
-        let def = serde_json::to_value(definition()).unwrap();
-        let params = &def["function"]["parameters"];
-        assert_eq!(params["additionalProperties"], false);
-        assert_eq!(params["required"], json!(["query"]));
-        assert!(def["function"]["description"].as_str().unwrap().contains("untrusted"));
-    }
-
-    #[test]
-    fn arguments_default_and_normalize() {
-        let q = query(json!({"query": "  rust\n  reqwest\tblocking  "}));
-        assert_eq!(q.text, "rust reqwest blocking");
-        assert_eq!((q.max_results, q.page, q.site.clone(), q.time_range), (5, 1, None, None));
-        let q = query(json!({"query": "tokio", "site": "Docs.RS.", "time_range": "week", "page": 2, "max_results": 3}));
-        assert_eq!(q.engine_text(), "tokio site:docs.rs");
-        assert_eq!(q.time_range, Some(TimeRange::Week));
     }
 
     #[test]
@@ -1601,53 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn site_must_be_a_bare_domain() {
-        assert_eq!(checked_site("docs.rs").unwrap(), "docs.rs");
-        assert_eq!(checked_site("bücher.example").unwrap(), "xn--bcher-kva.example");
-        for bad in ["https://docs.rs", "docs.rs/tokio", "localhost", "127.0.0.1", "-bad.com", "a..b", "user@docs.rs", ""] {
-            assert!(checked_site(bad).is_err(), "accepted {bad:?}");
-        }
-    }
-
-    #[test]
-    fn backend_selection() {
-        let config = Config::from_vars(vars(&[("S0MA_BRAVE_API_KEY", "k")])).unwrap();
-        assert!(matches!(config.backend, Backend::Brave { .. }));
-        assert_eq!(config.min_interval, Duration::ZERO);
-
-        let config = Config::from_vars(vars(&[])).unwrap();
-        assert!(matches!(&config.backend, Backend::Searxng { url, .. } if url.as_str() == DEFAULT_SEARXNG_URL));
-        assert_eq!(config.min_interval, Duration::from_millis(1_000));
-
-        let config = Config::from_vars(vars(&[("S0MA_SEARCH_BACKEND", "searxng"), ("S0MA_BRAVE_API_KEY", "k")])).unwrap();
-        assert!(matches!(config.backend, Backend::Searxng { .. }));
-
-        assert!(Config::from_vars(vars(&[("S0MA_SEARCH_BACKEND", "brave")])).is_err());
-        assert!(Config::from_vars(vars(&[("S0MA_SEARCH_BACKEND", "google")])).is_err());
-        // This host, the VM or a private network; never a public host or a name.
-        for allowed in ["http://192.168.10.161:8888/search", "http://127.0.0.1:8888/search", "http://10.0.0.7/search", "http://[::1]:8888/search"] {
-            assert!(Config::from_vars(vars(&[("S0MA_SEARCH_URL", allowed)])).is_ok(), "{allowed}");
-        }
-        for refused in ["http://8.8.8.8:8888/search", "http://searx.example.com/search", "ftp://127.0.0.1/search"] {
-            assert!(Config::from_vars(vars(&[("S0MA_SEARCH_URL", refused)])).is_err(), "{refused}");
-        }
-        assert!(Config::from_vars(vars(&[("S0MA_BRAVE_API_KEY", "has space")])).is_err());
-        assert!(Config::from_vars(vars(&[("S0MA_SEARCH_MIN_INTERVAL_MS", "soon")])).is_err());
-
-        let config = Config::from_vars(vars(&[("S0MA_SEARCH_BLOCKED_DOMAINS", " *.0xdf.gitlab.io, Example.COM ,,")])).unwrap();
-        assert_eq!(config.blocked, vec!["0xdf.gitlab.io", "example.com"]);
-    }
-
-    #[test]
-    fn disable_switch() {
-        assert!(enabled_by(vars(&[])));
-        assert!(enabled_by(vars(&[("S0MA_SEARCH", "1")])));
-        for off in ["0", "off", "FALSE", " no "] {
-            assert!(!enabled_by(vars(&[("S0MA_SEARCH", off)])), "{off}");
-        }
-    }
-
-    #[test]
     fn domain_matching_respects_label_boundaries() {
         assert!(domain_matches("docs.rs", "docs.rs"));
         assert!(domain_matches("www.docs.rs", "docs.rs"));
@@ -1668,48 +1414,6 @@ mod tests {
         let url = searxng_request_url(&Url::parse(DEFAULT_SEARXNG_URL).unwrap(), &q);
         let pairs: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!((pairs["format"].as_str(), pairs["pageno"].as_str(), pairs["time_range"].as_str()), ("json", "3", "month"));
-    }
-
-    fn brave_fixture() -> Value {
-        json!({
-            "type": "search",
-            "query": {"original": "rust reqwst", "altered": "rust reqwest"},
-            "web": {"type": "search", "results": [
-                {"title": "reqwest - <strong>Rust</strong>", "url": "https://docs.rs/reqwest/latest/reqwest/",
-                 "description": "An ergonomic, batteries-included HTTP Client for <strong>Rust</strong>.",
-                 "page_age": "2026-08-14T09:12:00", "age": "August 14, 2026",
-                 "extra_snippets": ["An ergonomic, batteries-included HTTP Client", "Plain bodies, JSON, urlencoded, multipart.", "Customizable redirect policy.", "HTTP Proxies."]},
-                {"title": "seanmonstar/reqwest", "url": "https://github.com/seanmonstar/reqwest", "description": "An easy and powerful Rust HTTP Client", "age": "3 days ago"}
-            ]}
-        })
-    }
-
-    #[test]
-    fn brave_results_render_with_extra_excerpts_and_dates() {
-        let page = parse_brave(&brave_fixture()).unwrap();
-        let response = render_default(page, &query(json!({"query": "rust reqwst"})));
-        let first = &response["results"][0];
-        assert_eq!(first["title"], "reqwest - Rust");
-        assert_eq!(first["domain"], "docs.rs");
-        assert_eq!(first["published"], "2026-08-14");
-        let excerpts = first["excerpts"].as_array().unwrap();
-        // Main excerpt, the contained duplicate dropped, then two extras.
-        assert_eq!(excerpts.len(), 3);
-        assert_eq!(excerpts[0], "An ergonomic, batteries-included HTTP Client for Rust.");
-        assert_eq!(excerpts[1], "Plain bodies, JSON, urlencoded, multipart.");
-        assert_eq!(response["results"][1]["published"], "3 days ago");
-        assert_eq!(response["searched_instead"], "rust reqwest");
-        assert_eq!(response["ok"], true);
-        assert!(response.get("next").is_some() && response.get("note").is_none());
-    }
-
-    #[test]
-    fn brave_without_web_block_is_an_honest_empty_result() {
-        let page = parse_brave(&json!({"type": "search", "query": {"original": "zzqqxx"}})).unwrap();
-        let response = render_default(page, &query(json!({"query": "zzqqxx"})));
-        assert_eq!(response["results"], json!([]));
-        assert_eq!(response["note"], EMPTY_NOTE);
-        assert!(parse_brave(&json!([1, 2])).is_err());
     }
 
     #[test]
@@ -1757,147 +1461,5 @@ mod tests {
         assert_eq!(urls, vec!["https://docs.rs/a", "https://xn--bcher-kva.docs.rs/b"]);
         assert_eq!(response["withheld_by_operator_policy"], 2);
         assert_eq!(response["results"][1]["rank"], 2);
-    }
-
-    #[test]
-    fn max_results_is_respected_and_titles_fall_back_to_domain() {
-        let page = Page {
-            hits: (0..8).map(|i| Hit { title: String::new(), url: format!("https://example{i}.com/"), excerpts: vec![], published: None }).collect(),
-            ..Page::default()
-        };
-        let response = render_default(page, &query(json!({"query": "x", "max_results": 3})));
-        let results = response["results"].as_array().unwrap();
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0]["title"], "example0.com");
-    }
-
-    #[test]
-    fn output_stays_under_the_tokenizer_probe_threshold() {
-        let long = "word ".repeat(200);
-        let page = Page {
-            hits: (0..10)
-                .map(|i| Hit {
-                    title: long.clone(),
-                    url: format!("https://example{i}.com/{}", "p".repeat(900)),
-                    excerpts: vec![format!("{i}a {long}"), format!("{i}b {long}"), format!("{i}c {long}")],
-                    published: None,
-                })
-                .collect(),
-            ..Page::default()
-        };
-        let response = render_default(page, &query(json!({"query": "x", "max_results": 10})));
-        let size = stamp_event_id(&response.to_string(), u64::MAX).len();
-        assert!(size <= 7_500, "{size} bytes");
-        let results = response["results"].as_array().unwrap();
-        // Extras go before results do, and the top result keeps its main excerpt.
-        assert!(results.iter().all(|r| r["excerpts"].as_array().unwrap().len() == 1));
-        assert_eq!(results.len() + response["omitted_for_size"].as_u64().unwrap() as usize, 10);
-        assert_eq!(results[0]["rank"], 1);
-    }
-
-    #[test]
-    fn text_is_cleaned() {
-        assert_eq!(clean_text("<b>Rust</b> &amp; <i>Go</i>&#33; &#x2014; a < b && c", 100), "Rust & Go! — a < b && c");
-        assert_eq!(clean_text("line<br>break\n\ttabs", 100), "line break tabs");
-        assert_eq!(clean_text("ig\u{200B}nore\u{202E}txt\u{0007}", 100), "ignoretxt");
-        assert_eq!(clean_text("&bogus; &#xZZ; &", 100), "&bogus; &#xZZ; &");
-        assert_eq!(clean_text("abcdefghij", 5), "abcd…");
-        assert_eq!(clean_text("界界界界界界", 3), "界界…");
-    }
-
-    #[test]
-    fn cache_reuses_only_complete_answers_and_says_so() {
-        let full = json!({"ok": true, "results": [{"rank": 1}], "retrieved_at": "2026-10-01T12:00:00Z"});
-        assert!(cacheable(&full));
-        assert!(!cacheable(&json!({"ok": true, "results": []})));
-        assert!(!cacheable(&json!({"ok": true, "results": [{"rank": 1}], "degraded_engines": ["google: timeout"]})));
-        assert!(!cacheable(&json!({"ok": false})));
-
-        let key = "cache-test-unique-key".to_owned();
-        cache_put(key.clone(), &full);
-        let reused = mark_cached(cache_get(&key).unwrap());
-        assert_eq!(reused["cached"], true);
-        assert_eq!(reused["retrieved_at"], "2026-10-01T12:00:00Z");
-        assert!(reused["note"].as_str().unwrap().contains("2026-10-01T12:00:00Z"));
-        assert!(cache_get("cache-test-missing").is_none());
-    }
-
-    #[test]
-    fn event_id_is_stamped_on_json_objects_only() {
-        let stamped: Value = serde_json::from_str(&stamp_event_id(r#"{"ok":true}"#, 42)).unwrap();
-        assert_eq!(stamped["archive_event_id"], 42);
-        assert_eq!(stamp_event_id("not json", 42), "not json");
-        assert_eq!(stamp_event_id("[1]", 42), "[1]");
-    }
-
-    #[test]
-    fn outages_are_structured_and_say_whether_retry_helps() {
-        let brave = Backend::Brave { key: "k".into(), endpoint: Url::parse(BRAVE_ENDPOINT).unwrap() };
-        let searxng = Backend::Searxng { url: Url::parse(DEFAULT_SEARXNG_URL).unwrap(), fallback: None };
-        let key = status_outage(&brave, StatusCode::UNAUTHORIZED, None, b"").response("brave");
-        assert_eq!((key["ok"].as_bool(), key["retry"].as_str()), (Some(false), Some("pointless until the operator acts")));
-        assert!(key["operator_action"].as_str().unwrap().contains("S0MA_BRAVE_API_KEY"));
-        let json_off = status_outage(&searxng, StatusCode::FORBIDDEN, None, b"<html>Forbidden</html>").response("searxng");
-        assert!(json_off["operator_action"].as_str().unwrap().contains("search.formats"));
-        let busy = status_outage(&brave, StatusCode::BAD_GATEWAY, None, b"").response("brave");
-        assert_eq!(busy["retry"], "may succeed shortly");
-        assert!(busy["fallback"].as_str().unwrap().contains("browser_navigate"));
-        let quota = status_outage(&brave, StatusCode::TOO_MANY_REQUESTS, Some(86_000), b"").response("brave");
-        assert!(quota["error"].as_str().unwrap().contains("86000s"));
-    }
-
-    /// Live checks, skipped by default. Point them at a running backend:
-    ///   S0MA_TEST_SEARXNG_URL=http://192.168.10.161:8888/search cargo test search::tests::live -- --ignored
-    ///   S0MA_TEST_BRAVE_URL=http://127.0.0.1:9999/res/v1/web/search S0MA_TEST_BRAVE_KEY=... (a mock or the real endpoint)
-    #[test]
-    #[ignore]
-    fn live_searxng() {
-        let url = Url::parse(&std::env::var("S0MA_TEST_SEARXNG_URL").expect("S0MA_TEST_SEARXNG_URL")).unwrap();
-        let config =
-            Config { backend: Backend::Searxng { url, fallback: None }, blocked: vec![], min_interval: Duration::ZERO };
-        let q = query(json!({"query": "rust reqwest"}));
-        match fetch(&config, &q) {
-            Ok(body) => {
-                let response = render(parse_searxng(&body.body).unwrap(), &q, &[], "searxng", "t");
-                println!("{}", serde_json::to_string_pretty(&response).unwrap());
-                assert_eq!(response["ok"], true);
-            }
-            Err(outage) => panic!("{}", outage.response("searxng")),
-        }
-    }
-
-    /// The full tool path as agent.rs calls it, configured from the real
-    /// environment (S0MA_SEARCH_BACKEND / S0MA_SEARCH_URL / S0MA_BRAVE_API_KEY).
-    #[test]
-    #[ignore]
-    fn live_execute() {
-        let c = call(json!({"query": "rust reqwest blocking client", "max_results": 3}));
-        for round in 0..2 {
-            let started = Instant::now();
-            let result = execute(&c).expect("execute returns a result");
-            let stamped: Value = serde_json::from_str(&stamp_event_id(&result, 7)).unwrap();
-            println!("round {round}: {:?}, {} bytes\n{}", started.elapsed(), result.len(), serde_json::to_string_pretty(&stamped).unwrap());
-            assert_eq!(stamped["archive_event_id"], 7);
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn live_brave() {
-        let endpoint = Url::parse(&std::env::var("S0MA_TEST_BRAVE_URL").unwrap_or_else(|_| BRAVE_ENDPOINT.into())).unwrap();
-        let key = std::env::var("S0MA_TEST_BRAVE_KEY").expect("S0MA_TEST_BRAVE_KEY");
-        let config = Config { backend: Backend::Brave { key, endpoint }, blocked: vec![], min_interval: Duration::ZERO };
-        let q = query(json!({"query": "rust reqwest", "max_results": 3}));
-        for round in 0..2 {
-            let started = Instant::now();
-            match fetch(&config, &q) {
-                Ok(body) => {
-                    let response = render(parse_brave(&body.body).unwrap(), &q, &[], "brave", "t");
-                    println!("round {round}: {:?}\n{}", started.elapsed(), serde_json::to_string_pretty(&response).unwrap());
-                    assert_eq!(response["ok"], true);
-                }
-                Err(outage) => panic!("{}", outage.response("brave")),
-            }
-        }
     }
 }

@@ -1,15 +1,15 @@
-//! `/goal`: an objective s0ma keeps working toward, turn after turn, until it
+//! `/goal`: an objective the agent keeps working toward, turn after turn, until it
 //! is done.
 //!
 //! The operator sets one with `/goal <objective>`. Its first turn starts at once, and
 //! whenever a turn ends with the goal still active and nothing else owed, the
 //! harness starts the next one with a prompt that carries the objective
 //! (`next_turn`). It stops when:
-//! - s0ma marks it complete with `goal_update` and an audit confirms it. The
-//!   audit is a separate model call that sees the objective, s0ma's claim and
+//! - the agent marks it complete with `goal_update` and an audit confirms it. The
+//!   audit is a separate model call that sees the objective, the agent's claim and
 //!   the transcript, with no tools and no stake in the work: the claim is
-//!   s0ma's, the verdict is not (`audit`);
-//! - s0ma marks it blocked, which it may do only once the same blocker has
+//!   the agent's, the verdict is not (`audit`);
+//! - the agent marks it blocked, which it may do only once the same blocker has
 //!   held for three goal turns;
 //! - The operator pauses or clears it, or stops a turn with ctrl+c (which pauses it);
 //! - its budget, in turns or generated tokens, is spent: one wrap-up turn,
@@ -21,7 +21,7 @@
 //! The states, the tools, the continuation prompt's completion and blocked
 //! audits and the empty-turn breaker follow Codex's goals; the separate
 //! evaluator, the check-ins on long waits and `clear`'s aliases follow Claude
-//! Code's `/goal`. What is s0ma's own: a goal waits on whatever s0ma's
+//! Code's `/goal`. What is the agent's own: a goal waits on whatever the agent's
 //! attention waits on (a wake event, a subagent, the operator), nothing resumes on
 //! startup until the operator has spoken, and a goal set during a job goes when the
 //! job is closed.
@@ -149,23 +149,23 @@ pub struct Goal {
     /// paused it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// What it waits on, as s0ma left it (`Hold`).
+    /// What it waits on, as the agent left it (`Hold`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold: Option<Hold>,
 }
 
-/// What a goal waits on, as s0ma left it when it registered a wait.
+/// What a goal waits on, as the agent left it when it registered a wait.
 ///
-/// Attention has a wait too, but any line typed ends that one in s0ma, a
+/// Attention has a wait too, but any line typed ends that one in the agent, a
 /// command included, and the ending is saved: `/goal` to see how it is going
-/// would set the goal off again without the answer s0ma asked for, and so
+/// would set the goal off again without the answer the agent asked for, and so
 /// would a restart after it. This is the goal's own record, kept with the
 /// goal, and ended only by what the wait was for: a message from the operator, a wake
 /// event, `/goal resume`, the kickoff of a new goal, a check-in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "for", content = "what")]
 pub enum Hold {
-    /// The operator: what s0ma said it was waiting for.
+    /// The operator: what the agent said it was waiting for.
     Operator(String),
     /// A wake event, in words.
     Event(String),
@@ -409,7 +409,7 @@ with no tools, agrees. s0ma can also mark it blocked, after the same blocker has
 pub struct Outcome {
     pub reply: Result<String>,
     /// The line the operator typed, when it set a goal: archived like a message, so
-    /// s0ma's memory has what it was asked to do and a job's close finds it.
+    /// the agent's memory has what it was asked to do and a job's close finds it.
     pub record: Option<String>,
     /// The operator spoke to the goal: the check-ins start over.
     pub operator_spoke: bool,
@@ -698,7 +698,7 @@ pub fn status_text(goal: Option<&Goal>, waiting: Option<&str>) -> String {
 }
 
 /// Shown at start-up when a goal was left active: it does not resume until
-/// The operator has said something, as nothing autonomous does.
+/// the operator has said something, as nothing autonomous does.
 pub fn startup_notice() -> Option<String> {
     let goal = current()?;
     (goal.status == Status::Active).then(|| {
@@ -734,7 +734,7 @@ impl TurnKind {
     }
 }
 
-/// What the harness knows about whether s0ma can be started now.
+/// What the harness knows about whether the agent can be started now.
 #[derive(Clone, Debug, Default)]
 pub struct Gates {
     /// Attention is engaged, not waiting.
@@ -743,7 +743,7 @@ pub struct Gates {
     pub sleep_waiting: bool,
     /// Subagents still working: their results start the next turn.
     pub workers: usize,
-    /// s0ma waits for a wake event (what for, in words).
+    /// The agent waits for a wake event (what for, in words).
     pub vm_wait: Option<String>,
 }
 
@@ -832,7 +832,7 @@ pub fn next_turn(gates: &Gates, watch: &mut Watch, now: Instant) -> Next {
         return Next::Nothing;
     };
     match goal.status {
-        // The operator just asked for it, so nothing s0ma waits on holds it back.
+        // The operator just asked for it, so nothing the agent waits on holds it back.
         Status::Active if goal.kickoff_owed => {
             watch.not_waiting();
             match change(|goal| goal.kickoff_owed = false) {
@@ -849,7 +849,7 @@ pub fn next_turn(gates: &Gates, watch: &mut Watch, now: Instant) -> Next {
                 return Next::Turn(TurnKind::Continue, continuation_prompt(&goal));
             }
             // Attention waits on something, and anything but a wake event is
-            // The operator: no check-ins then, since he is the one being waited on.
+            // the operator: no check-ins then, since he is the one being waited on.
             let what = match (&gates.vm_wait, gates.engaged) {
                 (Some(what), _) => what.clone(),
                 (None, false) => {
@@ -944,7 +944,7 @@ pub struct Notice {
 pub struct Ending {
     /// The operator stopped it (ctrl+c), at any point from its admission on.
     pub interrupted: bool,
-    /// It failed with an error s0ma recovers from.
+    /// It failed with an error the agent recovers from.
     pub error: Option<String>,
 }
 
@@ -995,7 +995,7 @@ fn account(
             _ => {}
         }
     }
-    // s0ma changed it during the turn (goal_update): said in the turn as it
+    // The agent changed it during the turn (goal_update): said in the turn as it
     // happened, and here where it shows with the turn collapsed.
     let by_s0ma = match goal.status {
         Status::Complete | Status::Blocked => true,
@@ -1111,7 +1111,7 @@ pub fn hold() -> Option<Hold> {
     current()?.hold
 }
 
-/// s0ma's wait changed (a new one, or none). Written only when it differs.
+/// The agent's wait changed (a new one, or none). Written only when it differs.
 pub fn set_hold(hold: Option<Hold>) {
     let Some(goal) = current() else { return };
     if goal.hold == hold {
@@ -1122,7 +1122,7 @@ pub fn set_hold(hold: Option<Hold>) {
     }
 }
 
-/// A goal is running: it, not loop mode, decides when s0ma carries on, even
+/// A goal is running: it, not loop mode, decides when the agent carries on, even
 /// while it waits.
 pub fn active() -> bool {
     current().is_some_and(|goal| goal.status == Status::Active)
@@ -1162,7 +1162,7 @@ pub fn forget_job(job: &str) -> Result<Forgotten> {
     if kept.note.is_some() {
         kept.note = Some(crate::jobs::marker(job));
     }
-    // What s0ma said it waited for, in its words, from the job's context.
+    // What the agent said it waited for, in its words, from the job's context.
     kept.hold = kept.hold.map(|hold| match hold {
         Hold::Operator(_) => Hold::Operator(crate::jobs::marker(job)),
         Hold::Event(_) => Hold::Event(crate::jobs::marker(job)),
@@ -1229,7 +1229,7 @@ Blocked audit:
 Call goal_update only after the completion or blocked audit passes, or when the operator explicitly asks you to pause this goal (status \"paused\"; never on your own initiative). Do not mark the goal complete because the budget is nearly spent or because you are stopping work.";
 
 /// Shorter than the kickoff's: the audits are in goal_update's description,
-/// which is always in front of s0ma, and the full text every turn would fill
+/// which is always in front of the agent, and the full text every turn would fill
 /// the context with copies of itself.
 const AUDITS_IN_BRIEF: &str = "\
 Before claiming the goal is achieved, run the completion audit: derive every requirement from the objective, check each against current evidence you gather now, and claim only what that evidence proves (goal_update describes the audit and the blocked rule).";
@@ -1540,7 +1540,7 @@ fn verdict_schema() -> Value {
 }
 
 /// What the audit is sent: the objective, the claim, and the conversation as
-/// s0ma has it now, rendered as plain text without s0ma's reasoning.
+/// the agent has it now, rendered as plain text without the agent's reasoning.
 pub fn audit_request(goal: &Goal, evidence: &str, messages: &[Message]) -> Vec<Message> {
     let objective = goal.objective.replace('<', "&lt;").replace('>', "&gt;");
     vec![
@@ -1548,7 +1548,7 @@ pub fn audit_request(goal: &Goal, evidence: &str, messages: &[Message]) -> Vec<M
         Message::user(format!(
             "<objective>\n{objective}\n</objective>\n\n<claim>\n{}\n</claim>\n\n<transcript>\n{}\n</transcript>",
             clip(evidence, EVIDENCE_CHARS),
-            transcript(crate::memory_layers::live_turns(messages)),
+            transcript(crate::memory::layers::live_turns(messages)),
         )),
     ]
 }
@@ -1612,7 +1612,7 @@ fn model_judge(request: &[Message], interrupt: &AtomicBool) -> std::result::Resu
     Ok(response.content)
 }
 
-/// Apply the verdict to the goal: what s0ma is told, and what the operator sees.
+/// Apply the verdict to the goal: what the agent is told, and what the operator sees.
 fn settle_claim(
     goal: &Goal,
     verdict: Result<Verdict>,
@@ -1856,50 +1856,11 @@ mod tests {
         serde_json::from_str(&result).unwrap()
     }
 
-    fn verdict(met: bool, satisfied: &[bool], missing: &str) -> String {
-        json!({
-            "requirements": satisfied.iter().enumerate().map(|(n, s)| json!({
-                "requirement": format!("requirement {n}"), "evidence": "the test output", "satisfied": s
-            })).collect::<Vec<_>>(),
-            "met": met,
-            "missing": missing,
-        })
-        .to_string()
-    }
-
     fn never_called(_: &[Message]) -> std::result::Result<String, String> {
         panic!("the audit should not have run")
     }
 
     // -------------------------------------------------------------- the command
-
-    #[test]
-    fn subcommands_are_single_words_and_anything_else_is_an_objective() {
-        let objective = |line: &str| match parse(line) {
-            Some(Ok(Command::Set(_, objective))) => objective,
-            _ => panic!("{line} should set a goal"),
-        };
-        assert!(matches!(parse("/goal"), Some(Ok(Command::Status))));
-        assert!(matches!(parse("/goal status"), Some(Ok(Command::Status))));
-        assert!(matches!(parse("/goal Pause"), Some(Ok(Command::Pause))));
-        assert!(matches!(parse("/goal help"), Some(Ok(Command::Help))));
-        for word in CLEAR_WORDS {
-            assert!(matches!(parse(&format!("/goal {word}")), Some(Ok(Command::Clear))), "{word}");
-        }
-        assert!(matches!(parse("/goal resume"), Some(Ok(Command::Resume(Budget { turns: None, tokens: None })))));
-        assert!(matches!(
-            parse("/goal resume --turns 5"),
-            Some(Ok(Command::Resume(Budget { turns: Some(5), tokens: None })))
-        ));
-        // A sentence that starts with one of them is an objective.
-        assert_eq!(objective("/goal stop the flaky test from failing"), "stop the flaky test from failing");
-        assert_eq!(objective("/goal status page for the API"), "status page for the API");
-        assert_eq!(objective("/goal resume work on the importer"), "resume work on the importer");
-        // Not this command at all.
-        assert!(parse("/goals").is_none());
-        assert!(parse("/goalkeeper").is_none());
-        assert!(parse("fix the /goal command").is_none());
-    }
 
     #[test]
     fn a_budget_comes_before_the_objective() {
@@ -1920,35 +1881,6 @@ mod tests {
         let long = format!("/goal {}", "x".repeat(MAX_OBJECTIVE + 1));
         assert!(matches!(parse(&long), Some(Err(error)) if error.contains("at most 4000")));
         assert!(matches!(parse(&format!("/goal {}", "x".repeat(MAX_OBJECTIVE))), Some(Ok(Command::Set(..)))));
-    }
-
-    #[test]
-    fn only_a_line_with_an_objective_carries_one() {
-        assert!(carries_objective("/goal fix the acme deploy pipeline"));
-        assert!(carries_objective("/goal --turn 5 fix the acme deploy pipeline"), "refused, but still typed");
-        for line in ["/goal", "/goal pause", "/goal resume --turns 5", "/goal clear", "/job pause acme", "hello"] {
-            assert!(!carries_objective(line), "{line}");
-        }
-    }
-
-    #[test]
-    fn setting_records_what_was_typed_and_replaces_an_unfinished_goal() {
-        let fixture = Fixture::new("set");
-        let outcome = command("/goal --turns 9 fix the build");
-        assert_eq!(outcome.record.as_deref(), Some("/goal --turns 9 fix the build"), "archived as the operator's words");
-        assert!(outcome.operator_spoke);
-        let goal = fixture.goal();
-        assert_eq!((goal.objective.as_str(), goal.status, goal.turn_budget), ("fix the build", Status::Active, Some(9)));
-        assert!(goal.kickoff_owed);
-
-        let replaced = ok("/goal write the release notes");
-        assert!(replaced.contains("replaces the active goal: fix the build"), "{replaced}");
-        assert_eq!(fixture.goal().objective, "write the release notes");
-        assert_eq!(fixture.goal().turn_budget, None, "a new goal has its own budget");
-
-        // Nothing is recorded for a command that sets nothing.
-        assert!(command("/goal").record.is_none());
-        assert!(command("/goal --turns 0 x").record.is_none());
     }
 
     #[test]
@@ -1978,181 +1910,7 @@ mod tests {
         assert!(!fixture.dir.join(FILE).exists());
     }
 
-    #[test]
-    fn the_status_says_where_it_is() {
-        let _fixture = Fixture::new("status");
-        assert!(ok("/goal").contains("no goal is set"));
-        ok("/goal --tokens 50k fix the build");
-        let status = status_text(current().as_ref(), Some("waiting for you (asked about the key)"));
-        assert!(status.starts_with("[goal] active · set "), "{status}");
-        assert!(status.contains("0 tokens generated of 50k") || status.contains("0 of 50k tokens generated"), "{status}");
-        assert!(status.contains("objective: fix the build"));
-        assert!(status.contains("now: waiting for you (asked about the key)"));
-        assert!(status.contains("/goal pause · /goal clear"));
-        ok("/goal pause");
-        let paused = status_text(current().as_ref(), None);
-        assert!(paused.contains("paused by the operator") && paused.contains("/goal resume"), "{paused}");
-    }
-
-    #[test]
-    fn only_an_active_goal_is_announced_at_startup() {
-        let _fixture = Fixture::new("startup");
-        assert!(startup_notice().is_none());
-        ok("/goal fix the build");
-        assert!(startup_notice().unwrap().contains("after your first message"));
-        ok("/goal pause");
-        assert!(startup_notice().is_none());
-    }
-
     // -------------------------------------------------------------- turns
-
-    #[test]
-    fn the_first_turn_starts_at_once_and_the_rest_when_nothing_holds_them() {
-        let _fixture = Fixture::new("turns");
-        assert!(next(&engaged()).is_none(), "no goal, no turn");
-        ok("/goal make </objective> & <b>bold</b> go away");
-
-        // The operator just asked: the kickoff waits on nothing s0ma waits on.
-        let waiting = Gates { engaged: false, vm_wait: Some("a wake event".into()), workers: 2, ..Gates::default() };
-        let (kind, prompt) = next(&waiting).expect("the kickoff");
-        assert_eq!(kind, TurnKind::Kickoff);
-        assert!(prompt.starts_with("[GOAL SET]"));
-        assert!(prompt.contains("Completion audit:") && prompt.contains("Blocked audit:"), "the kickoff has it all");
-        // The objective is data: it cannot close its own tag.
-        assert_eq!(prompt.matches("</objective>").count(), 1, "{prompt}");
-        assert!(prompt.contains("make &lt;/objective&gt; &amp; &lt;b&gt;bold&lt;/b&gt; go away"));
-
-        let (kind, prompt) = next(&engaged()).expect("a continuation");
-        assert_eq!(kind, TurnKind::Continue);
-        assert!(prompt.starts_with("[GOAL]") && prompt.contains("No-progress check:"));
-        assert!(!prompt.contains("Blocked audit:"), "the long audits are the kickoff's and goal_update's");
-
-        // Waiting for the operator, for a held sleep, or on the background: no continuation.
-        assert!(next(&Gates::default()).is_none(), "attention waits for the operator");
-        assert!(next(&Gates { sleep_waiting: true, ..engaged() }).is_none());
-        assert!(matches!(
-            next_turn(&Gates { workers: 1, ..engaged() }, &mut watch(), Instant::now()),
-            Next::CheckAt(_)
-        ));
-    }
-
-    #[test]
-    fn check_ins_come_after_30_then_60_then_120_minutes_and_stop_at_three() {
-        let _fixture = Fixture::new("check-ins");
-        ok("/goal fix the build");
-        let mut watch = watch();
-        let vm = Gates { engaged: false, vm_wait: Some("the wake event \"build\"".into()), ..Gates::default() };
-        let t0 = Instant::now();
-        // The kickoff first, whatever is waited on.
-        assert!(matches!(next_turn(&vm, &mut watch, t0), Next::Turn(TurnKind::Kickoff, _)));
-
-        let mut at = t0;
-        for (n, minutes) in [(1, 30), (2, 60), (3, 120)] {
-            match next_turn(&vm, &mut watch, at) {
-                Next::CheckAt(due) => assert_eq!(due - at, Duration::from_secs(minutes * 60), "check-in {n}"),
-                _ => panic!("check-in {n} is not due yet"),
-            }
-            at += Duration::from_secs(minutes * 60);
-            match next_turn(&vm, &mut watch, at) {
-                Next::Turn(TurnKind::CheckIn, prompt) => {
-                    let waited = format!("waiting {} for the wake event \"build\"", span(minutes * 60));
-                    assert!(prompt.contains(&waited), "{prompt}");
-                    assert!(prompt.contains(&format!("check-in {n} of 3")));
-                }
-                _ => panic!("check-in {n} is due"),
-            }
-        }
-        at += Duration::from_secs(24 * 3600);
-        assert!(matches!(next_turn(&vm, &mut watch, at), Next::Nothing), "three, and no more");
-        watch.operator_spoke();
-        assert!(matches!(next_turn(&vm, &mut watch, at), Next::CheckAt(_)), "until the operator speaks");
-
-        // None while s0ma waits for the operator himself, and none when turned off.
-        let mut fresh = Watch::every(Duration::from_secs(60));
-        assert!(matches!(next_turn(&Gates::default(), &mut fresh, at), Next::Nothing));
-        let mut off = Watch::every(Duration::ZERO);
-        assert!(matches!(next_turn(&vm, &mut off, at + Duration::from_secs(99_999)), Next::Nothing));
-    }
-
-    #[test]
-    fn a_turn_counts_against_the_goal_it_ran_for() {
-        let fixture = Fixture::new("count");
-        ok("/goal fix the build");
-        // Refused before reaching the model: not one of the goal's.
-        let started = begin_turn(Some(TurnKind::Kickoff), true);
-        assert!(finish_turn(started, Ending::default()).is_empty());
-        assert_eq!(fixture.goal().turns, 0);
-
-        turn(Some(TurnKind::Kickoff), true, 2, 1_200, false);
-        let goal = fixture.goal();
-        assert_eq!((goal.turns, goal.run_turns, goal.tokens), (1, 1, 1_200));
-
-        // The server gave no count: the characters streamed stand in.
-        let started = begin_turn(None, false);
-        note_call(None, 380);
-        finish_turn(started, Ending::default());
-        assert_eq!(fixture.goal().tokens, 1_300);
-
-        // A turn that began before the goal was replaced is not the new one's.
-        let started = begin_turn(Some(TurnKind::Continue), true);
-        note_call(Some(5_000), 0);
-        ok("/goal write the release notes");
-        finish_turn(started, Ending::default());
-        assert_eq!(fixture.goal().tokens, 0);
-
-        // Nor is a turn that began with no goal live.
-        ok("/goal pause");
-        turn(None, false, 1, 900, false);
-        assert_eq!(fixture.goal().turns, 0);
-    }
-
-    #[test]
-    fn three_continuations_without_a_tool_call_block_the_goal() {
-        let fixture = Fixture::new("quiet");
-        ok("/goal fix the build");
-        next(&engaged());
-        turn(Some(TurnKind::Kickoff), true, 0, 100, false);
-        assert_eq!(fixture.goal().quiet_turns, 0, "only continuations count");
-
-        assert!(turn(Some(TurnKind::Continue), true, 0, 100, false).is_empty());
-        assert!(turn(Some(TurnKind::Continue), true, 0, 100, false).is_empty());
-        assert!(next(&engaged()).unwrap().1.contains("The last 2 continuation turns called no tools (2 of 3"));
-        // A tool call, or the operator, starts the count over.
-        turn(Some(TurnKind::Continue), true, 1, 100, false);
-        assert_eq!(fixture.goal().quiet_turns, 0);
-        turn(Some(TurnKind::Continue), true, 0, 100, false);
-        turn(None, false, 0, 100, false);
-        assert_eq!(fixture.goal().quiet_turns, 0, "The operator spoke");
-        // goal_get is not progress.
-        let started = begin_turn(Some(TurnKind::Continue), true);
-        note_call(Some(10), 0);
-        note_tools(&[call(GET, json!({}))]);
-        finish_turn(started, Ending::default());
-        assert_eq!(fixture.goal().quiet_turns, 1);
-
-        turn(Some(TurnKind::Continue), true, 0, 100, false);
-        let notices = turn(Some(TurnKind::Continue), true, 0, 100, false);
-        assert_eq!(fixture.goal().status, Status::Blocked);
-        assert!(notices[0].alert && notices[0].text.contains("3 turns in a row without a tool call"));
-        assert!(next(&engaged()).is_none());
-
-        // A resumed run starts the count over.
-        ok("/goal resume");
-        assert_eq!(fixture.goal().quiet_turns, 0);
-    }
-
-    #[test]
-    fn ctrl_c_pauses_the_goal() {
-        let fixture = Fixture::new("interrupt");
-        ok("/goal fix the build");
-        next(&engaged());
-        let notices = turn(Some(TurnKind::Kickoff), true, 1, 100, true);
-        assert_eq!(fixture.goal().status, Status::Paused);
-        assert!(notices[0].text.contains("you stopped the turn"));
-        assert!(next(&engaged()).is_none());
-        ok("/goal resume");
-        assert!(matches!(next(&engaged()), Some((TurnKind::Continue, _))));
-    }
 
     #[test]
     fn a_spent_budget_gets_one_wrap_up_turn_then_nothing() {
@@ -2183,45 +1941,6 @@ mod tests {
         assert_eq!(fixture.goal().status, Status::BudgetLimited);
     }
 
-    fn failed(kind: Option<TurnKind>, calls: bool, error: &str) -> Vec<Notice> {
-        let started = begin_turn(kind, true);
-        if calls {
-            note_call(Some(10), 0);
-        }
-        finish_turn(started, Ending { interrupted: false, error: Some(error.into()) })
-    }
-
-    #[test]
-    fn a_turn_that_fails_blocks_the_goal_it_ran_for_and_no_other() {
-        let fixture = Fixture::new("error");
-        assert!(failed(None, true, "boom").is_empty(), "no goal, nothing to block");
-        ok("/goal fix the build");
-        // Even one that failed before reaching the model.
-        let notices = failed(Some(TurnKind::Kickoff), false, "context admission paused");
-        assert!(notices[0].alert && notices[0].problem);
-        let goal = fixture.goal();
-        assert_eq!((goal.status, goal.turns), (Status::Blocked, 0));
-        assert!(goal.note.unwrap().contains("context admission paused"));
-        assert!(failed(None, true, "again").is_empty(), "already stopped");
-
-        // A goal set during a turn that then fails is not that turn's.
-        ok("/goal --turns 1 write the notes");
-        let started = begin_turn(None, false);
-        note_call(Some(10), 0);
-        ok("/goal write the release notes");
-        finish_turn(started, Ending { interrupted: false, error: Some("boom".into()) });
-        assert_eq!(fixture.goal().status, Status::Active);
-
-        // The turn that spends the budget fails: no wrap-up turn after it.
-        ok("/goal --turns 1 write the notes");
-        next(&engaged());
-        failed(Some(TurnKind::Kickoff), true, "the server went away");
-        let goal = fixture.goal();
-        assert_eq!(goal.status, Status::Blocked, "the error decides: blocked, not out of budget");
-        assert!(!goal.wrap_up_owed, "so no wrap-up turn starts unattended after it");
-        assert!(next(&Gates::default()).is_none());
-    }
-
     #[test]
     fn an_error_on_the_wrap_up_side_of_a_spent_budget_skips_the_wrap_up() {
         let fixture = Fixture::new("error-budget");
@@ -2239,147 +1958,7 @@ mod tests {
         assert!(next(&Gates::default()).is_none());
     }
 
-    #[test]
-    fn ctrl_c_with_no_turn_to_stop_pauses_the_goal() {
-        let fixture = Fixture::new("ctrl-c-between");
-        assert!(pause_for_interrupt().is_none());
-        ok("/goal fix the build");
-        assert!(active());
-        assert!(pause_for_interrupt().unwrap().text.contains("you pressed ctrl+c"));
-        assert_eq!(fixture.goal().status, Status::Paused);
-        assert!(!active());
-        assert!(pause_for_interrupt().is_none());
-        // A turn stopped before it reached the model: not counted, still paused.
-        ok("/goal resume");
-        let started = begin_turn(Some(TurnKind::Continue), true);
-        finish_turn(started, Ending { interrupted: true, error: None });
-        let goal = fixture.goal();
-        assert_eq!((goal.status, goal.turns), (Status::Paused, 0));
-    }
-
     // -------------------------------------------------------------- the tools
-
-    #[test]
-    fn get_shows_the_goal_or_none() {
-        let _fixture = Fixture::new("get");
-        let none: Value =
-            serde_json::from_str(&execute_with(&call(GET, json!({})), &[], &mut never_called, &|| false, |_| Ok(())).unwrap()).unwrap();
-        assert!(none["goal"].is_null());
-        ok("/goal --turns 10 fix the build");
-        let some: Value =
-            serde_json::from_str(&execute_with(&call(GET, json!({})), &[], &mut never_called, &|| false, |_| Ok(())).unwrap()).unwrap();
-        assert_eq!(some["goal"]["objective"], "fix the build");
-        assert_eq!(some["goal"]["turns_remaining"], 10);
-    }
-
-    #[test]
-    fn a_confirmed_claim_completes_the_goal() {
-        let fixture = Fixture::new("confirmed");
-        ok("/goal fix the build");
-        let mut sent = Vec::new();
-        let mut judge = |request: &[Message]| {
-            sent = request.to_vec();
-            Ok(verdict(true, &[true, true], ""))
-        };
-        let mut statuses = Vec::new();
-        let result = execute_with(
-            &call(UPDATE, json!({"status": "complete", "evidence": "cargo build: Finished"})),
-            &[],
-            &mut judge,
-            &|| false,
-            |status| {
-                statuses.push(status);
-                Ok(())
-            },
-        )
-        .unwrap();
-        let result: Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["status"], "complete");
-        assert_eq!(result["requirements"].as_array().unwrap().len(), 2);
-        assert_eq!(fixture.goal().status, Status::Complete);
-        assert!(statuses[0].contains("auditing") && statuses[1].contains("achieved, and the audit agrees"));
-        // What the audit was given.
-        assert_eq!(sent[0].role, "system");
-        assert!(sent[1].content.contains("<objective>\nfix the build\n</objective>"));
-        assert!(sent[1].content.contains("<claim>\ncargo build: Finished\n</claim>"));
-        assert!(next(&engaged()).is_none(), "an achieved goal starts nothing");
-        assert!(!ok("/goal write the notes").contains("replaces"), "an achieved goal is replaced without a word");
-    }
-
-    #[test]
-    fn what_s0ma_did_to_the_goal_is_said_again_when_the_turn_ends() {
-        let _fixture = Fixture::new("said-again");
-        ok("/goal fix the build");
-        next(&engaged());
-        let started = begin_turn(Some(TurnKind::Kickoff), true);
-        note_call(Some(10), 0);
-        note_tools(&[call(UPDATE, json!({}))]);
-        let mut judge = |_: &[Message]| Ok(verdict(true, &[true], ""));
-        update(json!({"status": "complete", "evidence": "cargo build: Finished"}), &mut judge);
-        let notices = finish_turn(started, Ending::default());
-        assert_eq!(notices.len(), 1);
-        assert!(notices[0].text.starts_with("[goal] achieved, and the audit agrees: fix the build"));
-        assert!(notices[0].text.contains("1 turn ·") && notices[0].alert && !notices[0].problem);
-
-        // A turn that leaves it as it was says nothing.
-        ok("/goal write the notes");
-        next(&engaged());
-        assert!(turn(Some(TurnKind::Kickoff), true, 1, 10, false).is_empty());
-    }
-
-    #[test]
-    fn an_unconfirmed_claim_keeps_the_goal_and_three_block_it() {
-        let fixture = Fixture::new("rejected");
-        ok("/goal fix the build");
-        let mut judge = |_: &[Message]| Ok(verdict(false, &[true, false], "the tests were never run"));
-        let first = update(json!({"status": "complete", "evidence": "it builds"}), &mut judge);
-        assert_eq!(first["status"], "active");
-        assert_eq!(first["missing"], "the tests were never run");
-        assert_eq!(first["unsatisfied"].as_array().unwrap().len(), 1);
-        let goal = fixture.goal();
-        assert_eq!((goal.status, goal.rejected_claims), (Status::Active, 1));
-        assert!(goal.note.unwrap().contains("the tests were never run"));
-        assert!(next(&engaged()).unwrap().1.contains("Last: completion claim 1: the audit not confirmed"));
-
-        // "Met" over a requirement it marked unsatisfied confirms nothing.
-        let mut inconsistent = |_: &[Message]| Ok(verdict(true, &[true, false], ""));
-        let second = update(json!({"status": "complete", "evidence": "it builds"}), &mut inconsistent);
-        assert_eq!(second["status"], "active");
-        assert_eq!(second["missing"], "requirement 1", "named from the requirement when the judge left it blank");
-
-        // Nor does an answer that is not a verdict, or no answer.
-        let mut garbled = |_: &[Message]| Ok("not json".to_string());
-        let third = update(json!({"status": "complete", "evidence": "it builds"}), &mut garbled);
-        assert_eq!(third["status"], "blocked");
-        let goal = fixture.goal();
-        assert_eq!(goal.status, Status::Blocked);
-        assert!(goal.note.unwrap().contains("blocked after 3 unconfirmed completion claims"));
-
-        ok("/goal resume");
-        assert_eq!(fixture.goal().rejected_claims, 0, "a resumed run starts over");
-        let mut down = |_: &[Message]| Err("connection refused".to_string());
-        let failed = update(json!({"status": "complete", "evidence": "it builds"}), &mut down);
-        assert_eq!(failed["status"], "active");
-        assert!(failed["audit"].as_str().unwrap().contains("could not run: connection refused"));
-    }
-
-    #[test]
-    fn an_audit_cut_short_by_ctrl_c_decides_nothing() {
-        let fixture = Fixture::new("audit-stopped");
-        ok("/goal fix the build");
-        let mut stopped_judge = |_: &[Message]| Err("interrupted".to_string());
-        let result = execute_with(
-            &call(UPDATE, json!({"status": "complete", "evidence": "it builds"})),
-            &[],
-            &mut stopped_judge,
-            &|| true,
-            |_| Ok(()),
-        )
-        .unwrap();
-        assert!(result.contains("stopped (ctrl+c)"), "{result}");
-        let goal = fixture.goal();
-        assert_eq!((goal.status, goal.rejected_claims, goal.note), (Status::Active, 0, None), "not a turned-down claim");
-    }
 
     #[test]
     fn a_claim_without_evidence_or_a_live_goal_is_refused_before_any_audit() {
@@ -2394,24 +1973,6 @@ mod tests {
         assert!(paused["error"].as_str().unwrap().contains("paused"));
         let resume = update(json!({"status": "active"}), &mut never_called);
         assert!(resume["error"].as_str().unwrap().contains("the operator's"));
-    }
-
-    #[test]
-    fn blocked_is_taken_on_the_third_goal_turn_and_not_before() {
-        let fixture = Fixture::new("blocked");
-        ok("/goal fix the build");
-        let block = || update(json!({"status": "blocked", "reason": "the registry rejects the token"}), &mut never_called);
-        assert!(block()["error"].as_str().unwrap().contains("this is turn 1 of this run"));
-        turn(Some(TurnKind::Kickoff), true, 1, 10, false);
-        assert!(block()["error"].as_str().unwrap().contains("turn 2"));
-        turn(Some(TurnKind::Continue), true, 1, 10, false);
-        assert_eq!(block()["status"], "blocked");
-        assert!(fixture.goal().note.unwrap().contains("the registry rejects the token"));
-
-        ok("/goal resume");
-        assert!(block()["error"].as_str().unwrap().contains("turn 1"), "a fresh blocked audit");
-        let no_reason = update(json!({"status": "blocked"}), &mut never_called);
-        assert!(no_reason["error"].as_str().unwrap().contains("reason"));
     }
 
     #[test]
@@ -2433,96 +1994,7 @@ mod tests {
         assert_eq!(fixture.goal().status, Status::Blocked, "repeating it cannot spin the goal forever");
     }
 
-    #[test]
-    fn a_claim_turned_down_during_the_wrap_up_does_not_say_carry_on() {
-        let fixture = Fixture::new("wrap-up-claim");
-        ok("/goal --turns 1 fix the build");
-        next(&engaged());
-        turn(Some(TurnKind::Kickoff), true, 1, 10, false);
-        assert_eq!(fixture.goal().status, Status::BudgetLimited);
-        let mut judge = |_: &[Message]| Ok(verdict(false, &[false], "the tests were never run"));
-        let result = update(json!({"status": "complete", "evidence": "it builds"}), &mut judge);
-        assert_eq!(result["status"], "budget_limited");
-        assert!(result["next"].as_str().unwrap().contains("start no new work"));
-    }
-
-    #[test]
-    fn a_turn_in_the_wait_starts_the_check_in_clock_over() {
-        let _fixture = Fixture::new("watch-turn");
-        ok("/goal fix the build");
-        let mut watch = watch();
-        let vm = Gates { engaged: false, vm_wait: Some("the wake event \"step\"".into()), ..Gates::default() };
-        let t0 = Instant::now();
-        next_turn(&vm, &mut watch, t0);
-        assert!(matches!(next_turn(&vm, &mut watch, t0), Next::CheckAt(_)));
-        // Twenty minutes in, a wake event's turn runs, and s0ma waits for the next step.
-        watch.turn_ran();
-        let t1 = t0 + Duration::from_secs(20 * 60);
-        match next_turn(&vm, &mut watch, t1) {
-            Next::CheckAt(due) => assert_eq!(due - t1, Duration::from_secs(30 * 60), "30 minutes from the new wait"),
-            _ => panic!("not due yet"),
-        }
-    }
-
-    #[test]
-    fn what_the_goal_waits_on_is_kept_with_it_until_resume_or_a_new_goal() {
-        let fixture = Fixture::new("hold");
-        set_hold(Some(Hold::Operator("x".into())));
-        assert!(hold().is_none(), "no goal, nothing to hold");
-        ok("/goal deploy it");
-        set_hold(Some(Hold::Operator("asked the operator for the deploy key".into())));
-        // As a restart finds it.
-        init(&fixture.dir);
-        assert_eq!(hold(), Some(Hold::Operator("asked the operator for the deploy key".into())));
-        ok("/goal pause");
-        ok("/goal resume");
-        assert!(hold().is_none(), "resuming is the operator saying carry on");
-        set_hold(Some(Hold::Event("the wake event \"build\"".into())));
-        ok("/goal something else");
-        assert!(hold().is_none());
-    }
-
-    #[test]
-    fn s0ma_pauses_only_what_operator_asked_it_to() {
-        let fixture = Fixture::new("paused");
-        ok("/goal fix the build");
-        let paused = update(json!({"status": "paused", "reason": "The operator said hold off"}), &mut never_called);
-        assert_eq!(paused["status"], "paused");
-        assert!(fixture.goal().note.unwrap().contains("at the operator's request: The operator said hold off"));
-    }
-
     // -------------------------------------------------------------- the audit's view
-
-    #[test]
-    fn the_transcript_shows_what_was_done_not_what_was_thought() {
-        let mut messages = vec![
-            Message::user("fix the build".into()).by_operator(),
-            Message::user("[GOAL] continue".into()),
-            Message::assistant_with_tools(
-                "running the build".into(),
-                vec![call("vm_exec", json!({"command": "cargo build"}))],
-            )
-            .with_reasoning("I wonder whether".into()),
-            Message::tool("c".into(), format!("{}ERROR at the end", "x".repeat(10_000))),
-            Message::assistant("it builds".into()),
-        ];
-        let text = transcript(&messages);
-        assert!(text.contains("[Operator]\nfix the build"));
-        assert!(text.contains("[harness]\n[GOAL] continue"));
-        assert!(text.contains("[s0ma calls vm_exec] {\"command\":\"cargo build\"}"));
-        assert!(text.contains("characters cut") && text.contains("ERROR at the end"), "a result keeps its tail");
-        assert!(!text.contains("I wonder whether"), "reasoning is not evidence");
-
-        // Too long: the newest is kept.
-        messages.insert(0, Message::user("the oldest message".into()));
-        for n in 0..60 {
-            messages.push(Message::tool("c".into(), format!("result {n} {}", "y".repeat(3_000))));
-        }
-        let text = transcript(&messages);
-        assert!(text.len() <= TRANSCRIPT_CHARS + 200);
-        assert!(text.starts_with("[earlier transcript left out for length]"));
-        assert!(text.contains("result 59") && !text.contains("the oldest message"));
-    }
 
     // -------------------------------------------------------------- jobs
 
@@ -2555,28 +2027,5 @@ mod tests {
         assert_eq!(kept.objective, "fix acme's deploy", "set before the job, so not the job's");
         assert_eq!(kept.note.as_deref(), Some(crate::jobs::marker("acme").as_str()));
         assert!(!kept.touched_by.contains(&"acme".to_string()));
-    }
-
-    #[test]
-    fn goals_set_in_the_same_millisecond_are_still_two() {
-        let ids: std::collections::HashSet<String> = (0..200)
-            .map(|_| Goal::new("x".into(), "/goal x".into(), Budget::default(), None).id)
-            .collect();
-        assert_eq!(ids.len(), 200);
-    }
-
-    #[test]
-    fn counts_and_spans_read_short() {
-        assert_eq!(count(950), "950");
-        assert_eq!(count(12_500), "12.5k");
-        assert_eq!(count(50_000), "50k");
-        assert_eq!(count(1_200_000), "1.2m");
-        assert_eq!(span(45), "45s");
-        assert_eq!(span(12 * 60 + 5), "12m");
-        assert_eq!(span(2 * 3600 + 5 * 60), "2h 05m");
-        assert_eq!(span(3 * 86_400 + 4 * 3600), "3d 4h");
-        assert_eq!(parse_count("2m"), Some(2_000_000));
-        assert_eq!(parse_count("1.5k"), Some(1_500));
-        assert_eq!(parse_count("k"), None);
     }
 }

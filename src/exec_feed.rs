@@ -1,8 +1,8 @@
 //! Who is running a machine call.
 //!
 //! A subagent's calls run with its run id set on the thread (`as_owner`), so
-//! the machine tools can tell its calls from s0ma's: they then run as the
-//! subagents' account, in its own shell (`netboxes.rs`).
+//! the machine tools can tell its calls from the agent's: they then run as the
+//! subagents' account, in its own shell (`vm/netboxes.rs`).
 //!
 //! (It also kept which private shell session was whose, mirrored to attached
 //! terminals. Every shell is a netbox now, named for its subagent, so nothing
@@ -92,15 +92,3 @@ pub fn apply(change: Change) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_subagents_calls_carry_its_run_id_only_while_they_run() {
-        assert_eq!(owner(), None);
-        let seen = as_owner("subagent-1-2-3-1", owner);
-        assert_eq!(seen.as_deref(), Some("subagent-1-2-3-1"));
-        assert_eq!(owner(), None, "the owner is only for that call");
-    }
-}

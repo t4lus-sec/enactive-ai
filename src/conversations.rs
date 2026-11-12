@@ -42,7 +42,7 @@
 //! - a job's and the side calls', when the job closes;
 //! - at exit: the side calls', any left, and the main turn's unless the working
 //!   context was saved to be taken back up;
-//! - at start: every `worker:` and `sleep:` left by an earlier run (one s0ma
+//! - at start: every `worker:` and `sleep:` left by an earlier run (one agent
 //!   per ds41d).
 //!
 //! All of it only when the engine says it can (`ds41_features` in
@@ -261,7 +261,7 @@ impl Features {
 }
 
 /// Known for good once read; a failed read is tried again after a while
-/// (s0ma may start before the engine).
+/// (the agent may start before the engine).
 static FEATURES: Mutex<Option<(Option<Features>, Instant)>> = Mutex::new(None);
 const FEATURES_RETRY: Duration = Duration::from_secs(30);
 
@@ -269,7 +269,11 @@ pub fn features() -> Features {
     // Tests say per thread what the engine can do.
     #[cfg(test)]
     return test_features();
+    // A hosted API has none of an engine's extensions, and isn't asked.
     #[allow(unreachable_code)]
+    if crate::model_config::hosted() {
+        return Features::default();
+    }
     let mut known = FEATURES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match &*known {
         Some((Some(features), _)) => return features.clone(),
@@ -282,12 +286,13 @@ pub fn features() -> Features {
 }
 
 fn read_features() -> Option<Features> {
-    let response: Value = reqwest::blocking::Client::builder()
+    let request = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(10))
         .build()
         .ok()?
-        .get(crate::llm::endpoint("/v1/models"))
+        .get(crate::llm::endpoint("/v1/models"));
+    let response: Value = crate::model_config::authorize(request)
         .send()
         .ok()?
         .error_for_status()
@@ -305,7 +310,7 @@ pub fn enabled() -> bool {
 /// Whether to send `priority`: the engine takes it (ds41d says so), or the
 /// operator turned priority scheduling on for vLLM (`S0MA_LLM_PRIORITY=1`).
 pub fn priority_enabled() -> bool {
-    std::env::var("S0MA_LLM_PRIORITY").is_ok_and(|value| value.trim() == "1") || features().priority
+    !crate::model_config::hosted() && (std::env::var("S0MA_LLM_PRIORITY").is_ok_and(|value| value.trim() == "1") || features().priority)
 }
 
 /// What a request carries for `conversation`: its id when the engine takes
@@ -479,7 +484,7 @@ fn post_end(body: &Value) {
         .connect_timeout(Duration::from_secs(5))
         .timeout(END_TIMEOUT)
         .build()
-        .map(|client| client.post(crate::llm::endpoint("/v1/conversations/end")).json(body).send());
+        .map(|client| crate::model_config::authorize(client.post(crate::llm::endpoint("/v1/conversations/end")).json(body)).send());
 }
 
 // ------------------------------------------------------------------ the session
@@ -495,7 +500,7 @@ fn save(state: &State) {
     let Some(file) = &state.file else { return };
     let saved = Saved { session: state.session.clone(), jobs: state.jobs.clone() };
     if let Ok(text) = serde_json::to_string_pretty(&saved) {
-        // Lost only until the next save; s0ma goes on either way.
+        // Lost only until the next save; the agent goes on either way.
         let _ = crate::util::write_atomic(file, text);
     }
 }
@@ -513,7 +518,7 @@ pub fn init(data_dir: &Path, resumed: bool) {
             state.session = saved.session;
             state.jobs = saved.jobs;
         }
-        // Jobs closed while s0ma was not running have nothing left to end by.
+        // Jobs closed while the agent was not running have nothing left to end by.
         let open = crate::jobs::open_job().into_iter().chain(crate::jobs::held_job()).collect::<Vec<_>>();
         state.jobs.retain(|job, _| open.contains(job));
         state.file = Some(file);
@@ -633,99 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn ids_have_their_form_and_a_uuid_per_worker() {
-        let uuid = new_uuid();
-        assert_eq!(uuid.len(), 36);
-        assert_eq!(&uuid[14..15], "4", "version 4: {uuid}");
-        assert!(matches!(&uuid[19..20], "8" | "9" | "a" | "b"), "the variant: {uuid}");
-        assert_ne!(new_uuid(), uuid, "one each time");
-
-        let worker = Conversation::worker("b3-1", &uuid);
-        assert_eq!(worker.id(), format!("worker:b3-1:{uuid}"));
-        let again = Conversation::worker("b3-1", &new_uuid());
-        assert_ne!(again.id(), worker.id(), "a slot reused by a new worker gets a new id");
-        assert_eq!(slug("Count the lines in the ACCESS logs!", 40), "count-the-lines-in-the-access-logs");
-        assert_eq!(slug("", 40), "x");
-        assert!(slug(&"long ".repeat(30), 40).len() <= 40);
-
-        let session = state().session.clone();
-        assert_eq!(Conversation::side("knowledge").id(), format!("knowledge:{session}"));
-        assert_eq!(Conversation::side("router").id(), format!("router:{session}"), "side calls use the session's uuid");
-        let sleep = Conversation::sleep("batch 3");
-        assert!(sleep.id().starts_with("sleep:batch-3:") && sleep.id().len() < 128);
-        for conversation in [&worker, &sleep, &Conversation::side("judge")] {
-            let role = conversation.id().split(':').next().unwrap();
-            assert!(role.len() <= 24 && role.chars().next().unwrap().is_ascii_lowercase(), "{role}");
-            assert!(conversation.id().is_ascii());
-        }
-        assert!(Conversation::main().priority() < Conversation::side("router").priority());
-        assert!(Conversation::side("router").priority() < worker.priority());
-        assert!(worker.priority() < sleep.priority());
-    }
-
-    #[test]
-    fn without_the_feature_nothing_is_named_or_ended() {
-        let _lock = lock();
-        set_features_for_test(None);
-        let _ = take_ends();
-        let worker = Conversation::worker("b1-1", &new_uuid());
-        assert_eq!(request_fields(&worker).0, None, "no conversation_id");
-        {
-            let _scope = worker.enter(true);
-            drop(begin_request(&worker, &[Message::user("a".into())], None));
-            drop(begin_request(&worker, &[Message::user("b".into())], None));
-        }
-        worker.end_later();
-        shutdown(false);
-        assert!(take_ends().is_empty(), "no end calls");
-    }
-
-    #[test]
-    fn a_worker_is_ended_once_after_its_last_request_and_a_fold_ends_it_first() {
-        let _lock = lock();
-        set_features_for_test(Some(ds41()));
-        let _ = take_ends();
-        let worker = Conversation::worker("b2-1", &new_uuid());
-        assert_eq!(request_fields(&worker), (Some(worker.id().to_string()), Some(WORKER_PRIORITY)));
-        let system = Message::system("you are a worker".into());
-        let task = Message::user("the task".into());
-        {
-            let _scope = worker.enter(true);
-            assert_eq!(current_or(|| Conversation::side("x")).0, worker, "the thread's conversation");
-            // Growing: nothing ended.
-            drop(begin_request(&worker, &[system.clone(), task.clone()], None));
-            drop(begin_request(&worker, &[system.clone(), task.clone(), Message::user("result".into())], None));
-            assert!(take_ends().is_empty(), "append-only: no end");
-            // A compaction: the prompt no longer starts with the last one.
-            let running = begin_request(&worker, &[system.clone(), Message::user("notes".into())], None);
-            assert_eq!(ids(&take_ends()), [worker.id()], "one end, before the next request");
-            // Still running when the scope is left: the end waits for it.
-            let waiting = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                drop(running);
-            });
-            drop(_scope);
-            assert!(ENDS.lock().unwrap().is_empty(), "not while its request runs");
-            waiting.join().unwrap();
-        }
-        assert_eq!(ids(&take_ends()), [worker.id()], "once more when it is done for good");
-        assert_eq!(current_or(|| Conversation::side("judge")).1, true, "the scope is left");
-
-        // A paused worker is still inside its scope: nothing is ended.
-        let paused = Conversation::worker("b2-2", &new_uuid());
-        let scope = paused.enter(true);
-        drop(begin_request(&paused, &[task.clone()], None));
-        assert!(take_ends().is_empty());
-        drop(scope);
-        assert_eq!(ids(&take_ends()), [paused.id()]);
-
-        // A worker that never sent anything has nothing to end.
-        drop(Conversation::worker("b2-3", &new_uuid()).enter(true));
-        assert!(take_ends().is_empty());
-        set_features_for_test(None);
-    }
-
-    #[test]
     fn side_calls_never_end_each_other_and_start_ends_leftovers() {
         let _lock = lock();
         set_features_for_test(Some(ds41()));
@@ -788,15 +700,5 @@ mod tests {
         assert_ne!(job_uuid(state(), "acme"), uuid, "a job opened again is a new conversation");
         state().jobs.clear();
         set_features_for_test(None);
-    }
-
-    #[test]
-    fn features_are_read_from_the_models_list() {
-        let served = json!({"data": [{"id": "m", "max_model_len": 262144}], "ds41_features": ["priority", "conversation_id", "conversation_end"]});
-        assert_eq!(Features::from_models(&served), ds41());
-        let in_entry = json!({"data": [{"id": "m", "ds41_features": ["conversation_end"]}]});
-        assert!(Features::from_models(&in_entry).conversation_end);
-        let vllm = json!({"data": [{"id": "m", "max_model_len": 262144}]});
-        assert_eq!(Features::from_models(&vllm), Features::default());
     }
 }

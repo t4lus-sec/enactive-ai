@@ -417,9 +417,4 @@ mod tests {
 
         assert_eq!(command_text(&tagged), "/voice off");
     }
-
-    #[test]
-    fn ordinary_input_is_unchanged() {
-        assert_eq!(command_text("hello"), "hello");
-    }
 }

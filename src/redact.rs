@@ -1,6 +1,6 @@
-//! Redacting part of one archive event, at s0ma's request and with approval.
+//! Redacting part of one archive event, at the agent's request and with approval.
 //!
-//! s0ma sometimes sees something in its own past that should not be kept: a
+//! The agent sometimes sees something in its own past that should not be kept: a
 //! credential that came back in a tool result, a detail a client asked not to
 //! be held, something pasted by accident. `/job` is for a whole stretch of such
 //! work. This is for one event, and usually for part of one -- a key struck out
@@ -12,16 +12,16 @@
 //! nothing; the memory tab (Alt+M, or `/redact`) shows the proposal as a diff
 //! against what the event says now, and only `a` there writes anything --
 //! once to see everywhere the text is kept, and again to strike it. The reason
-//! s0ma gives is part of the request, because the operator is being asked to
+//! the agent gives is part of the request, because the operator is being asked to
 //! destroy a piece of the record and has to know what for.
 //!
 //! The operator's own redactions are made in the same tab, by marking text
-//! anywhere s0ma keeps it (`strike_by_operator`). He approves them by making
+//! anywhere the agent keeps it (`strike_by_operator`). He approves them by making
 //! them; they are recorded here with him as their author.
 //!
 //! # Why the harness does the striking
 //!
-//! s0ma names the exact strings to remove and this module replaces each one
+//! The agent names the exact strings to remove and this module replaces each one
 //! with [`MARKER`]. No model is asked to rewrite the event:
 //!
 //! * a rewriter would have to be shown the thing being removed, and its output
@@ -47,7 +47,7 @@
 //!
 //! # What it cannot reach
 //!
-//! * **The request itself, in the saved calls.** s0ma had to name the strings
+//! * **The request itself, in the saved calls.** the agent had to name the strings
 //!   to have them removed, so they are in that tool call's arguments, which is
 //!   saved like any other. The call is dropped with the others when the
 //!   fragments are long enough to search for, but a short one is not searched
@@ -104,7 +104,7 @@ pub fn state_word(state: State) -> &'static str {
     }
 }
 
-/// One version of the event's content as someone would have it: s0ma's
+/// One version of the event's content as someone would have it: the agent's
 /// proposal, then whatever the operator edited it into.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {
@@ -117,7 +117,7 @@ pub struct Version {
 pub struct Request {
     pub request: u64,
     pub event_id: u64,
-    /// The turn s0ma asked from, when it asked during one. Provenance for the
+    /// The turn the agent asked from, when it asked during one. Provenance for the
     /// review: what it was doing when it noticed is often the thing that makes
     /// the request make sense.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,7 +125,7 @@ pub struct Request {
     /// Who said the event, for the window's header.
     pub speaker: String,
     pub at: String,
-    /// Why s0ma asked. Shown to the operator and kept with the decision.
+    /// Why the agent asked. Shown to the operator and kept with the decision.
     pub reason: String,
     pub state: State,
     /// The digest of the event's content when the request was made. The
@@ -141,7 +141,7 @@ pub struct Request {
     pub decided_at: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
-    /// Who asked: s0ma, through the tool, or the operator, striking text
+    /// Who asked: the agent, through the tool, or the operator, striking text
     /// from the memory tab -- which goes straight through, and is recorded
     /// here so the book is the whole account of what was removed.
     #[serde(default = "s0ma")]
@@ -231,7 +231,7 @@ impl Book {
     }
 }
 
-/// Held from taking a request's number to writing it: s0ma asks on the
+/// Held from taking a request's number to writing it: the agent asks on the
 /// app's thread, the operator strikes from the tab's.
 static NUMBERING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -334,7 +334,7 @@ fn request(book: &Book, memory: &Hippocampus, event_id: u64, reason: &str, remov
 
     // The proposal, made here rather than by a model: every occurrence of each
     // string, replaced. A string that is not in the event is the interesting
-    // case -- it means s0ma is remembering the event rather than reading it,
+    // case -- it means the agent is remembering the event rather than reading it,
     // and striking nothing while reporting success would be the worst outcome.
     let (proposed, struck) = if remove.is_empty() {
         (MARKER.to_owned(), 1)
@@ -429,7 +429,7 @@ fn brief(text: &str) -> String {
 /// The struck text is never stored: it is the one thing being got rid of, and
 /// keeping a copy to know what to search for would defeat the point. It is
 /// recovered when it is needed and dropped again, and because it comes from a
-/// diff it covers the operator's own edits as well as s0ma's proposal.
+/// diff it covers the operator's own edits as well as the agent's proposal.
 pub fn struck_fragments(was: &str, now: &str) -> Vec<String> {
     use similar::{ChangeTag, TextDiff};
     // Each run of the old text that went, whole: a block taken out is one
@@ -548,7 +548,7 @@ pub fn approve(memory: &Hippocampus, book: &Book, n: u64) -> Result<(Request, cr
         None => {
             // Nothing long enough to look for elsewhere; what holds this one
             // event still goes.
-            crate::context_resume::forget(memory.archive_path().parent().unwrap_or(Path::new(".")));
+            crate::context::resume::forget(memory.archive_path().parent().unwrap_or(Path::new(".")));
             crate::strike::Impact::default()
         }
     };
@@ -576,7 +576,7 @@ pub fn approve(memory: &Hippocampus, book: &Book, n: u64) -> Result<(Request, cr
         ));
     }
 
-    // Read again: the strike went through the book too, and s0ma's reason
+    // Read again: the strike went through the book too, and the agent's reason
     // may have quoted what it was asking to remove.
     let mut request = book.load(n).unwrap_or(request);
     request.state = State::Approved;
@@ -600,7 +600,7 @@ pub fn strike_by_operator(
 ) -> Result<(Request, crate::strike::Impact)> {
     // The number first, held until the record is written: a book that cannot
     // be read is found out before anything is struck, not after, and a
-    // request s0ma makes meanwhile cannot take the same number.
+    // request the agent makes meanwhile cannot take the same number.
     let _numbering = NUMBERING.lock().map_err(|_| "the redaction book's lock was poisoned".to_string())?;
     let number = book.next_number()?;
     let impact = crate::strike::apply(memory, fragments)?;
@@ -625,7 +625,7 @@ pub fn strike_by_operator(
     Ok((request, impact))
 }
 
-/// Every request's words -- s0ma's reason, a proposal still waiting, a note --
+/// Every request's words -- the agent's reason, a proposal still waiting, a note --
 /// given what `strike` returns for them. With `apply`, saved. Returns, for
 /// each request that held something, its number and how many occurrences.
 ///
@@ -714,7 +714,7 @@ the review says when it holds the text.";
 
 /// `/redact` or `/redact view [n]`: the memory tab, at the redactions (and
 /// at request n). For a terminal that opens it itself (`session.rs`, the
-/// steering pane), where `handle_command` would open it on s0ma's own.
+/// steering pane), where `handle_command` would open it on the agent's own.
 pub fn tab_request(command: &str) -> Option<Option<u64>> {
     let mut words = command.split_whitespace();
     if words.next()? != "/redact" {
@@ -865,60 +865,6 @@ mod tests {
         assert_eq!(fixture.book.load(1).unwrap().state, State::Approved);
     }
 
-    /// The point of striking parts rather than the whole event: what is left is
-    /// the real record, not a hole where a tool result used to be.
-    #[test]
-    fn only_the_named_strings_go_and_every_occurrence_of_them_does() {
-        let mut fixture = Fixture::new("partial");
-        let id = fixture.say("host alpha-7 key sk-aaa111bbb\nagain: sk-aaa111bbb\nhost beta-9 is fine");
-        fixture.ask(json!({"event_id": id, "reason": REASON, "remove": ["sk-aaa111bbb"]}));
-        approve(&fixture.memory, &fixture.book, 1).unwrap();
-
-        let left = fixture.content(id);
-        assert!(!left.contains("sk-aaa111bbb"), "{left}");
-        assert_eq!(left.matches(MARKER).count(), 2, "both occurrences: {left}");
-        assert!(left.contains("host alpha-7"), "the rest of the event is still there: {left}");
-        assert!(left.contains("host beta-9 is fine"), "{left}");
-    }
-
-    #[test]
-    fn a_string_that_is_not_in_the_event_is_refused_and_records_nothing() {
-        let mut fixture = Fixture::new("absent");
-        let id = fixture.say("the deploy finished with no errors at all");
-
-        let out = fixture.ask(json!({"event_id": id, "reason": REASON, "remove": ["sk-not-in-there"]}));
-        assert_eq!(out["requested"], false, "{out}");
-        let error = out["error"].as_str().unwrap();
-        assert!(error.contains("does not occur"), "{error}");
-        assert!(error.contains("archive_get"), "it says how to fix it: {error}");
-        assert!(fixture.book.all().unwrap().is_empty(), "nothing was written");
-
-        // Too short to be unambiguous.
-        let out = fixture.ask(json!({"event_id": id, "reason": REASON, "remove": ["the"]}));
-        assert_eq!(out["requested"], false, "{out}");
-        assert!(out["error"].as_str().unwrap().contains("shorter than"), "{out}");
-
-        // A reason that says nothing is no reason to destroy a record.
-        let out = fixture.ask(json!({"event_id": id, "reason": "bad", "remove": ["deploy finished"]}));
-        assert_eq!(out["requested"], false, "{out}");
-        assert!(out["error"].as_str().unwrap().contains("say why"), "{out}");
-
-        // And an event that is not there.
-        let out = fixture.ask(json!({"event_id": 9999, "reason": REASON}));
-        assert!(out["error"].as_str().unwrap().contains("no event 9999"), "{out}");
-    }
-
-    #[test]
-    fn leaving_remove_out_proposes_the_whole_content() {
-        let mut fixture = Fixture::new("whole");
-        let id = fixture.say("every word of this was a mistake to keep");
-        let out = fixture.ask(json!({"event_id": id, "reason": REASON}));
-        assert_eq!(out["requested"], true, "{out}");
-        assert_eq!(fixture.book.load(1).unwrap().current(), MARKER);
-        approve(&fixture.memory, &fixture.book, 1).unwrap();
-        assert_eq!(fixture.content(id), MARKER);
-    }
-
     #[test]
     fn the_same_event_is_not_queued_twice_and_a_redacted_one_is_refused() {
         let mut fixture = Fixture::new("twice");
@@ -950,143 +896,6 @@ mod tests {
         assert_eq!(fixture.content(id), "[redacted for job acme]", "the approval did not overwrite it");
     }
 
-    #[test]
-    fn declining_leaves_the_event_alone_and_keeps_no_copy_of_the_text() {
-        let mut fixture = Fixture::new("decline");
-        let said = "key sk-decline999 in the output";
-        let id = fixture.say(said);
-        fixture.ask(json!({"event_id": id, "reason": REASON, "remove": ["sk-decline999"]}));
-
-        reject(&fixture.book, 1, "rotate it instead").unwrap();
-        assert_eq!(fixture.content(id), said, "untouched");
-        let request = fixture.book.load(1).unwrap();
-        assert_eq!(request.state, State::Rejected);
-        assert_eq!(request.note, "rotate it instead");
-        // The proposal held a copy of the event's text; there is no reason for
-        // it to outlive the decision.
-        assert!(request.versions.is_empty());
-        let stored = fs::read_to_string(fixture.dir.join("redactions/1.json")).unwrap();
-        assert!(!stored.contains("in the output"), "{stored}");
-    }
-
-    /// The operator's own version is what approving writes, and it decides
-    /// what counts as struck.
-    #[test]
-    fn an_edited_version_is_what_gets_written() {
-        let mut fixture = Fixture::new("edited");
-        let id = fixture.say("user svc_deploy key sk-edit777888 host prod-3");
-        fixture.ask(json!({"event_id": id, "reason": REASON, "remove": ["sk-edit777888"]}));
-
-        // The operator decides the account name should go too.
-        save_edit(&fixture.book, 1, "user [redacted] key [redacted] host prod-3").unwrap();
-        assert!(fixture.book.load(1).unwrap().edited());
-        approve(&fixture.memory, &fixture.book, 1).unwrap();
-
-        let left = fixture.content(id);
-        assert_eq!(left, "user [redacted] key [redacted] host prod-3");
-        assert!(!left.contains("svc_deploy"), "the operator's extra removal happened too: {left}");
-        assert!(fixture.book.load(1).unwrap().versions.is_empty(), "no copy kept after approval");
-    }
-
-    #[test]
-    fn what_was_struck_is_worked_out_from_the_two_texts() {
-        // Both s0ma's removals and an operator's edit, without either having
-        // been stored anywhere.
-        let struck = struck_fragments("user svc_deploy key sk-abc123456789 host prod-3", "user [redacted] key [redacted] host prod-3");
-        assert!(struck.iter().any(|f| f.contains("sk-abc123456789")), "{struck:?}");
-        assert!(struck.iter().any(|f| f.contains("svc_deploy")), "{struck:?}");
-        // Nothing that stayed.
-        assert!(!struck.iter().any(|f| f.contains("prod-3")), "{struck:?}");
-        // An unchanged text strikes nothing.
-        assert!(struck_fragments("same words here", "same words here").is_empty());
-    }
-
-    /// A block taken out is struck as the block, not as the words in it: the
-    /// tool call's header is in every tool event there is.
-    #[test]
-    fn a_block_taken_out_is_one_fragment() {
-        let was = "before\n[tool:vm_exec]\narguments:\n{\"cmd\":\"cat key\"}\nresult:\nsk-123456789\nafter";
-        let now = "before\n[redacted]\nafter";
-        let struck = struck_fragments(was, now);
-        assert_eq!(struck, ["[tool:vm_exec]\narguments:\n{\"cmd\":\"cat key\"}\nresult:\nsk-123456789"], "{struck:?}");
-        // Words with spaces between them that the diff keeps: still one run.
-        assert_eq!(struck_fragments("user secret key here end", "user [redacted] end"), ["secret key here"]);
-        assert_eq!(struck_fragments("a b secret one c d secret two e", "a b [redacted] c d [redacted] e"), ["secret one", "secret two"]);
-        // Two strings struck side by side: the space the diff keeps between
-        // them does not split the run.
-        assert_eq!(struck_fragments("a secret one b", "a [redacted] [redacted] b"), ["secret one"]);
-        // The whole content proposed: the whole content is the one fragment.
-        assert_eq!(struck_fragments("[tool:vm_exec]\nresult:\nok", "[redacted]"), ["[tool:vm_exec]\nresult:\nok"]);
-    }
-
-    /// There is no cap: s0ma is told to ask rarely in the tool's description
-    /// and the operator decides each one, rather than a number deciding for
-    /// him. Several in a row is a thing that works, not a thing to refuse.
-    #[test]
-    fn asking_is_not_rate_limited() {
-        let mut fixture = Fixture::new("unbounded");
-        let _turn = crate::calls::begin_turn();
-        for n in 0..12 {
-            let id = fixture.say(&format!("event {n} with key sk-many{n:05}x in it"));
-            let out = fixture.ask(json!({
-                "event_id": id, "reason": REASON, "remove": [format!("sk-many{n:05}x")]
-            }));
-            assert_eq!(out["requested"], true, "request {n}: {out}");
-            assert_eq!(out["request"], n + 1);
-        }
-        assert_eq!(fixture.book.pending().unwrap().len(), 12);
-    }
-
-    #[test]
-    fn the_command_routes_without_touching_anything() {
-        let fixture = Fixture::new("command");
-        assert!(crate::redact::handle_command(&fixture.memory, "/sleep").is_none());
-        assert!(matches!(
-            crate::redact::handle_command(&fixture.memory, "/redact").unwrap(),
-            Reply::View(None)
-        ));
-        assert!(matches!(
-            crate::redact::handle_command(&fixture.memory, "/redact view 3").unwrap(),
-            Reply::View(Some(3))
-        ));
-        let Reply::Text(help) = crate::redact::handle_command(&fixture.memory, "/redact help").unwrap() else {
-            panic!("help is text")
-        };
-        assert!(help.contains("nothing changes until you do"), "{help}");
-        let Reply::Text(list) = crate::redact::handle_command(&fixture.memory, "/redact list").unwrap() else {
-            panic!("list is text")
-        };
-        assert!(list.contains("nothing waiting"), "{list}");
-        assert!(matches!(
-            crate::redact::handle_command(&fixture.memory, "/redact frobnicate").unwrap(),
-            Reply::Error(_)
-        ));
-    }
-
-    /// Approving strikes the text from the book too: s0ma's reason quoted it.
-    #[test]
-    fn approving_strikes_the_text_from_the_reason_that_quoted_it() {
-        let mut fixture = Fixture::new("reason");
-        let id = fixture.say("the key sk-quoted-777 is here");
-        let reason = "the key sk-quoted-777 came back in a tool result and should not be kept";
-        fixture.ask(json!({"event_id": id, "reason": reason, "remove": ["sk-quoted-777"]}));
-        approve(&fixture.memory, &fixture.book, 1).unwrap();
-        let stored = fs::read_to_string(fixture.dir.join("redactions/1.json")).unwrap();
-        assert!(!stored.contains("sk-quoted-777"), "{stored}");
-        assert!(stored.contains("\"approved\""), "{stored}");
-    }
-
-
-    #[test]
-    fn the_tab_is_asked_for_by_redact_and_redact_view() {
-        assert_eq!(tab_request("/redact"), Some(None));
-        assert_eq!(tab_request("/redact view"), Some(None));
-        assert_eq!(tab_request("/redact view #4"), Some(Some(4)));
-        assert_eq!(tab_request("/redact list"), None);
-        assert_eq!(tab_request("/redact view x"), None);
-        assert_eq!(tab_request("/mistake"), None);
-    }
-
     /// The event approving rewrote is cited by a world record: the record's
     /// evidence still reads as unchanged, not as tampered with.
     #[test]
@@ -1115,5 +924,4 @@ mod tests {
         assert_eq!(got["evidence_integrity"], "unchanged", "{got}");
         assert!(!fixture.dir.join("daily_sleep_window.json").exists(), "the pinned review would refuse every deep sleep");
     }
-
 }

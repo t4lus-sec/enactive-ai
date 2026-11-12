@@ -1,12 +1,8 @@
-#[path = "tool_output.rs"]
 mod tool_output;
 pub(crate) use tool_output::{
     is_stub, limit_tool_output, limit_worker_output, locate_in_archive, page_stub, reread_stub, result_matches,
     result_page, source_truncation, worker_stub, WORKER_VISIBLE_CHARS,
 };
-#[cfg(test)]
-pub(crate) use tool_output::limit_worker_output_offline;
-#[path = "background_status.rs"]
 mod background;
 pub(crate) use background::{background_log, background_scope, background_status, configure_background_log, report_background_status, sleep_status, status};
 macro_rules! diagnostic { ($($args:tt)*) => { crate::llm::status(format_args!($($args)*)) }; }
@@ -111,6 +107,7 @@ where
 fn send_model_request(
     request: reqwest::blocking::RequestBuilder,
 ) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
+    let request = crate::model_config::authorize(request);
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
@@ -164,18 +161,16 @@ where
     ))
 }
 
-// ---- vLLM endpoint ----
+// ---- the model server ----
 //
-// The backend is vLLM's OpenAI-compatible server. Both values can be overridden
-// without a rebuild; the defaults match the single-card NVFP4 recipe.
-const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8001";
-const DEFAULT_MODEL: &str = "qwen38-nvfp4";
+// A local engine (ds41d or vLLM) by default, or a hosted OpenAI-compatible API:
+// where it is, which model, its key and which it is are `model_config`'s.
 
 /// Logical request lanes. Lane 0 is the main conversation and sleep integration;
 /// 1..=WORKER_LANES are subagents, sleep batch workers and compaction leases.
 ///
 /// vLLM has no slots. It batches every request continuously over one shared,
-/// paged KV pool, so lanes exist only for s0ma's own admission control. Sized to
+/// paged KV pool, so lanes exist only for the agent's own admission control. Sized to
 /// the server's `--max-num-seqs` (16 in the recipe) minus the main lane: more
 /// lanes than that would only queue inside vLLM.
 pub const WORKER_LANES: usize = 15;
@@ -183,26 +178,19 @@ pub const WORKER_LANES: usize = 15;
 /// vLLM priority scheduling: lower values are scheduled first and can preempt
 /// higher ones when the KV pool runs short. Opt-in via S0MA_LLM_PRIORITY=1,
 /// because a server started without `--scheduling-policy priority` rejects any
-/// non-zero priority with a 400, which s0ma would treat as fatal; sent anyway
+/// non-zero priority with a 400, which the agent would treat as fatal; sent anyway
 /// to ds41d, which says it takes it (and keeps prompts by it). Model calls
 /// take theirs from their conversation (`conversations.rs`); these are for
 /// the knowledge probes, which build their own requests.
 const MAIN_PRIORITY: i32 = crate::conversations::MAIN_PRIORITY;
 const WORKER_PRIORITY: i32 = crate::conversations::WORKER_PRIORITY;
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.to_owned())
-}
-
 pub(crate) fn endpoint(path: &str) -> String {
-    format!("{}{path}", env_or("S0MA_LLM_BASE_URL", DEFAULT_BASE_URL).trim_end_matches('/'))
+    format!("{}{path}", crate::model_config::base_url())
 }
 
 pub(crate) fn model_name() -> String {
-    env_or("S0MA_LLM_MODEL", DEFAULT_MODEL)
+    crate::model_config::model()
 }
 
 pub(crate) fn lane_priority(lane: usize) -> Option<i32> {
@@ -329,7 +317,9 @@ struct ChatRequest<'a> {
     max_tokens: u32,
     temperature: f32,
     top_p: f32,
-    top_k: u32,
+    /// Not an OpenAI field: left out for a hosted API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
     presence_penalty: f32,
     // vLLM applies this over the ENTIRE output so far, reasoning included, with
     // no window. llama.cpp applied it over the last 64 tokens only. Over a long
@@ -344,7 +334,9 @@ struct ChatRequest<'a> {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
-    chat_template_kwargs: TemplateOptions<'a>,
+    /// The engine's chat template's options: left out for a hosted API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<TemplateOptions<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
     /// Which conversation it is, for ds41d's kept prompts
@@ -366,18 +358,16 @@ struct ChatRequest<'a> {
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
-    continuous_usage_stats: bool,
+    /// vLLM's: left out for a hosted API, which may reject it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuous_usage_stats: Option<bool>,
 }
 
 /// `S0MA_STREAM_USAGE=off` sends no `stream_options`, for a server that
 /// rejects them.
-fn stream_options(stream: bool) -> Option<StreamOptions> {
-    stream_options_for(stream, std::env::var("S0MA_STREAM_USAGE").ok().as_deref())
-}
-
-fn stream_options_for(stream: bool, setting: Option<&str>) -> Option<StreamOptions> {
+fn stream_options_for(stream: bool, setting: Option<&str>, hosted: bool) -> Option<StreamOptions> {
     let off = setting.is_some_and(|value| value.trim().eq_ignore_ascii_case("off"));
-    (stream && !off).then_some(StreamOptions { include_usage: true, continuous_usage_stats: true })
+    (stream && !off).then_some(StreamOptions { include_usage: true, continuous_usage_stats: (!hosted).then_some(true) })
 }
 
 #[derive(Debug, Serialize)]
@@ -390,7 +380,7 @@ struct TemplateOptions<'a> {
     reasoning_effort: Option<&'a str>,
 }
 
-/// The model card lists xhigh, medium and low; s0ma's instruct and router modes
+/// The model card lists xhigh, medium and low; the agent's instruct and router modes
 /// use "none", which vLLM would reject as an effort level. Express it the way the
 /// card does instead: thinking disabled, no effort sent.
 fn thinking(options: &ChatOptions) -> (bool, Option<&'static str>) {
@@ -408,8 +398,24 @@ fn chat_request<'a>(
     stream: bool,
     response_format: Option<Value>,
 ) -> ChatRequest<'a> {
+    chat_request_for(messages, options, tools, conversation, stream, response_format, crate::model_config::hosted())
+}
+
+/// `chat_request`, for a local engine or (`hosted`) an OpenAI-compatible API.
+/// A hosted API gets only the standard fields: no `top_k`, no template
+/// options, no reasoning effort (its levels are the engine's model card's,
+/// not an API's), no priority or conversation id, which a strict API rejects.
+fn chat_request_for<'a>(
+    messages: &'a [Message],
+    options: &ChatOptions,
+    tools: Option<&'a [ToolDefinition]>,
+    conversation: &Conversation,
+    stream: bool,
+    response_format: Option<Value>,
+    hosted: bool,
+) -> ChatRequest<'a> {
     let (enable_thinking, reasoning_effort) = thinking(options);
-    let (conversation_id, priority) = crate::conversations::request_fields(conversation);
+    let (conversation_id, priority) = if hosted { (None, None) } else { crate::conversations::request_fields(conversation) };
     // An empty tool list is sent as no tools rather than `[]`.
     let tools = tools.filter(|tools| !tools.is_empty());
 
@@ -420,17 +426,17 @@ fn chat_request<'a>(
         max_tokens: options.max_tokens,
         temperature: options.temperature,
         top_p: options.top_p,
-        top_k: options.top_k,
+        top_k: (!hosted).then_some(options.top_k),
         presence_penalty: options.presence_penalty,
         frequency_penalty: options.frequency_penalty,
         stream,
-        stream_options: stream_options(stream),
-        reasoning_effort,
-        chat_template_kwargs: TemplateOptions {
+        stream_options: stream_options_for(stream, std::env::var("S0MA_STREAM_USAGE").ok().as_deref(), hosted),
+        reasoning_effort: reasoning_effort.filter(|_| !hosted),
+        chat_template_kwargs: (!hosted).then_some(TemplateOptions {
             enable_thinking,
             preserve_thinking: true,
             reasoning_effort: None,
-        },
+        }),
         priority,
         conversation_id,
         tool_choice: tools.map(|_| "auto"),
@@ -663,7 +669,6 @@ impl ChatOptions {
         };
         options
     }
-
 }
 
 pub fn count_input_tokens(
@@ -671,6 +676,9 @@ pub fn count_input_tokens(
     options: &ChatOptions,
     tools: Option<&[ToolDefinition]>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    if crate::model_config::hosted() {
+        return Ok(estimated_tokens(messages, tools));
+    }
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(60))
@@ -694,6 +702,17 @@ pub fn count_input_tokens(
         .json::<TokenizeResponse>()?;
 
     Ok(response.count)
+}
+
+/// A hosted API's count, estimated: it has no `/tokenize`, and its
+/// tokenizer is not this one's to run. Generous on purpose (three bytes of
+/// the request's JSON to a token, where English runs nearer four, and a
+/// little for each message's framing), so the context is budgeted on the safe
+/// side: a fold comes a little early rather than a request too large.
+fn estimated_tokens(messages: &[Message], tools: Option<&[ToolDefinition]>) -> usize {
+    let bytes = serde_json::to_vec(messages).map_or(0, |bytes| bytes.len())
+        + tools.filter(|tools| !tools.is_empty()).and_then(|tools| serde_json::to_vec(tools).ok()).map_or(0, |bytes| bytes.len());
+    bytes.div_ceil(3) + messages.len() * 8 + 16
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -884,11 +903,9 @@ impl Stream {
                 diagnostic!("[llm] retry {}/3 after: {}", attempt + 1, last);
                 self.wait(async move { tokio::time::sleep(Duration::from_secs(attempt)).await }, None, waiting)?;
             }
-            let request = self
-                .client
-                .post(url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body.to_vec());
+            let request = crate::model_config::authorize_async(
+                self.client.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").body(body.to_vec()),
+            );
             // Sent from inside the runtime, which whatever it sets up may need.
             match self.wait(async move { request.send().await }, limit, waiting)? {
                 None => last = format!("no response within {:?}", limit.unwrap_or_default()),
@@ -1333,7 +1350,7 @@ where
 ///
 /// There is no slot state to poll. vLLM aborts a request when its client
 /// disconnects, so a lane whose call has returned carries no server-side work;
-/// which lanes are free is s0ma's own accounting (the subagent manager and
+/// which lanes are free is the agent's own accounting (the subagent manager and
 /// maintenance leases). Deep sleep drains both before it borrows these.
 pub fn sleep_worker_slots() -> Result<Vec<(usize, usize)>, Box<dyn std::error::Error>> {
     let capacity = model_context_capacity()?;
@@ -1367,21 +1384,6 @@ where
 {
     let conversation = standing(Conversation::main);
     chat_config_capturing(messages, options, Some(tools), 0, &conversation, None, None, 3, on_event, Some(body), None)
-}
-
-/// `chat_with_tools_capturing` against another server, for tests.
-#[cfg(test)]
-pub(crate) fn chat_with_tools_capturing_at<F>(
-    base_url: &str,
-    messages: &[Message],
-    tools: &[ToolDefinition],
-    on_event: F,
-    body: &mut Option<Vec<u8>>,
-) -> Result<S0maResponse, Box<dyn std::error::Error>>
-where
-    F: FnMut(StreamEvent) -> Result<(), Box<dyn std::error::Error>>,
-{
-    chat_config_capturing(messages, &ChatOptions::xhigh(), Some(tools), 0, &Conversation::main(), None, None, 3, on_event, Some(body), Some(base_url))
 }
 
 /// Task-scoped worker request: explicitly pinned, VM tools, finite lifetime.
@@ -1420,16 +1422,69 @@ where
 /// The server's per-request context ceiling, from `/v1/models`. vLLM applies one
 /// `max_model_len` to every request, so there is no per-slot partition to read.
 /// Also verifies the configured model is the one being served.
+///
+/// A window set in the overview (`/model context`) wins. A hosted API's is
+/// read from its model list where it gives one (`hosted_capacity`).
 pub fn model_context_capacity() -> Result<usize, Box<dyn std::error::Error>> {
-    let response: Value = Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()?
-        .get(endpoint("/v1/models"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+    if let Some(window) = crate::model_config::context_window() {
+        return Ok(window);
+    }
+    if crate::model_config::hosted() {
+        return Ok(hosted_capacity());
+    }
+    let response: Value = crate::model_config::authorize(
+        Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()?
+            .get(endpoint("/v1/models")),
+    )
+    .send()?
+    .error_for_status()?
+    .json()?;
     served_capacity(&response, &model_name())
+}
+
+/// A hosted model's window: its entry in the API's `/v1/models`, where the
+/// API gives one (`context_length`, OpenRouter's; `max_model_len`;
+/// `context_window`), else `ASSUMED_HOSTED_CONTEXT`. Asked at most every ten
+/// minutes per server and model: an API's list can run to hundreds of models.
+fn hosted_capacity() -> usize {
+    static KNOWN: std::sync::Mutex<Option<(String, usize, Instant, bool)>> = std::sync::Mutex::new(None);
+    // A new server, model or key is asked again at once: the list a key
+    // couldn't read (or got refused) may read with the next.
+    let key = format!(
+        "{} {} {:x}",
+        crate::model_config::base_url(),
+        model_name(),
+        crate::util::fnv1a64(crate::model_config::api_key().unwrap_or_default().as_bytes())
+    );
+    if let Some((known, window, at, read)) = &*crate::util::locked(&KNOWN)
+        && *known == key
+        // A list that was read holds for ten minutes; one that wasn't is
+        // tried again after one.
+        && at.elapsed() < Duration::from_secs(if *read { 600 } else { 60 })
+    {
+        return *window;
+    }
+    let listed = (|| -> Option<Value> {
+        let client = Client::builder().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build().ok()?;
+        crate::model_config::authorize(client.get(endpoint("/v1/models"))).send().ok()?.error_for_status().ok()?.json().ok()
+    })();
+    let window = listed.as_ref().and_then(|list| listed_window(list, &model_name()));
+    *crate::util::locked(&KNOWN) = Some((key, window.unwrap_or(crate::model_config::ASSUMED_HOSTED_CONTEXT), Instant::now(), listed.is_some()));
+    window.unwrap_or(crate::model_config::ASSUMED_HOSTED_CONTEXT)
+}
+
+/// The window `model`'s entry in a `/v1/models` list gives, if it gives one.
+fn listed_window(list: &Value, model: &str) -> Option<usize> {
+    let entry = list.get("data")?.as_array()?.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))?;
+    ["context_length", "max_model_len", "context_window"]
+        .iter()
+        .find_map(|field| entry.get(field).and_then(Value::as_u64))
+        .or_else(|| entry.pointer("/top_provider/context_length").and_then(Value::as_u64))
+        .filter(|window| *window > 0)
+        .and_then(|window| usize::try_from(window).ok())
 }
 
 fn served_capacity(response: &Value, model: &str) -> Result<usize, Box<dyn std::error::Error>> {
@@ -1492,192 +1547,26 @@ mod reasoning_retention_tests {
     use super::*;
 
     #[test]
-    fn capacity_comes_from_the_configured_served_model() {
-        let models = serde_json::json!({"data":[
-            {"id":"qwen38-nvfp4","max_model_len":262144},
-            {"id":"other","max_model_len":8192}
+    fn a_hosted_count_is_estimated_on_the_safe_side_and_its_window_read_from_the_list() {
+        let text = "The operator asked for the build log and a summary of what failed. ".repeat(40);
+        let messages = [Message::system("You are a careful assistant.".into()), Message::user(text.clone())];
+        let estimate = estimated_tokens(&messages, None);
+        // English runs about four characters a token: the estimate is above that.
+        assert!(estimate > text.len() / 4 && estimate < text.len(), "{estimate} for {} chars", text.len());
+        let tools = [ToolDefinition::function("vm_exec", "run a command", serde_json::json!({"type": "object"}))];
+        assert!(estimated_tokens(&messages, Some(&tools)) > estimate, "tools count too");
+
+        let list = serde_json::json!({"data": [
+            {"id": "vendor/a", "context_length": 200000},
+            {"id": "vendor/b", "top_provider": {"context_length": 65536}},
+            {"id": "vendor/c", "max_model_len": 32768},
+            {"id": "vendor/d"},
         ]});
-        assert_eq!(served_capacity(&models, "qwen38-nvfp4").unwrap(), 262144);
-        let missing = served_capacity(&models, "qwen").unwrap_err().to_string();
-        assert!(missing.contains("qwen38-nvfp4"), "error should list what is served: {missing}");
-        assert!(served_capacity(&serde_json::json!({"data":[{"id":"m","max_model_len":0}]}), "m").is_err());
-        assert!(served_capacity(&serde_json::json!([]), "m").is_err());
-    }
-
-    #[test]
-    fn requests_carry_no_llama_cpp_fields_and_map_none_to_no_thinking() {
-        let messages = [Message::user("hi".into())];
-        let value = serde_json::to_value(chat_request(&messages, &ChatOptions::instruct(), None, &Conversation::side("test"), true, None)).unwrap();
-        assert!(value.get("cache_prompt").is_none());
-        assert!(value.get("id_slot").is_none());
-        assert!(value.get("reasoning_effort").is_none());
-        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
-        assert!(value["chat_template_kwargs"].get("reasoning_effort").is_none());
-
-        let no_tools: &[ToolDefinition] = &[];
-        let value = serde_json::to_value(chat_request(&messages, &ChatOptions::xhigh(), Some(no_tools), &Conversation::side("test"), true, None)).unwrap();
-        assert_eq!(value["reasoning_effort"], "xhigh");
-        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], true);
-        assert!(value.get("tools").is_none() && value.get("tool_choice").is_none());
-    }
-
-    #[test]
-    fn streaming_requests_ask_for_token_counts() {
-        let options = serde_json::to_value(stream_options_for(true, None)).unwrap();
-        assert_eq!(options["include_usage"], true);
-        assert_eq!(options["continuous_usage_stats"], true);
-        assert!(stream_options_for(false, None).is_none(), "only streaming requests may carry it");
-        assert!(stream_options_for(true, Some(" OFF ")).is_none());
-        assert!(stream_options_for(true, Some("on")).is_some());
-        if std::env::var("S0MA_STREAM_USAGE").is_err() {
-            let messages = [Message::user("hi".into())];
-            let value = serde_json::to_value(chat_request(&messages, &ChatOptions::instruct(), None, &Conversation::side("test"), true, None)).unwrap();
-            assert_eq!(value["stream_options"]["include_usage"], true);
-        }
-    }
-
-    #[test]
-    fn the_prompt_and_its_cached_part_ride_along_with_usage_for_the_prefill_rate() {
-        // vLLM with --enable-prompt-tokens-details on the closing report, and
-        // its null prompt_tokens_details without the flag mid-stream.
-        let stream = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":40000,\"completion_tokens\":1,\"prompt_tokens_details\":null}}\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":2}}\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40000,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":36000}}}\n",
-            "data: [DONE]\n",
-        );
-        let mut seen = Vec::new();
-        parse_stream(stream.as_bytes(), |event| {
-            if let StreamEvent::Usage { prompt_tokens, cached_tokens, last, .. } = event {
-                seen.push((prompt_tokens, cached_tokens, last));
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            seen,
-            [(Some(40_000), None, false), (None, None, false), (Some(40_000), Some(36_000), true)],
-            "null details and a missing prompt count are both just absent"
-        );
-    }
-
-    #[test]
-    fn usage_in_the_stream_is_reported_after_each_chunks_text() {
-        let stream = concat!(
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hm\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\",\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"vm_exec\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"completion_tokens\":4}}\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"total_tokens\":13}}\n",
-            "data: [DONE]\n",
-        );
-        let mut seen = Vec::new();
-        let response = parse_stream(stream.as_bytes(), |event| {
-            seen.push(match event {
-                StreamEvent::Started => "start".to_string(),
-                StreamEvent::Reasoning(text) => format!("r:{text}"),
-                StreamEvent::Content(text) => format!("c:{text}"),
-                StreamEvent::ToolArguments(text) => format!("a:{text}"),
-                StreamEvent::Usage { completion_tokens, last, .. } => format!("u:{completion_tokens}:{last}"),
-                StreamEvent::Waiting => "wait".to_string(),
-            });
-            Ok(())
-        })
-        .unwrap();
-        // "start" opens every generation, so a retry of this call is measured
-        // on its own; the tool's name counts as generated output beside its
-        // arguments.
-        assert_eq!(seen, ["start", "r:hm", "u:1:false", "c:ok", "a:vm_exec", "a:{}", "u:4:false", "u:4:true"]);
-        assert_eq!(response.content, "ok");
-        assert_eq!(response.tool_calls.len(), 1);
-
-        // Usage of an unexpected shape is ignored rather than failing the stream.
-        let odd = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"completion_tokens\":1.5}}\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":\"n/a\"}\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"c\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n",
-            "data: [DONE]\n",
-        );
-        let mut usages = 0;
-        let response = parse_stream(odd.as_bytes(), |event| {
-            usages += usize::from(matches!(event, StreamEvent::Usage { .. }));
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!((response.content.as_str(), usages), ("abc", 0));
-
-        // A server that sends no usage: the stream reads as before.
-        let plain = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\ndata: [DONE]\n";
-        let mut count = 0;
-        let response = parse_stream(plain.as_bytes(), |_| { count += 1; Ok(()) }).unwrap();
-        // The generation's own start, then its one content delta.
-        assert_eq!((response.content.as_str(), count), ("hi", 2));
-    }
-
-    /// The bug this guards: a broken stream is retried through the same
-    /// callback, so without a per-generation marker the abandoned attempt, the
-    /// gap and the retry's prefill were all measured as one generation while
-    /// only the retry's tokens were counted. The rate read far too low.
-    #[test]
-    fn every_attempt_of_a_retried_call_opens_its_own_generation() {
-        // No [DONE]: an incomplete stream, which is what earns a retry.
-        let broken = "data: {\"choices\":[{\"delta\":{\"content\":\"part\"}}]}\n";
-        let good = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\ndata: [DONE]\n";
-        let mut bodies = [broken, good].into_iter();
-        let mut starts = 0;
-        let response = sample_until_answered(3, false, || {
-            let body = bodies.next().expect("one body per attempt");
-            parse_stream(body.as_bytes(), |event| {
-                starts += usize::from(matches!(event, StreamEvent::Started));
-                Ok(())
-            })
-        })
-        .unwrap();
-        assert_eq!((response.content.as_str(), starts), ("done", 2));
-    }
-
-    #[test]
-    fn requests_name_their_conversation_only_to_an_engine_that_takes_it() {
-        let _lock = crate::conversations::TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let messages = [Message::user("hi".into())];
-        let worker = Conversation::worker("b1-2", &crate::conversations::new_uuid());
-        crate::conversations::set_features_for_test(None);
-        let plain = serde_json::to_value(chat_request(&messages, &ChatOptions::instruct(), None, &worker, true, None)).unwrap();
-        assert!(plain.get("conversation_id").is_none(), "vLLM and fne: as before");
-        if std::env::var("S0MA_LLM_PRIORITY").is_err() {
-            assert!(plain.get("priority").is_none());
-        }
-        crate::conversations::set_features_for_test(Some(crate::conversations::ds41()));
-        let named = serde_json::to_value(chat_request(&messages, &ChatOptions::instruct(), None, &worker, true, None)).unwrap();
-        assert_eq!(named["conversation_id"], worker.id());
-        assert_eq!(named["priority"], crate::conversations::WORKER_PRIORITY);
-        let main = serde_json::to_value(chat_request(&messages, &ChatOptions::instruct(), None, &Conversation::main(), true, None)).unwrap();
-        assert!(main["conversation_id"].as_str().unwrap().starts_with("main:"));
-        assert_eq!(main["priority"], 0, "the main turn keeps the lowest number");
-        crate::conversations::set_features_for_test(None);
-    }
-
-    #[test]
-    fn where_the_cache_came_from_rides_along() {
-        let stream = concat!(
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":800,\"cache_source\":\"disk\"}}}\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":800,\"cache_source\":\"elsewhere\"}}}\n",
-            "data: [DONE]\n",
-        );
-        let mut sources = Vec::new();
-        parse_stream(stream.as_bytes(), |event| {
-            if let StreamEvent::Usage { cache_source, .. } = event {
-                sources.push(cache_source);
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(sources, [Some(CacheSource::Disk), None], "an unknown source is left out");
-    }
-
-    #[test]
-    fn priority_is_omitted_unless_enabled() {
-        if std::env::var("S0MA_LLM_PRIORITY").is_ok() { return; }
-        assert_eq!(lane_priority(0), None);
-        assert_eq!(lane_priority(5), None);
+        assert_eq!(listed_window(&list, "vendor/a"), Some(200_000));
+        assert_eq!(listed_window(&list, "vendor/b"), Some(65_536));
+        assert_eq!(listed_window(&list, "vendor/c"), Some(32_768));
+        assert_eq!(listed_window(&list, "vendor/d"), None, "not given: assumed by the caller");
+        assert_eq!(listed_window(&list, "vendor/e"), None);
     }
 
     #[test]
@@ -1687,13 +1576,6 @@ mod reasoning_retention_tests {
         assert!(check_lane(WORKER_LANES + 1).is_err());
         assert!(release_worker_slot(0).is_err());
         assert!(release_worker_slot(WORKER_LANES).is_ok());
-    }
-
-    #[test]
-    fn newer_vllm_reasoning_field_is_read() {
-        let stream = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\"}}]}\n\ndata: [DONE]\n";
-        let response = parse_stream(std::io::Cursor::new(stream), |_| Ok(())).unwrap();
-        assert_eq!(response.reasoning_content, "think");
     }
 
     #[test]
@@ -1759,23 +1641,6 @@ mod recovery_tests {
         assert!(is_fatal_error(fatal_model("oversized request").as_ref()));
     }
     #[test]
-    fn retry_passes_validation_feedback_and_stops_after_success() {
-        let mut calls = 0;
-        let value = retry_text("test", |feedback| {
-            calls += 1;
-            if calls == 1 {
-                assert!(feedback.is_none());
-                Err("episode applicability must contain 1..12000 bytes".into())
-            } else {
-                assert!(feedback.unwrap().contains("applicability"));
-                Ok("repaired".into())
-            }
-        })
-        .unwrap();
-        assert_eq!(value, "repaired");
-        assert_eq!(calls, 2);
-    }
-    #[test]
     fn validation_exhaustion_is_nonfatal_and_bounded() {
         let mut calls = 0;
         let error = retry_text("test", |_| {
@@ -1786,24 +1651,6 @@ mod recovery_tests {
         assert_eq!(calls, 3);
         assert!(error.starts_with(RETRY_EXHAUSTED));
         assert!(!is_fatal_message(&error));
-    }
-    #[test]
-    fn fatal_and_already_exhausted_failures_do_not_multiply_retries() {
-        for message in [
-            "[fatal-model] oversized request",
-            "[retry-exhausted] transport unavailable",
-        ] {
-            let mut calls = 0;
-            assert_eq!(
-                retry_text("test", |_| {
-                    calls += 1;
-                    Err(message.into())
-                })
-                .unwrap_err(),
-                message
-            );
-            assert_eq!(calls, 1);
-        }
     }
     #[test]
     fn truncated_and_malformed_streams_are_recoverable_but_callbacks_pass_through() {
@@ -1819,43 +1666,6 @@ mod recovery_tests {
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "operator interrupted");
-    }
-    #[test]
-    fn stream_context_error_remains_fatal() {
-        let error=parse_stream(std::io::Cursor::new("data: {\"error\":{\"message\":\"request exceeds the available context size\"}}\n\n"), |_|Ok(())).unwrap_err();
-        assert!(is_fatal_error(error.as_ref()));
-    }
-    #[test]
-    fn transient_http_failure_retries_then_succeeds() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for (status, body) in [("503 Service Unavailable", "loading"), ("200 OK", "ready")] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).unwrap();
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-        assert_eq!(
-            send_model_request(client.get(format!("http://{address}")))
-                .unwrap()
-                .text()
-                .unwrap(),
-            "ready"
-        );
-        server.join().unwrap();
     }
     #[test]
     fn http_fatal_body_is_preserved_without_retry() {
@@ -1888,62 +1698,6 @@ mod recovery_tests {
 }
 
 #[cfg(test)]
-mod generating_tests {
-    use super::*;
-
-    #[test]
-    fn a_generation_counts_while_it_lives_and_not_after_however_it_ends() {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let count = || COUNTER.load(Ordering::SeqCst);
-        let first = Generating::on(&COUNTER);
-        let second = Generating::on(&COUNTER);
-        assert_eq!(count(), 2, "concurrent requests (a turn and its workers) each count");
-        drop(first);
-        assert_eq!(count(), 1);
-        drop(second);
-        assert_eq!(count(), 0);
-        // A request that panics mid-stream still stops counting.
-        let _ = std::panic::catch_unwind(|| {
-            let _held = Generating::on(&COUNTER);
-            panic!("stream broke");
-        });
-        assert_eq!(count(), 0);
-    }
-
-    #[test]
-    fn a_request_counts_from_its_send_to_the_end_of_its_stream() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 8192];
-            let _ = stream.read(&mut request).unwrap();
-            // While the server has the request, as during a prefill.
-            let during_prefill = generating();
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
-            write!(stream, "data: {{\"choices\":[{{\"delta\":{{\"content\":\"half\"}}}}]}}\n\n").unwrap();
-            stream.flush().unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-            write!(stream, "data: {{\"choices\":[{{\"delta\":{{\"content\":\" done\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n").unwrap();
-            during_prefill
-        });
-        let stream = Stream::new().unwrap();
-        let mut while_streaming = Vec::new();
-        let response = generate_once(&stream, &format!("http://{address}/v1/chat/completions"), &serde_json::to_vec(&serde_json::json!({"model":"m"})).unwrap(), Some(Duration::from_secs(5)), &mut |event| {
-            if matches!(event, StreamEvent::Content(_)) {
-                while_streaming.push(generating());
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(response.content, "half done");
-        assert!(server.join().unwrap(), "counted while the server held the request");
-        assert_eq!(while_streaming, [true, true], "and while the reply streamed");
-    }
-}
-
-#[cfg(test)]
 mod interim_fix_tests {
     use super::*;
     use std::cell::RefCell;
@@ -1967,56 +1721,6 @@ mod interim_fix_tests {
     }
 
     #[test]
-    fn thinking_modes_send_no_frequency_penalty() {
-        for options in [ChatOptions::low(), ChatOptions::medium(), ChatOptions::xhigh(), ChatOptions::sleep()] {
-            assert_eq!(options.frequency_penalty, 0.0,
-                "vLLM applies frequency_penalty unwindowed; a non-zero value corrupts long outputs");
-            assert_eq!(options.presence_penalty, 0.0);
-            assert_ne!(options.reasoning_effort, "none", "thinking modes must keep thinking on");
-        }
-        let messages = [Message::user("hi".into())];
-        let value = serde_json::to_value(chat_request(&messages, &ChatOptions::normal(), None, &Conversation::side("test"), true, None)).unwrap();
-        assert_eq!(value["frequency_penalty"], 0.0);
-        assert_eq!(value["reasoning_effort"], "xhigh");
-    }
-
-    #[test]
-    fn empty_answer_is_resampled_until_the_model_speaks() {
-        let (items, drawn) = script(vec![
-            Ok(response("", "thinking...", "stop", false)),
-            Ok(response("  ", "more thinking", "stop", false)),
-            Ok(response("Here it is.", "done", "stop", false)),
-        ]);
-        let result = sample_until_answered(1, true, || { *drawn.borrow_mut() += 1; items.borrow_mut().next().unwrap() }).unwrap();
-        assert_eq!(result.content, "Here it is.");
-        assert_eq!(*drawn.borrow(), 3);
-    }
-
-    #[test]
-    fn persistent_empty_answer_is_returned_not_turned_into_an_error() {
-        let (items, drawn) = script((0..5).map(|_| Ok(response("", "t", "stop", false))).collect());
-        let result = sample_until_answered(3, true, || { *drawn.borrow_mut() += 1; items.borrow_mut().next().unwrap() }).unwrap();
-        assert!(result.content.is_empty());
-        assert_eq!(*drawn.borrow(), 1 + EMPTY_ANSWER_RESAMPLES);
-    }
-
-    #[test]
-    fn greedy_requests_are_not_resampled() {
-        let (items, drawn) = script(vec![Ok(response("", "t", "stop", false)), Ok(response("x", "", "stop", false))]);
-        let result = sample_until_answered(3, false, || { *drawn.borrow_mut() += 1; items.borrow_mut().next().unwrap() }).unwrap();
-        assert!(result.content.is_empty());
-        assert_eq!(*drawn.borrow(), 1);
-    }
-
-    #[test]
-    fn tool_calls_and_length_stops_are_not_empty_answers() {
-        assert!(!is_empty_answer(&response("", "t", "tool_calls", true)));
-        assert!(!is_empty_answer(&response("", "t", "stop", true)));
-        assert!(!is_empty_answer(&response("", "t", "length", false)));
-        assert!(is_empty_answer(&response("\n", "t", "stop", false)));
-    }
-
-    #[test]
     fn malformed_stream_budget_is_unchanged_and_separate() {
         let malformed = || -> Result<S0maResponse, Box<dyn std::error::Error>> {
             Err(format!("{MODEL_RESPONSE} truncated").into())
@@ -2035,173 +1739,5 @@ mod interim_fix_tests {
         assert_eq!(result.content, "answer");
         assert_eq!(*drawn.borrow(), 5);
     }
-
-    #[test]
-    fn interrupts_pass_through_without_resampling() {
-        let (items, drawn) = script(vec![Err("operator interrupted".into()), Ok(response("x", "", "stop", false))]);
-        let error = sample_until_answered(3, true, || { *drawn.borrow_mut() += 1; items.borrow_mut().next().unwrap() }).unwrap_err();
-        assert_eq!(error.to_string(), "operator interrupted");
-        assert_eq!(*drawn.borrow(), 1);
-    }
 }
 
-#[cfg(test)]
-mod default_effort_tests {
-    #[test]
-    fn requested_modes_use_xhigh() {
-        for options in [
-            super::ChatOptions::normal(),
-            super::ChatOptions::sleep(),
-        ] {
-            assert_eq!(options.reasoning_effort, "xhigh");
-        }
-    }
-}
-
-#[cfg(test)]
-mod repair_report_tests {
-    #[test]
-    fn a_repaired_call_is_reported_once() {
-        let ids = vec!["call-report-once-a".to_string(), "call-report-once-b".to_string()];
-        assert_eq!(super::first_reports(&ids), 2);
-        // The same broken calls on the next request: nothing new to say.
-        assert_eq!(super::first_reports(&ids), 0);
-        assert_eq!(super::first_reports(&["call-report-once-c".to_string(), ids[0].clone()]), 1);
-    }
-}
-
-#[cfg(test)]
-mod stop_tests {
-    //! Ctrl+C (any error from the callback) stops a call that has not started
-    //! streaming, and the server sees the connection go: what makes vLLM abort
-    //! the prefill.
-    use super::*;
-    use std::io::Write;
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-
-    /// What the server does once it has read the request.
-    #[derive(Clone, Copy)]
-    enum Engine {
-        /// Says nothing at all: still taking the request in.
-        Silent,
-        /// Sends the headers, then nothing: prefilling.
-        Prefilling,
-        /// Sends the headers, waits, then streams an answer.
-        SlowFirstToken(Duration),
-    }
-
-    /// An engine on a free port. The channel gets how long after the request
-    /// the client went away, if it did within 10 s.
-    fn engine(behaviour: Engine) -> (String, mpsc::Receiver<Option<Duration>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            // The request: headers, then Content-Length bytes of body.
-            let mut seen = Vec::new();
-            let mut byte = [0u8; 1];
-            while !seen.ends_with(b"\r\n\r\n") {
-                socket.read_exact(&mut byte).unwrap();
-                seen.push(byte[0]);
-            }
-            let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
-            let length: usize = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .map(|value| value.trim().parse().unwrap())
-                .unwrap_or(0);
-            let mut body = vec![0; length];
-            socket.read_exact(&mut body).unwrap();
-            let asked = Instant::now();
-            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
-            match behaviour {
-                Engine::Silent => {}
-                Engine::Prefilling => socket.write_all(headers.as_bytes()).unwrap(),
-                Engine::SlowFirstToken(delay) => {
-                    socket.write_all(headers.as_bytes()).unwrap();
-                    std::thread::sleep(delay);
-                    let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-                    let _ = socket.write_all(answer.as_bytes());
-                    let _ = tx.send(None);
-                    return;
-                }
-            }
-            // Gone when a read sees the end of the stream (or the reset).
-            let mut rest = [0u8; 64];
-            let gone = loop {
-                match socket.read(&mut rest) {
-                    Ok(0) => break Some(asked.elapsed()),
-                    Ok(_) => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut => break None,
-                    Err(_) => break Some(asked.elapsed()),
-                }
-            };
-            let _ = tx.send(gone);
-        });
-        (format!("http://{address}/v1/chat/completions"), rx)
-    }
-
-    fn call(url: &str, quiet_limit: Option<Duration>, stop_after: Option<usize>) -> (Result<S0maResponse, Box<dyn std::error::Error>>, Vec<String>, Duration) {
-        let stream = Stream::new().unwrap();
-        let mut events = Vec::new();
-        let mut waits = 0;
-        let started = Instant::now();
-        let result = generate_once(&stream, url, b"{}", quiet_limit, &mut |event: StreamEvent| {
-            if let StreamEvent::Waiting = event {
-                waits += 1;
-                if stop_after.is_some_and(|n| waits >= n) {
-                    return Err("stopped: ctrl+c".into());
-                }
-            }
-            events.push(format!("{event:?}"));
-            Ok(())
-        });
-        (result, events, started.elapsed())
-    }
-
-    #[test]
-    fn ctrl_c_during_a_prefill_stops_the_call_and_drops_the_connection() {
-        let (url, gone) = engine(Engine::Prefilling);
-        let (result, events, took) = call(&url, None, Some(3));
-        let error = result.err().expect("stopped");
-        assert_eq!(error.to_string(), "stopped: ctrl+c", "the caller's own error, not a broken stream to retry");
-        assert!(took < Duration::from_secs(2), "within a few polls, not at the first token: {took:?}");
-        assert_eq!(events.first().map(String::as_str), Some("Started"), "the headers had come");
-        let gone = gone.recv_timeout(Duration::from_secs(15)).unwrap();
-        assert!(gone.is_some_and(|after| after < Duration::from_secs(3)), "the server saw the client go: {gone:?}");
-    }
-
-    #[test]
-    fn ctrl_c_before_the_server_has_answered_stops_it_too() {
-        let (url, gone) = engine(Engine::Silent);
-        let (result, events, took) = call(&url, None, Some(3));
-        assert_eq!(result.err().expect("stopped").to_string(), "stopped: ctrl+c");
-        assert!(took < Duration::from_secs(2), "{took:?}");
-        assert!(events.iter().all(|event| event == "Waiting"), "nothing but waits: {events:?}");
-        let gone = gone.recv_timeout(Duration::from_secs(15)).unwrap();
-        assert!(gone.is_some_and(|after| after < Duration::from_secs(3)), "{gone:?}");
-    }
-
-    #[test]
-    fn a_slow_first_token_is_waited_for_and_read_whole() {
-        let (url, _gone) = engine(Engine::SlowFirstToken(Duration::from_millis(450)));
-        let (result, events, _) = call(&url, None, None);
-        let response = result.unwrap();
-        assert_eq!(response.content, "ok");
-        assert_eq!(events.first().map(String::as_str), Some("Started"));
-        assert!(events.iter().filter(|event| *event == "Waiting").count() >= 3, "{events:?}");
-        assert!(events.contains(&"Content(\"ok\")".to_string()));
-    }
-
-    #[test]
-    fn the_quiet_limit_still_ends_a_stream_that_stops_arriving() {
-        let (url, _gone) = engine(Engine::Prefilling);
-        let (result, _, took) = call(&url, Some(Duration::from_millis(300)), None);
-        let error = result.err().expect("timed out").to_string();
-        assert!(error.starts_with(MODEL_RESPONSE) && error.contains("nothing arrived for 300ms"), "{error}");
-        assert!(took < Duration::from_secs(2), "{took:?}");
-    }
-}

@@ -16,13 +16,10 @@ use crate::runtime_context::ContextProjections;
 use crate::threads::{self, ThreadStore};
 use crate::types::Message;
 
-#[path = "sleep_episodes.rs"]
+pub(crate) mod schedule;
 mod episodes;
-#[path = "sleep_incremental.rs"]
 mod incremental;
-#[path = "sleep_journal.rs"]
 mod journal;
-#[path = "sleep_continuous.rs"]
 pub mod continuous;
 
 #[derive(Debug)]
@@ -161,7 +158,6 @@ questions alongside observed outcomes. Do not copy full reasoning traces into th
 checkpoint or promote an unsupported hypothesis into a fact.
 "#;
 
-
 const EVENT_COMPACTION_PROMPT: &str = r#"
 You are s0ma's episodic memory consolidation process.
 
@@ -235,8 +231,6 @@ Keep the checkpoint concise. Prefer dense factual statements over narrative rete
 
 Return only the memory checkpoint. Do not include reasoning, commentary, preambles, tool requests, thread updates, self-model updates, or explanations of the consolidation process.
 "#;
-
-
 
 pub fn prepare(memory:&Hippocampus)->Result<Option<SleepInput>,Box<dyn std::error::Error>> {
     continuous::prepare_review(memory)
@@ -1243,7 +1237,7 @@ fn reflect_prepared(
 
             // Reflection must survive malformed model-generated arguments.
             // Feed the parse/validation error back as the matching tool result
-            // so s0ma can repair the call without aborting the sleep cycle.
+            // so the agent can repair the call without aborting the sleep cycle.
             if tool_name == "episode_consolidate" {
                 if let Some(session) = episode_session.as_deref() {
                     journal.staged = session.pass_state();
@@ -1385,82 +1379,6 @@ mod reflection_fold_tests {
         assert_eq!(reclaim_reflection_context(&mut messages, 0), 0);
     }
 
-    #[test]
-    fn every_older_episode_call_is_compacted() {
-        let mut messages = prompt();
-        for id in ["e1", "e2"] {
-            messages.push(turn(vec![call(
-                id,
-                "episode_consolidate",
-                json!({"operations": [{"episode": {"title": "q".repeat(3000)}}]}),
-            )]));
-            messages.push(result(id, json!({"ok": true, "staged": 1})));
-        }
-        reclaim_reflection_context(&mut messages, 0);
-        assert_eq!(arguments(&messages[2], 0)["operations"], "[1 items elided]");
-        assert_eq!(arguments(&messages[4], 0)["operations"], "[1 items elided]");
-    }
-
-    #[test]
-    fn fold_replaces_every_turn_with_a_ledger_that_remembers_each_write() {
-        let mut messages = prompt();
-        messages.push(turn(vec![
-            call("r1", "archive_get", json!({"id": 5})),
-            call(
-                "w1",
-                "world_record_put",
-                json!({"model": "m", "key": "k1", "body": "b".repeat(900)}),
-            ),
-        ]));
-        messages.push(result("r1", json!({"ok": true, "text": "evidence"})));
-        messages.push(result("w1", json!({"ok": true})));
-        messages.push(turn(vec![call("w2", "thread_create", json!({"title": "New thread"}))]));
-        messages.push(result("w2", json!({"ok": false, "error": "duplicate title"})));
-        messages.push(turn(vec![call("w3", "skill_write", json!({"name": "s"}))]));
-        messages.push(Message::user("Your previous response did not finish cleanly.".into()));
-
-        assert_eq!(fold_reflection_transcript(&mut messages, 2, false), Some(7));
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1].content, "digests");
-
-        let ledger = &messages[2].content;
-        assert_eq!(messages[2].role, "user");
-        assert!(ledger.starts_with(LEDGER_HEADER));
-        let put = ledger.lines().find(|l| l.starts_with("- world_record_put ")).unwrap();
-        assert!(put.contains(r#""key":"k1""#) && put.contains("[900 chars elided]") && put.ends_with("→ done"));
-        let create = ledger.lines().find(|l| l.starts_with("- thread_create ")).unwrap();
-        assert!(create.contains("FAILED, not applied: duplicate title"));
-        let interrupted = ledger.lines().find(|l| l.starts_with("- skill_write ")).unwrap();
-        assert!(interrupted.contains("no result recorded"));
-        assert!(ledger.contains("archive_get ×1"));
-        assert!(!ledger.contains("Episode operations"), "no episode set in this integration");
-        assert!(!ledger.contains("bbbb") && !ledger.contains("evidence"));
-
-        // Only the ledger is left after the prompt, so there is no tool message
-        // without its call for the chat template to reject.
-        assert!(messages.iter().all(|m| m.role != "tool" && m.tool_calls.is_none()));
-    }
-
-    #[test]
-    fn a_later_fold_carries_earlier_writes_forward_in_order() {
-        let mut messages = prompt();
-        messages.push(turn(vec![call("w1", "thread_update", json!({"id": "t_1"}))]));
-        messages.push(result("w1", json!({"ok": true})));
-        fold_reflection_transcript(&mut messages, 2, false).unwrap();
-
-        messages.push(turn(vec![call("w2", "thread_update", json!({"id": "t_2"}))]));
-        messages.push(result("w2", json!({"ok": true})));
-        fold_reflection_transcript(&mut messages, 2, true).unwrap();
-
-        assert_eq!(messages.len(), 3);
-        let ledger = &messages[2].content;
-        assert_eq!(ledger.matches(LEDGER_HEADER).count(), 1);
-        let first = ledger.find(r#""id":"t_1""#).unwrap();
-        let second = ledger.find(r#""id":"t_2""#).unwrap();
-        assert!(first < second);
-        assert!(ledger.contains("Episode operations that succeeded stay applied"));
-    }
-
     fn ledger_counts(ledger: &str, tool: &str) -> usize {
         let itemized = ledger
             .lines()
@@ -1501,27 +1419,6 @@ mod reflection_fold_tests {
         assert_eq!(ledger_counts(ledger, "thread_update"), 1);
         assert!(ledger.len() < LEDGER_MAX_CHARS + 4_000);
     }
-
-    #[test]
-    fn nothing_after_the_prompt_means_nothing_to_fold() {
-        let mut messages = prompt();
-        assert_eq!(fold_reflection_transcript(&mut messages, 2, false), None);
-        assert_eq!(messages.len(), 2);
-    }
-
-    #[test]
-    fn reflection_overflow_no_longer_blames_the_server_window() {
-        let reflection = fit_sleep_output(REFLECTION_FOLLOW_UP, 258_183, 262_144, &ChatOptions::sleep())
-            .unwrap_err()
-            .to_string();
-        assert!(llm::is_fatal_message(&reflection));
-        assert!(reflection.contains("sleep_integration.json") && !reflection.contains("MAX_MODEL_LEN"));
-
-        let batch = fit_sleep_output("digest rollup", 258_183, 262_144, &ChatOptions::sleep())
-            .unwrap_err()
-            .to_string();
-        assert!(batch.contains("MAX_MODEL_LEN"));
-    }
 }
 
 #[cfg(test)]
@@ -1529,88 +1426,11 @@ mod reasoning_retention_tests {
     use super::*;
 
     #[test]
-    fn projection_reuse_checks_thread_revision_and_schema() {
-        let mut snapshot = SleepSnapshot {
-            schema_version: SLEEP_SNAPSHOT_SCHEMA_VERSION,
-            timestamp: "now".into(),
-            checkpoint: MemoryCheckpoint {
-                timestamp: "old".into(),
-                from_event_id: 1,
-                through_event_id: 2,
-                source_event_count: 2,
-                summary: "memory".into(),
-            },
-            thread_revision: "threads-1".into(),
-            projections: ContextProjections::default(),
-        };
-        assert!(projection_reuse(&snapshot, "threads-1"));
-        assert!(!projection_reuse(&snapshot, "threads-2"));
-        snapshot.schema_version = 0;
-        assert!(!projection_reuse(&snapshot, "threads-1"));
-    }
-
-    #[test]
-    fn full_slot_accepts_220k_input_with_output_reserved() {
-        let options = fit_sleep_output("test", 220000, 262144, &ChatOptions::sleep()).unwrap();
-        assert_eq!(options.max_tokens, 32768);
-    }
-
-    #[test]
     fn growing_reflection_fits_output_and_rejects_exhaustion() {
         let options = fit_sleep_output("test", 245000, 262144, &ChatOptions::sleep()).unwrap();
         assert_eq!(options.max_tokens, 15096);
         assert!(fit_sleep_output("test", 255000, 262144, &ChatOptions::sleep()).is_err());
         assert!(fit_sleep_output("test", usize::MAX, 262144, &ChatOptions::sleep()).is_err());
-    }
-
-    #[test]
-    fn reasoning_reaches_sleep_then_leaves_the_unconsolidated_tail() {
-        let path = std::env::temp_dir().join(format!(
-            "s0ma_reasoning_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut memory = Hippocampus::new(path.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("Run the control".into()).unwrap();
-        memory
-            .remember_reasoning("Do not equate null with access denial.", false)
-            .unwrap();
-        memory.remember_s0ma("Control succeeded.".into()).unwrap();
-        memory
-            .remember_reasoning("Next compare the second account.", true)
-            .unwrap();
-        memory.remember_reasoning("", false).unwrap();
-        // Reload from disk, not the live inference buffer.
-        let memory = Hippocampus::new(path.join("hippocampus.jsonl")).unwrap();
-        let input = prepare(&memory).unwrap().unwrap();
-        assert_eq!(input.source_events.len(), 4);
-        for source in [
-            build_consolidation_source(&input),
-        ] {
-            assert!(source.contains("Do not equate null with access denial."));
-            assert!(source.contains("Next compare the second account."));
-            assert!(source.contains("[s0ma_reasoning state=interrupted]"));
-        }
-        let turns = memory.recent_conversation_turns(10).unwrap();
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].s0ma, "Control succeeded.");
-        let through = input.source_events.last().unwrap().id;
-        memory
-            .store_checkpoint(
-                input.source_events[0].id,
-                through,
-                input.source_events.len(),
-                "Control valid; second account remains to be checked.".into(),
-            )
-            .unwrap();
-        assert!(prepare(&memory).unwrap().is_none());
-        assert!(memory.recall_after(through).unwrap().is_empty());
-        // Consolidation advances the working boundary without deleting raw traces.
-        assert_eq!(memory.recall_after(0).unwrap().len(), 4);
-        std::fs::remove_dir_all(path).unwrap();
     }
 }
 

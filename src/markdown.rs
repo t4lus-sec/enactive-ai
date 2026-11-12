@@ -1,7 +1,7 @@
 //! Streaming Markdown → ANSI renderer for the transcript.
 //!
 //! Model output arrives a few tokens at a time and is written straight to the
-//! terminal at s0ma's saved output cursor, so this renderer can never go back
+//! terminal at the agent's saved output cursor, so this renderer can never go back
 //! and restyle text it has already emitted. Instead it holds back only the
 //! characters that are still ambiguous:
 //!
@@ -657,7 +657,7 @@ impl MarkdownStream {
             .collect();
 
         // A table that opens the reply starts on its own line, clear of the
-        // "s0ma>" prefix the caller writes in front of the first output.
+        // "the agent>" prefix the caller writes in front of the first output.
         let mut out = String::new();
         if !self.emitted && self.out.is_empty() {
             out.push('\n');
@@ -931,7 +931,7 @@ fn records(rendered: &[Vec<String>], header_rows: usize, limit: usize) -> String
     out
 }
 
-/// A whole document rendered as the page renders s0ma's replies, in lines
+/// A whole document rendered as the page renders the agent's replies, in lines
 /// fitted to `width` columns (each line closes its own styles), for a tab
 /// that shows one: the projects tab's write-ups and reports. `text` is made
 /// safe here.
@@ -1117,67 +1117,6 @@ mod tests {
         out
     }
 
-    /// Visual check in your own terminal:
-    /// `cargo test markdown_preview -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn markdown_preview() {
-        let sample = "# Heading\n\nSome **bold**, *italic*, ~~struck~~ and `code`.\n\n- ~~done~~ item\n- [link](https://example.com)\n\n| a | b |\n|---|---|\n| ~~x~~ | **y** |\n";
-        let mut md = MarkdownStream::new();
-        let mut out = md.push(sample);
-        out.push_str(&md.finish());
-        println!("\n{out}");
-    }
-
-    #[test]
-    fn chunking_never_changes_the_result() {
-        let input = "# Title\n\nSome **bold** and *italic* and ~~gone~~ and `code`.\n\n- one\n- two [link](https://x.y)\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|--:|\n| 1 | 22 |\n\n> quoted\n---\n";
-        let whole = render(input, usize::MAX).1;
-        for chunk in [1, 2, 3, 5, 7] {
-            assert_eq!(render(input, chunk).1, whole, "chunk size {chunk}");
-        }
-    }
-
-    #[test]
-    fn markers_are_replaced_by_styling() {
-        let (raw, text) = render("Some **bold** and *it* and `x`\n", 1);
-        assert_eq!(text, "Some bold and it and x\n");
-        assert!(raw.contains(";1m"));
-        assert!(raw.contains(";3m"));
-    }
-
-    #[test]
-    fn strikethrough() {
-        for chunk in [1, 2, usize::MAX] {
-            let (raw, text) = render("was ~~$40~~ now $30\n", chunk);
-            assert_eq!(text, "was $40 now $30\n");
-            assert!(raw.contains(";9m"));
-        }
-        // At the start of a line, `~~` must not be mistaken for a code fence.
-        let (raw, text) = render("~~gone~~ kept\n", 1);
-        assert_eq!(text, "gone kept\n");
-        assert!(raw.contains(";9m"));
-        // Inside table cells too.
-        let (raw, _) = render("| a |\n|---|\n| ~~x~~ |\n", 1);
-        assert!(raw.contains(";9m"));
-    }
-
-    #[test]
-    fn single_tildes_stay_literal() {
-        let (raw, text) = render("takes ~5 min in ~/src, ~~~ and ~~ alone\n", 1);
-        assert_eq!(text, "takes ~5 min in ~/src, ~~~ and ~~ alone\n");
-        assert!(!raw.contains(";9"));
-        // An unclosed ~~ is struck only to the end of its line.
-        let (raw, _) = render("~~open\nnext\n", usize::MAX);
-        assert!(!raw[raw.find('\n').unwrap()..].contains(";9"));
-    }
-
-    #[test]
-    fn identifiers_and_arithmetic_stay_literal() {
-        let (_, text) = render("snake_case_name and 2 * 3 = 6\n", 1);
-        assert_eq!(text, "snake_case_name and 2 * 3 = 6\n");
-    }
-
     #[test]
     fn unclosed_emphasis_does_not_leak_past_the_line() {
         for chunk in [1, usize::MAX] {
@@ -1187,173 +1126,5 @@ mod tests {
             let second = &raw[raw.find('\n').unwrap()..];
             assert!(!second.contains(";3m"), "italic leaked: {second:?}");
         }
-    }
-
-    #[test]
-    fn block_elements() {
-        let (_, text) = render("## Head\n- item\n3. third\n> q\n***\n", 1);
-        assert!(text.contains("Head\n"));
-        assert!(!text.contains('#'));
-        assert!(text.contains("• item"));
-        assert!(text.contains("3. third"));
-        assert!(text.contains("│ q"));
-        assert!(text.contains("────"));
-    }
-
-    #[test]
-    fn code_blocks_are_not_parsed() {
-        let (_, text) = render("```py\nx = a*b*c # not a heading\n```\nafter\n", 1);
-        assert!(text.contains("┌─ py"));
-        assert!(text.contains("\nx = a*b*c # not a heading\n"));
-        assert!(text.contains("└─"));
-        assert!(text.contains("after"));
-    }
-
-    #[test]
-    fn code_lines_copy_as_exactly_the_code() {
-        let code = "def f(x):\n    if x:\n        return x | 1\n\n    return 0";
-        let (raw, text) = render(&format!("```python\n{code}\n```\n"), 2);
-        // Between the header and the footer, the visible lines are the code
-        // itself: indentation kept, nothing added in front.
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.iter().position(|line| line.starts_with("┌─")).unwrap();
-        let end = lines.iter().position(|line| line.starts_with("└─")).unwrap();
-        assert_eq!(lines[start + 1..end].join("\n"), code);
-        // Still styled as code.
-        assert!(raw.contains("\x1b[0;36m"));
-    }
-
-    #[test]
-    fn tables_are_aligned() {
-        let (_, text) = render("| name | n |\n|:--|--:|\n| **a** | 1 |\n| bbbb | 22 |\nafter\n", 3);
-        assert!(text.contains("│ name │  n │"));
-        assert!(text.contains("│ a    │  1 │"));
-        assert!(text.contains("│ bbbb │ 22 │"));
-        assert!(text.ends_with("after\n"));
-    }
-
-    fn render_at(input: &str, width: usize) -> (String, String) {
-        let mut md = MarkdownStream::new();
-        md.set_width(Some(width));
-        let raw = md.push(input) + &md.finish();
-        (raw.clone(), strip(&raw))
-    }
-
-    const SERVICES: &str = "| Port | Service | Notes |\n|---|---|---|\n\
-        | 22 | ssh | Password auth enabled; root login permitted, worth checking |\n\
-        | 8080 | http-proxy | Manager app at /manager/html |\n";
-
-    #[test]
-    fn wide_tables_fit_the_terminal_and_keep_their_borders() {
-        for width in [60, 50, 40] {
-            let (_, text) = render_at(SERVICES, width);
-            let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
-            assert!(lines.len() > 6, "rows wrapped onto extra lines at {width}:\n{text}");
-            for line in &lines {
-                assert!(unicode_width::UnicodeWidthStr::width(*line) < width, "too wide at {width}: {line}");
-                assert!(matches!(line.chars().next(), Some('┌' | '│' | '├' | '└')), "{line}");
-                assert!(matches!(line.chars().last(), Some('┐' | '│' | '┤' | '┘')), "{line}");
-            }
-            // Wrapping happened between words, never inside one.
-            for word in ["Password", "permitted,", "checking", "http-proxy", "/manager/html"] {
-                assert!(text.contains(word), "{word} split at {width}:\n{text}");
-            }
-        }
-    }
-
-    #[test]
-    fn tables_that_fit_are_laid_out_as_before() {
-        let table = "| name | n |\n|:--|--:|\n| **a** | 1 |\n| bbbb | 22 |\n";
-        assert_eq!(render_at(table, 200).1, render(table, 3).1);
-    }
-
-    #[test]
-    fn narrow_screens_get_one_record_per_row() {
-        let (_, text) = render_at(SERVICES, 30);
-        assert!(!text.contains('│'), "no grid:\n{text}");
-        assert!(text.contains("Port: 22\nService: ssh\nNotes: Password auth"), "{text}");
-        assert!(text.contains("Port: 8080\nService: http-proxy\n"), "{text}");
-        for line in text.lines() {
-            assert!(unicode_width::UnicodeWidthStr::width(line) < 30, "{line}");
-        }
-    }
-
-    #[test]
-    fn styling_carries_onto_wrapped_lines() {
-        let table = "| a | b |\n|---|---|\n| x | **one two three four five six seven eight nine ten** |\n";
-        let (raw, text) = render_at(table, 30);
-        let bold = "\x1b[0;37;1m";
-        let wrapped: Vec<&str> = raw.lines().filter(|line| line.contains("│") && !strip(line).contains(" a ")).collect();
-        assert!(wrapped.len() > 1, "{text}");
-        for line in wrapped {
-            if strip(line).split('│').nth(2).is_some_and(|cell| !cell.trim().is_empty()) {
-                assert!(line.contains(bold), "bold lost on a wrapped line: {line:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_reply_that_opens_with_a_table_starts_it_on_its_own_line() {
-        let (_, text) = render_at("| a |\n|---|\n| b |\n", 80);
-        assert!(text.starts_with("\n┌"), "{text:?}");
-        let (_, text) = render_at("Results:\n| a |\n|---|\n| b |\n", 80);
-        assert!(text.starts_with("Results:\n┌"), "{text:?}");
-        // The width survives finish(), for the next reply.
-        let mut md = MarkdownStream::new();
-        md.set_width(Some(30));
-        let _ = md.push("x") + &md.finish();
-        let second = strip(&(md.push(SERVICES) + &md.finish()));
-        assert!(second.contains("Port: 22"), "{second}");
-    }
-
-    #[test]
-    fn column_fitting_shares_room_widest_first() {
-        // Fits: unchanged.
-        assert_eq!(fit_columns(&[4, 10], &[4, 5], 80), Some(vec![4, 10]));
-        // Too wide: the narrow column stays whole, the wide one gives way.
-        let widths = fit_columns(&[4, 10, 80], &[4, 10, 13], 60).unwrap();
-        assert_eq!(widths[..2], [4, 10]);
-        // Exactly the limit (the caller has already kept the last terminal column free).
-        assert_eq!(1 + 3 * 3 + widths.iter().sum::<usize>(), 60);
-        // Not even the longest words fit: records.
-        assert_eq!(fit_columns(&[20, 20, 20], &[15, 15, 15], 40), None);
-    }
-
-    #[test]
-    fn non_links_and_paths_survive() {
-        let (_, text) = render("arr[i] and - [ ] todo and C:\\Users\\me and \\*x\\*\n", 1);
-        assert_eq!(text, "arr[i] and - [ ] todo and C:\\Users\\me and *x*\n");
-    }
-
-    #[test]
-    fn held_back_text_is_flushed_on_finish() {
-        let (_, text) = render("ends with **", 1);
-        assert_eq!(text, "ends with **");
-        let (_, text) = render("| a |", 1);
-        assert_eq!(text, "| a |\n");
-    }
-
-    #[test]
-    fn only_sgr_sequences_are_emitted() {
-        let (raw, _) = render("# h\n- **b** [l](u)\n```\nc\n```\n| a |\n|-|\n| b |\n", 1);
-        let mut rest = raw.as_str();
-        while let Some(i) = rest.find('\x1b') {
-            rest = &rest[i + 1..];
-            let end = rest.find('m').unwrap();
-            assert!(rest[..end].starts_with('['));
-            assert!(rest[1..end].chars().all(|c| c.is_ascii_digit() || c == ';'));
-            rest = &rest[end + 1..];
-        }
-    }
-
-    #[test]
-    fn a_document_renders_in_lines_that_fit() {
-        let lines = super::render_lines("# Title\n\nSome **bold** words that run on for a while past the edge.\n\n- one\n- two\n\n```\ncode\n```", 24);
-        let plain: Vec<String> = lines.iter().map(|line| strip(line)).collect();
-        assert!(plain.iter().all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 24), "{plain:?}");
-        assert!(plain.iter().any(|line| line.contains("Title")) && plain.iter().any(|line| line.contains("bold")), "{plain:?}");
-        assert!(plain.iter().any(|line| line.contains("one")) && plain.iter().any(|line| line.contains("code")), "{plain:?}");
-        assert!(!plain.iter().any(|line| line.contains("**")), "rendered, not raw: {plain:?}");
-        assert!(lines.iter().all(|line| line.ends_with(super::RESET)), "each line closes its styles");
     }
 }

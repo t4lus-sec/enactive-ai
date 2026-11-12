@@ -1,22 +1,22 @@
 //! How the conversation is drawn in the transcript, and the record that lets
 //! Ctrl+O draw all of it again the other way.
 //!
-//! **Collapsed** (the default) reads as a conversation: your messages, s0ma's
-//! replies, and between them one dim line for each stretch of work. While s0ma
+//! **Collapsed** (the default) reads as a conversation: your messages, the agent's
+//! replies, and between them one dim line for each stretch of work. While the agent
 //! works, that line shows what it is doing now (`[*] thinking · ~240 tokens`,
 //! `[*] vm_exec(df -h)`); when the reply starts, it settles into a summary:
 //! `[+] 14s · ran vm_exec ×2, web_search · ~1.2k tokens of thought · 1 failed`.
 //! Harness status lines (folds, subagent progress, masking) are not shown.
 //!
-//! Each of s0ma's messages hangs under one `s0ma>`: its later lines, the text
+//! Each of the agent's messages hangs under one `s0ma>`: its later lines, the text
 //! of later passes and the work lines between them sit in a gutter as wide as
-//! the name, so only a new speaker (`you>`, s0ma's next message, a harness
+//! the name, so only a new speaker (`you>`, the agent's next message, a harness
 //! line) starts at the left edge:
 //!
 //! ```text
 //! you> check the disk
 //!       [+] 4s · ran vm_exec · ~300 tokens of thought
-//! s0ma> I'll look at /var too.
+//! the agent> I'll look at /var too.
 //!       [+] 2s · ran vm_exec
 //!       The root filesystem is 82% full, mostly logs.
 //! ```
@@ -41,7 +41,7 @@ use crate::terminal::{
 /// Collapsed work lines: quieter than the reply text around them.
 pub(crate) const WORK_STYLE: &str = "\x1b[3;90m";
 
-/// Collapsed: how far s0ma's message hangs in under its name (`s0ma> `).
+/// Collapsed: how far the agent's message hangs in under its name (`s0ma> `).
 pub const GUTTER: usize = 6;
 /// Narrower than this, a gutter would cost too much of the line.
 const GUTTER_MIN_COLUMNS: usize = 40;
@@ -114,7 +114,6 @@ impl Detail {
             Detail::Expanded => Detail::Collapsed,
         }
     }
-
 }
 
 /// The dim line a redraw starts with when the record no longer reaches back
@@ -133,7 +132,7 @@ pub enum Mark {
 /// One thing written to the transcript.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Entry {
-    /// A turn begins (the operator's or an autonomous one): s0ma's next words
+    /// A turn begins (the operator's or an autonomous one): the agent's next words
     /// start a new message, under its name again.
     Turn,
     /// A display pass begins (the steering pane opened): a fresh line, and the
@@ -214,7 +213,7 @@ pub struct TranscriptRecord {
 
 impl TranscriptRecord {
     /// Every entry kept, oldest first, and whether earlier ones were dropped:
-    /// what a terminal attaching to this s0ma starts from (`session.rs`).
+    /// what a terminal attaching to this agent starts from (`session.rs`).
     pub fn all(&self) -> (impl Iterator<Item = &Recorded>, bool) {
         (self.entries.iter(), self.dropped)
     }
@@ -576,7 +575,7 @@ pub struct Renderer {
     /// Reply styling that arrived before any visible reply text this pass:
     /// the `s0ma>` prefix waits for text.
     answer_held: Option<String>,
-    /// Collapsed: s0ma's name is on screen for the message in progress, so
+    /// Collapsed: the agent's name is on screen for the message in progress, so
     /// more of it (a later pass's text) goes on in the gutter, without it.
     message_open: bool,
     /// Collapsed: notices that came while a reply was mid-line, drawn once
@@ -810,7 +809,7 @@ impl Renderer {
             Entry::Raw { text, operator } => {
                 self.settle(out);
                 if *operator {
-                    // The operator speaks at the left edge; s0ma's answer is
+                    // The operator speaks at the left edge; the agent's answer is
                     // a new message, under its name.
                     self.flush_word(out);
                     self.close_message();
@@ -831,8 +830,8 @@ impl Renderer {
     }
 
     /// The operator's message: `you>  `, so its text starts in the column
-    /// s0ma's does (after `s0ma> `), and the lines after the first (wrapped,
-    /// or after a line break in it) hang under that column. s0ma's answer is
+    /// the agent's does (after `s0ma> `), and the lines after the first (wrapped,
+    /// or after a line break in it) hang under that column. The agent's answer is
     /// a new message, under its name.
     fn operator_line(&mut self, out: &mut Out, text: &str) {
         self.speaker_line(out, "you", OPERATOR_STYLE, OPERATOR_TEXT_STYLE, text);
@@ -840,7 +839,7 @@ impl Renderer {
 
     /// Someone's message, as the operator's is drawn: `label>` in
     /// `label_style`, then the text in `text_style`, its later lines hanging
-    /// in the gutter. A subagent's tab draws s0ma's directions this way.
+    /// in the gutter. A subagent's tab draws the agent's directions this way.
     pub fn speaker_line(&mut self, out: &mut Out, label: &str, label_style: &str, text_style: &str, text: &str) {
         self.settle(out);
         self.flush_word(out);
@@ -890,7 +889,7 @@ impl Renderer {
 
     /// A notice as a quiet `[*]` line in the gutter, like a work line, a green
     /// `[+]` one for a step that finished, or a `[-]` one for a problem. A long
-    /// one wraps under its own text. It leaves s0ma's message open: more of it
+    /// one wraps under its own text. It leaves the agent's message open: more of it
     /// goes on below without the name.
     fn draw_notice(&mut self, out: &mut Out, brief: &str, mark: Mark) {
         self.settle(out);
@@ -922,7 +921,7 @@ impl Renderer {
     /// below it after its own prefix.
     fn harness_line(&mut self, out: &mut Out, text: &str) {
         self.ensure_line_start(out);
-        // At the left edge, like a speaker of its own; what s0ma says next
+        // At the left edge, like a speaker of its own; what the agent says next
         // comes under its name again.
         self.close_message();
         self.push_text(out, &format!("{text}\r\n"));
@@ -974,7 +973,7 @@ impl Renderer {
         self.answer_held = None;
     }
 
-    /// s0ma's message is over (someone else speaks, or a turn begins): its
+    /// The agent's message is over (someone else speaks, or a turn begins): its
     /// next text starts at the left edge under its name.
     fn close_message(&mut self) {
         self.message_open = false;
@@ -1366,230 +1365,6 @@ mod tests {
         Entry::Answer(text.to_string())
     }
 
-    fn operator(text: &str) -> Entry {
-        Entry::Operator(text.to_string())
-    }
-
-    /// A turn with everything in it: thinking, a reply before the calls, two
-    /// calls (one failing), harness status lines, a fold, and the reply.
-    fn busy_turn() -> Vec<(u64, Entry)> {
-        vec![
-            (0, Entry::Pass),
-            (0, reasoning(&"a".repeat(400))),
-            (900, answer("\n\nI'll check the disk.")),
-            (1_000, status("[tool] running: vm_exec, arguments: {\"command\": \"df -h\"}")),
-            (1_200, status("[subagent] worker-1: 40% of its budget used")),
-            (1_400, status("[tool] finished: vm_exec (0.4s)")),
-            (1_500, reasoning(&"b".repeat(4_400))),
-            (6_000, status("[tool] running: web_search, arguments: {\"query\": \"x\"}")),
-            (6_100, status("[tool] failed: web_search: rate limited")),
-            (6_200, status("[tool] finished: web_search (0.1s)")),
-            // The pass ends for the fold (StreamPrinter::finish_interrupted).
-            (6_300, Entry::Raw { text: "\r\n".into(), operator: false }),
-            (6_400, Entry::Note("[context] 221000 input tokens mid-turn; folding before the next model call".into())),
-            (6_500, Entry::Note("[context] folded 40 messages into 2 episodes: 221000 → 70000 input tokens; continuing the turn".into())),
-            (6_600, Entry::Pass),
-            (6_600, reasoning(&"c".repeat(400))),
-            (14_600, answer("\n\n  The root filesystem is 82% full.")),
-        ]
-    }
-
-    #[test]
-    fn collapsed_reads_as_a_conversation() {
-        let shown = screen(&render(Detail::Collapsed, &busy_turn()));
-        assert_eq!(
-            shown,
-            vec![
-                "      [*] thought for <1s · ~100 tokens",
-                "s0ma> I'll check the disk.",
-                "      [+] 5s · ran vm_exec, web_search · ~1.1k tokens of thought · 1 failed",
-                "      [*] thought for <1s · ~100 tokens · context folded",
-                // The same message: on in the gutter, under one name.
-                "      The root filesystem is 82% full.",
-            ]
-        );
-        let all = shown.join("\n");
-        assert!(!all.contains("[subagent]") && !all.contains("[context]") && !all.contains("[tool]"), "{all}");
-    }
-
-    #[test]
-    fn expanded_keeps_everything_and_replies_start_at_the_prompt() {
-        let shown = screen(&render(Detail::Expanded, &busy_turn()));
-        let all = shown.join("\n");
-        for expected in [
-            "[Thinking]",
-            "s0ma> I'll check the disk.",
-            "[tool] running: vm_exec, arguments: {\"command\": \"df -h\"}",
-            "[subagent] worker-1: 40% of its budget used",
-            "[tool] failed: web_search: rate limited",
-            "s0ma> The root filesystem is 82% full.",
-        ] {
-            assert!(shown.iter().any(|line| line == expected), "missing {expected:?} in\n{all}");
-        }
-        assert!(all.contains("[context] folded 40 messages into 2 episodes"), "{all}");
-    }
-
-    #[test]
-    fn the_prefix_waits_for_visible_text() {
-        // Blank chunks, then styling, then the text.
-        let text = render(
-            Detail::Collapsed,
-            &[(0, answer("\n")), (1, answer("  \n")), (2, answer("\x1b[1m")), (3, answer("Bold start\x1b[0m."))],
-        );
-        assert_eq!(screen(&text), vec!["s0ma> Bold start."]);
-        assert!(text.contains("\x1b[1mBold start"), "styling kept: {text:?}");
-        // A reply the markdown renderer held back entirely arrives as a tail.
-        let text = render(Detail::Expanded, &[(0, answer("")), (1, Entry::AnswerTail("| a | b |".into()))]);
-        assert_eq!(screen(&text), vec!["s0ma> | a | b |"]);
-        // A tail after an operator message continues the reply without a prefix.
-        let text = render(
-            Detail::Expanded,
-            &[(0, answer("One")), (1, operator("wait")), (2, Entry::AnswerTail(" more.".into()))],
-        );
-        assert_eq!(screen(&text), vec!["s0ma> One", "you>  wait", " more."]);
-    }
-
-    #[test]
-    fn the_live_line_shows_the_current_step_in_place() {
-        let mut renderer = Renderer::new(Detail::Collapsed, 4.0);
-        let mut text = String::new();
-        let start = Instant::now();
-        let mut out = Out { text: &mut text, columns: 80, wrapping: true };
-        renderer.apply(&mut out, start, start, &reasoning(&"x".repeat(40)));
-        assert_eq!(screen(&text), vec!["      [*] thinking · ~10 tokens"]);
-
-        // More thinking right after: counted, redrawn once due.
-        let mut out = Out { text: &mut text, columns: 80, wrapping: true };
-        renderer.apply(&mut out, start, start, &reasoning(&"x".repeat(400)));
-        let drawn_at = renderer.drawn_at.unwrap();
-        assert!(!renderer.wants_refresh(drawn_at + Duration::from_millis(10)));
-        assert!(renderer.wants_refresh(drawn_at + THINKING_REDRAW));
-        renderer.refresh(&mut out, drawn_at + THINKING_REDRAW, false);
-        assert_eq!(screen(&text), vec!["      [*] thinking · ~110 tokens"]);
-
-        // A call replaces it at once, on the same line.
-        let mut out = Out { text: &mut text, columns: 80, wrapping: true };
-        renderer.apply(&mut out, start, start, &status("[tool] running: vm_exec, arguments: {\"command\": \"uptime\"}"));
-        assert_eq!(screen(&text), vec!["      [*] vm_exec(uptime)"]);
-        let mut out = Out { text: &mut text, columns: 80, wrapping: true };
-        renderer.apply(&mut out, start, start, &status("[tool] finished: vm_exec (0.2s)"));
-        renderer.refresh(&mut out, start + Duration::from_secs(1), true);
-        assert_eq!(screen(&text), vec!["      [+] vm_exec(uptime) · 0.2s"]);
-    }
-
-    #[test]
-    fn an_operator_message_mid_work_ends_the_stretch_and_a_new_one_follows() {
-        let shown = screen(&render(
-            Detail::Collapsed,
-            &[
-                (0, reasoning(&"a".repeat(80))),
-                (2_000, operator("also check /var")),
-                (2_100, status("[tool] running: subagent_wait, arguments: {}")),
-                (2_200, status("[tool] killed: subagent_wait")),
-                (5_200, status("[tool] finished: subagent_wait (3.1s)")),
-            ],
-        ));
-        assert_eq!(
-            shown,
-            vec!["      [*] thought for <1s · ~20 tokens", "you>  also check /var", "      [+] 3s · ran subagent_wait · 1 stopped"]
-        );
-    }
-
-    #[test]
-    fn many_tools_are_summarized_and_cut_to_the_width() {
-        let mut entries = Vec::new();
-        for (index, name) in ["vm_exec", "web_search", "browser_view", "archive_search", "episode_get", "vm_exec"].iter().enumerate() {
-            entries.push((index as u64 * 100, status(&format!("[tool] running: {name}, arguments: {{}}"))));
-            entries.push((index as u64 * 100 + 50, status(&format!("[tool] finished: {name} (0.1s)"))));
-        }
-        let shown = screen(&render(Detail::Collapsed, &entries));
-        assert_eq!(shown, vec!["      [+] <1s · ran vm_exec ×2, web_search, browser_view, archive_search, +1 m…"]);
-        // Narrow: cut, never wrapped.
-        let base = Instant::now();
-        let mut renderer = Renderer::new(Detail::Collapsed, 4.0);
-        let mut text = String::new();
-        for (millis, entry) in &entries {
-            let at = base + Duration::from_millis(*millis);
-            renderer.apply(&mut Out { text: &mut text, columns: 30, wrapping: true }, at, at, entry);
-        }
-        renderer.finish(&mut Out { text: &mut text, columns: 30, wrapping: true });
-        let shown = screen(&text);
-        assert!(shown.iter().all(|line| UnicodeWidthStr::width(line.as_str()) <= 29), "{shown:?}");
-    }
-
-    #[test]
-    fn tool_status_lines_are_read_back() {
-        assert_eq!(
-            parse_tool_status("[tool] running: vm_exec, arguments: {\"command\": \"ls, -la\"}"),
-            Some(ToolStatus::Running { name: "vm_exec".into(), arguments: "{\"command\": \"ls, -la\"}".into() })
-        );
-        assert_eq!(
-            parse_tool_status("[tool] finished: web_search (12.0s)"),
-            Some(ToolStatus::Finished { name: "web_search".into(), time: "12.0s".into() })
-        );
-        assert_eq!(
-            parse_tool_status("[tool] failed: vm_exec: exit status 2: no such file"),
-            Some(ToolStatus::Failed { name: "vm_exec".into(), error: "exit status 2: no such file".into() })
-        );
-        assert_eq!(parse_tool_status("[tool] killed: vm_exec"), Some(ToolStatus::Killed { name: "vm_exec".into(), detail: None }));
-        assert_eq!(
-            parse_tool_status("[tool] killed: vm_exec: process group ended"),
-            Some(ToolStatus::Killed { name: "vm_exec".into(), detail: Some("process group ended".into()) })
-        );
-        assert_eq!(parse_tool_status("[tool] batch rejected before execution (1/3): arguments were not valid JSON"), None);
-        assert_eq!(parse_tool_status("[tool] not running vm_exec: the operator stopped web_search earlier in this batch"), None);
-        assert_eq!(parse_tool_status("[context] masked 3 older tool results"), None);
-    }
-
-    #[test]
-    fn arguments_become_one_short_line() {
-        assert_eq!(compact_arguments(r#"{"command": "df -h"}"#), "df -h");
-        assert_eq!(compact_arguments(r#"{"query": "rust", "count": 5}"#), "rust, count: 5");
-        assert_eq!(compact_arguments(r#"{"b": 1, "a": [1, 2]}"#), "a: [1,2], b: 1");
-        assert_eq!(compact_arguments(r#"{"script": "set -e\n  make   test\n"}"#), "set -e make test");
-        assert_eq!(compact_arguments("{}"), "");
-        assert_eq!(compact_arguments("not json\nat all"), "not json at all");
-        let hostile = r#"{"text": "\u001b[2J\u001b7\u001b]52;c;aGk=\u0007:wq", "\u001b[r": 1}"#;
-        let shown = compact_arguments(hostile);
-        assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
-        assert!(shown.contains("␛[2J"), "{shown:?}");
-        assert!(compact_arguments(&format!(r#"{{"text": "{}"}}"#, "word ".repeat(200))).ends_with('…'));
-    }
-
-    #[test]
-    fn token_counts_read_naturally() {
-        assert_eq!(format_tokens(1), "~1 token");
-        assert_eq!(format_tokens(240), "~240 tokens");
-        assert_eq!(format_tokens(1_234), "~1.2k tokens");
-        assert_eq!(format_tokens(2_000), "~2k tokens");
-        assert_eq!(format_tokens(38_400), "~38k tokens");
-        assert_eq!(format_span(Duration::from_millis(400)), "<1s");
-        assert_eq!(format_span(Duration::from_secs(64)), "1m 04s");
-    }
-
-    #[test]
-    fn replaying_the_record_reaches_the_same_screen_as_live_output() {
-        let entries = busy_turn();
-        let base = Instant::now();
-        let mut record = TranscriptRecord::default();
-        for (millis, entry) in &entries {
-            record.push(base + Duration::from_millis(*millis), entry.clone());
-        }
-        for detail in [Detail::Collapsed, Detail::Expanded] {
-            let live = render(detail, &entries);
-            let (replayed, partial) = record.replay(detail);
-            assert!(!partial);
-            let mut renderer = Renderer::new(detail, 4.0);
-            let mut text = String::new();
-            for recorded in replayed {
-                let mut out = Out { text: &mut text, columns: 80, wrapping: true };
-                renderer.apply(&mut out, recorded.first, recorded.last, &recorded.entry);
-            }
-            renderer.finish(&mut Out { text: &mut text, columns: 80, wrapping: true });
-            assert_eq!(screen(&text), screen(&live), "{detail:?}");
-        }
-    }
-
     #[test]
     fn the_record_is_bounded_and_a_long_session_replays_its_end() {
         let base = Instant::now();
@@ -1618,143 +1393,6 @@ mod tests {
     }
 
     #[test]
-    fn detail_comes_from_the_environment_setting() {
-        assert_eq!(Detail::parse(None), Detail::Collapsed);
-        assert_eq!(Detail::parse(Some(" Expanded ")), Detail::Expanded);
-        assert_eq!(Detail::parse(Some("collapsed")), Detail::Collapsed);
-        assert_eq!(Detail::Expanded.toggled(), Detail::Collapsed);
-    }
-
-    #[test]
-    fn a_hidden_status_mid_reply_does_not_split_it() {
-        let text = render(Detail::Collapsed, &[
-            (0, Entry::Pass),
-            (0, reasoning("thinking it over")),
-            (100, answer("The root file")),
-            (150, status("[subagent] spawned 2 workers; s0ma continues")),
-            (200, answer("system is 82% full.")),
-        ]);
-        let lines = screen(&text);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[1], "s0ma> The root filesystem is 82% full.");
-    }
-
-    #[test]
-    fn a_subagent_that_stopped_shows_collapsed_and_its_progress_does_not() {
-        let text = render(Detail::Collapsed, &[
-            (0, Entry::Pass),
-            (0, answer("Working on it.")),
-            (100, status("[subagent b3-1] budget raised to 40k tokens")),
-            (150, status("[subagent b3-1] paused: time budget used (600s active of 600s); awaiting resize or cancel")),
-        ]);
-        let lines = screen(&text);
-        assert!(lines.iter().any(|line| line.contains("paused: time budget used")), "{lines:?}");
-        assert!(!lines.iter().any(|line| line.contains("budget raised")), "{lines:?}");
-    }
-
-    #[test]
-    fn styled_whitespace_from_the_markdown_tail_keeps_the_stretch_whole() {
-        let text = render(Detail::Collapsed, &[
-            (0, Entry::Pass),
-            (0, reasoning("first")),
-            (100, Entry::AnswerTail("\x1b[0;37m  \x1b[0m".into())),
-            (200, status("[tool] running: vm_exec, arguments: {\"command\": \"ls\"}")),
-            (300, status("[tool] finished: vm_exec (0.1s)")),
-        ]);
-        let lines = screen(&text);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("ran vm_exec"), "{lines:?}");
-    }
-
-    #[test]
-    fn thinking_in_the_middle_of_a_reply_does_not_glue_the_rest_to_its_summary() {
-        for detail in [Detail::Collapsed, Detail::Expanded] {
-            let text = render(detail, &[
-                (0, Entry::Pass),
-                (0, answer("Hello")),
-                // Empty reasoning beside every chunk changes nothing.
-                (10, reasoning("")),
-                (20, answer(" there.")),
-                (30, reasoning("but wait")),
-                (40, answer(" More.")),
-            ]);
-            let lines = screen(&text);
-            assert_eq!(lines[0], "s0ma> Hello there.", "{detail:?} {lines:?}");
-            assert!(lines.iter().all(|line| !line.contains("thought for") || !line.contains("More")), "{lines:?}");
-            assert!(lines.last().unwrap().contains("More."), "{lines:?}");
-        }
-    }
-
-    #[test]
-    fn the_operators_next_line_starts_a_line_of_its_own() {
-        // A turn that ended mid-line (an error, no closing blank line), then
-        // what the operator sent at the idle prompt.
-        let typed = Entry::Operator("next".into());
-        for detail in [Detail::Collapsed, Detail::Expanded] {
-            let text = render(detail, &[
-                (0, Entry::Pass),
-                (0, reasoning("hmm")),
-                (100, answer("partial text")),
-                (200, typed.clone()),
-            ]);
-            let lines = screen(&text);
-            assert_eq!(lines.last().unwrap(), "you>  next", "{detail:?} {lines:?}");
-            assert!(lines.iter().any(|line| line == "s0ma> partial text"), "{detail:?} {lines:?}");
-        }
-    }
-
-    #[test]
-    fn a_fold_is_only_reported_on_the_stretch_after_it() {
-        let folded = Entry::Note("[context] folded 12 messages into 2 episodes: 90000 → 30000 input tokens".into());
-        // Followed by work: that stretch says so.
-        let text = render(Detail::Collapsed, &[(0, folded.clone()), (0, Entry::Pass), (0, reasoning("next")), (50, answer("Done."))]);
-        assert!(screen(&text)[0].contains("context folded"), "{text:?}");
-        // Followed straight by a reply: no later stretch picks it up.
-        let text = render(Detail::Collapsed, &[
-            (0, folded),
-            (0, Entry::Pass),
-            (0, answer("Done.")),
-            (100, operator("next")),
-            (200, Entry::Pass),
-            (200, reasoning("thinking")),
-            (300, answer("Sure.")),
-        ]);
-        assert!(!text.contains("context folded"), "{text:?}");
-    }
-
-    #[test]
-    fn a_harness_line_mid_turn_gets_a_line_of_its_own() {
-        let warning = Entry::Line("[llm] repaired 1 truncated tool-call argument(s) before sending".into());
-        // During work, collapsed: the work line is settled above it.
-        let text = render(Detail::Collapsed, &[
-            (0, Entry::Pass),
-            (0, reasoning("checking")),
-            (100, status("[tool] running: vm_exec, arguments: {\"command\": \"ls\"}")),
-            (200, status("[tool] finished: vm_exec (0.1s)")),
-            (300, warning.clone()),
-            (400, answer("Done.")),
-        ]);
-        let lines = screen(&text);
-        assert!(lines[0].starts_with("      [+] ") && lines[0].contains("ran vm_exec"), "{lines:?}");
-        assert!(lines[1].starts_with("[llm] repaired"), "{lines:?}");
-        assert_eq!(lines[2], "s0ma> Done.");
-        // Mid-reply, either mode: the reply goes on below it, after its prefix.
-        for detail in [Detail::Collapsed, Detail::Expanded] {
-            let text = render(detail, &[(0, Entry::Pass), (0, answer("Partial reply")), (100, warning.clone()), (200, answer(" and the rest."))]);
-            let lines = screen(&text);
-            assert_eq!(lines[0], "s0ma> Partial reply", "{detail:?} {lines:?}");
-            assert!(lines[1].starts_with("[llm] repaired"), "{detail:?} {lines:?}");
-            assert_eq!(lines[2], "s0ma> and the rest.", "{detail:?} {lines:?}");
-            // Late text (a held table) after it gets the prefix too.
-            let text = render(detail, &[(0, Entry::Pass), (0, answer("Partial reply")), (100, warning.clone()), (200, Entry::AnswerTail("| a |".into()))]);
-            assert_eq!(screen(&text)[2], "s0ma> | a |", "{detail:?}");
-        }
-        // Expanded, reasoning that goes on below it gets its header again.
-        let text = render(Detail::Expanded, &[(0, Entry::Pass), (0, reasoning("one")), (100, warning), (200, reasoning("two"))]);
-        assert_eq!(screen(&text).iter().filter(|line| *line == "[Thinking]").count(), 2, "{text:?}");
-    }
-
-    #[test]
     fn a_rejected_batch_ends_the_pass_and_the_retry_goes_on_in_the_same_message() {
         let text = render(Detail::Collapsed, &[
             (0, Entry::Pass),
@@ -1764,275 +1402,5 @@ mod tests {
         ]);
         let lines = screen(&text);
         assert_eq!(lines, ["s0ma> I'll run both.", "      Retrying with valid JSON."]);
-    }
-
-    #[test]
-    fn late_reply_text_after_mid_reply_thinking_goes_on_below_its_summary() {
-        let text = render(Detail::Collapsed, &[
-            (0, Entry::Pass),
-            (0, answer("Here is the table:")),
-            (100, reasoning("let me lay it out")),
-            (200, Entry::AnswerTail("| a | b |".into())),
-        ]);
-        let lines = screen(&text);
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[1].starts_with("      [*] thought for"), "{lines:?}");
-        assert_eq!(lines[2], "      | a | b |");
-    }
-
-    #[test]
-    fn each_message_has_one_name_and_each_speaker_starts_at_the_left_edge() {
-        let shown = screen(&render(
-            Detail::Collapsed,
-            &[
-                (0, Entry::Turn),
-                (0, Entry::Pass),
-                (0, answer("First pass.")),
-                (100, status("[tool] running: vm_exec, arguments: {\"command\": \"ls\"}")),
-                (200, status("[tool] finished: vm_exec (0.1s)")),
-                (300, answer("Second pass.")),
-                (400, operator("and /home?")),
-                (500, answer("Sure.")),
-                // The next turn, autonomous: no `you>` above it.
-                (600, Entry::Raw { text: "\r\n\r\n".into(), operator: false }),
-                (700, Entry::Turn),
-                (700, Entry::Pass),
-                (800, answer("A wake event arrived.")),
-            ],
-        ));
-        assert_eq!(
-            shown,
-            vec![
-                "s0ma> First pass.",
-                "      [+] <1s · ran vm_exec",
-                "      Second pass.",
-                "you>  and /home?",
-                "s0ma> Sure.",
-                "",
-                "s0ma> A wake event arrived.",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_long_message_wraps_into_the_gutter_unless_the_terminal_is_narrow() {
-        let reply = "The root filesystem is 82% full, mostly journald logs under /var/log, \
-                     which can be vacuumed safely.\n\nSecond paragraph.";
-        for (columns, gutter) in [(40, 6), (30, 0)] {
-            let mut renderer = Renderer::new(Detail::Collapsed, 4.0);
-            let mut text = String::new();
-            let at = Instant::now();
-            for entry in [Entry::Turn, Entry::Pass, answer(reply)] {
-                renderer.apply(&mut Out { text: &mut text, columns, wrapping: true }, at, at, &entry);
-            }
-            renderer.finish(&mut Out { text: &mut text, columns, wrapping: true });
-            let lines = screen(&text);
-            assert!(lines[0].starts_with("s0ma> The root"), "{lines:?}");
-            assert!(lines.iter().all(|line| UnicodeWidthStr::width(line.as_str()) <= columns), "{lines:?}");
-            for line in lines[1..].iter().filter(|line| !line.is_empty()) {
-                let indent = line.len() - line.trim_start().len();
-                assert_eq!(indent, gutter, "{columns} columns: {lines:?}");
-            }
-            assert!(lines.contains(&"".to_string()), "the paragraph break stays, with nothing in it");
-        }
-    }
-
-    #[test]
-    fn expanded_keeps_a_name_per_pass_and_no_gutter() {
-        let shown = screen(&render(
-            Detail::Expanded,
-            &[
-                (0, Entry::Turn),
-                (0, Entry::Pass),
-                (0, answer("First pass.")),
-                (100, status("[tool] finished: vm_exec (0.1s)")),
-                (200, answer("Second pass.")),
-            ],
-        ));
-        assert!(shown.contains(&"s0ma> First pass.".to_string()), "{shown:?}");
-        assert!(shown.contains(&"s0ma> Second pass.".to_string()), "{shown:?}");
-    }
-
-    #[test]
-    fn a_sleep_reads_as_steps_collapsed_and_as_its_own_lines_expanded() {
-        let step = |brief: &str, full: &str, mark| Entry::Notice { brief: brief.into(), full: full.into(), mark };
-        let entries = [
-            (0, step("sleep · analysing 3 batch(es) on 3 workers", "[sleep] analysing 3 batch(es) on 3 workers", Mark::Work)),
-            (1, step("sleep · batch 2 of 3 analysed · 1 of 3 done", "[sleep] batch 2 of 3 analysed · 1 of 3 done", Mark::Done)),
-            (2, step("sleep · integration pass 1 of 2: batches 1–2 of 3", "[sleep] integration pass 1 of 2: batches 1–2 of 3, 90000 input tokens", Mark::Work)),
-            (3, step("sleep · done in 41m 07s · through #900 · 12 episodes committed", "[sleep] Deep sleep completed in 2467s, covering events through #900. Committed 12 episode(s): …", Mark::Done)),
-        ];
-        let collapsed = render(Detail::Collapsed, &entries);
-        assert_eq!(screen(&collapsed), vec![
-            "      [*] sleep · analysing 3 batch(es) on 3 workers",
-            "      [+] sleep · batch 2 of 3 analysed · 1 of 3 done",
-            "      [*] sleep · integration pass 1 of 2: batches 1–2 of 3",
-            "      [+] sleep · done in 41m 07s · through #900 · 12 episodes committed",
-        ]);
-        assert!(collapsed.contains(&format!("{OK_MARK}[+]{RESET} {WORK_STYLE}sleep · batch 2")), "a finished step's mark is green: {collapsed:?}");
-        let expanded = screen(&render(Detail::Expanded, &entries));
-        assert!(expanded.contains(&"[sleep] integration pass 1 of 2: batches 1–2 of 3, 90000 input tokens".to_string()), "{expanded:?}");
-        assert!(expanded.iter().any(|line| line.starts_with("[sleep] Deep sleep completed in 2467s")), "the manifest itself, expanded");
-        assert!(!expanded.iter().any(|line| line.contains("[+]")));
-    }
-
-    #[test]
-    fn a_notice_is_a_quiet_line_in_the_gutter_collapsed_and_whole_expanded() {
-        let notice = Entry::Notice { brief: "looping · /loop off stops it".into(), full: "[runtime] looping mode".into(), mark: Mark::Work };
-        let entries = [(0, operator("/loop on")), (10, notice.clone()), (20, Entry::Pass), (30, answer("Picking up the build."))];
-        let collapsed = render(Detail::Collapsed, &entries);
-        assert_eq!(screen(&collapsed), vec!["you>  /loop on", "      [*] looping · /loop off stops it", "s0ma> Picking up the build."]);
-        assert!(collapsed.contains(&format!("{WORK_STYLE}[*]{RESET} {WORK_STYLE}looping")), "{collapsed:?}");
-        let expanded = screen(&render(Detail::Expanded, &entries));
-        assert!(expanded.contains(&"[runtime] looping mode".to_string()), "{expanded:?}");
-        // Long: wrapped under its own text, nothing cut.
-        let mut renderer = Renderer::new(Detail::Collapsed, 4.0);
-        let mut text = String::new();
-        renderer.apply(&mut Out { text: &mut text, columns: 20, wrapping: true }, Instant::now(), Instant::now(), &notice);
-        assert_eq!(screen(&text), vec!["[*] looping · /loop", "    off stops it"]);
-        // A problem is marked as one.
-        let problem = Entry::Notice {
-            brief: "compaction · window #1..#9: 2 damaged batch(es) skipped, 5 kept".into(),
-            full: "[compaction] window #1..#9: 2 damaged batch(es) skipped, 5 kept".into(),
-            mark: Mark::Problem,
-        };
-        let text = render(Detail::Collapsed, &[(0, problem.clone())]);
-        assert_eq!(screen(&text), vec!["      [-] compaction · window #1..#9: 2 damaged batch(es) skipped, 5 kept"]);
-        assert!(text.contains(&format!("{FAILED_MARK}[-]")), "{text:?}");
-        assert!(screen(&render(Detail::Expanded, &[(0, problem)])).contains(&"[compaction] window #1..#9: 2 damaged batch(es) skipped, 5 kept".to_string()));
-    }
-
-    #[test]
-    fn a_queued_message_shows_where_s0ma_takes_it_and_its_notes_wait_for_the_line_to_end() {
-        let queued = Entry::Notice {
-            brief: "queued for after the current step: \u{201c}check the todo list\u{201d}".into(),
-            full: "queued".into(),
-            mark: Mark::Work,
-        };
-        let delivered = Entry::Notice { brief: "s0ma has your message".into(), full: "↳ s0ma has your message".into(), mark: Mark::Work };
-        let shown = screen(&render(
-            Detail::Collapsed,
-            &[
-                (0, Entry::Turn),
-                (0, Entry::Pass),
-                (0, reasoning(&"a".repeat(40))),
-                // The reply ends its pass with blank lines, and the message is
-                // queued while that line is still being written.
-                (100, answer("Loop cycle. The banner")),
-                (150, queued),
-                (200, answer(" is stale.\n\n\n")),
-                (300, status("[tool] running: attention_orient, arguments: {}")),
-                (400, status("[tool] finished: attention_orient (0.1s)")),
-                // s0ma takes it at the safe point after the calls.
-                (500, operator("check the todo list")),
-                (500, Entry::Raw { text: "\r\n".into(), operator: false }),
-                (600, delivered),
-                (600, Entry::Pass),
-                (600, reasoning(&"b".repeat(40))),
-                (700, answer("Checking it against the research hub.")),
-            ],
-        ));
-        assert_eq!(
-            shown,
-            vec![
-                "      [*] thought for <1s · ~10 tokens",
-                "s0ma> Loop cycle. The banner is stale.",
-                "      [*] queued for after the current step: \u{201c}check the todo list\u{201d}",
-                "      [+] <1s · ran attention_orient",
-                "you>  check the todo list",
-                "      [*] s0ma has your message",
-                "      [*] thought for <1s · ~10 tokens",
-                "s0ma> Checking it against the research hub.",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_paragraph_break_inside_a_reply_still_comes_through() {
-        let shown = screen(&render(
-            Detail::Collapsed,
-            &[(0, Entry::Turn), (0, Entry::Pass), (0, answer("One.\n\n")), (10, status("[subagent] spawned 1 worker")), (20, answer("Two."))],
-        ));
-        assert_eq!(shown, vec!["s0ma> One.", "", "      Two."]);
-    }
-
-    #[test]
-    fn the_operators_text_starts_where_s0mas_does_and_wraps_under_it() {
-        let message = "the build VM's disk keeps filling up, can you find out why\nand clean it up?";
-        let at = |columns: usize, detail: Detail, entries: &[Entry]| {
-            let mut renderer = Renderer::new(detail, 4.0);
-            let mut text = String::new();
-            for entry in entries {
-                renderer.apply(&mut Out { text: &mut text, columns, wrapping: true }, Instant::now(), Instant::now(), entry);
-            }
-            renderer.finish(&mut Out { text: &mut text, columns, wrapping: true });
-            screen(&text)
-        };
-        let shown = at(50, Detail::Collapsed, &[operator(message), Entry::Turn, Entry::Pass, answer("Looking into it now.")]);
-        assert_eq!(
-            shown,
-            vec![
-                "you>  the build VM's disk keeps filling up, can",
-                "      you find out why",
-                "      and clean it up?",
-                "s0ma> Looking into it now.",
-            ]
-        );
-        assert!(shown.iter().all(|line| UnicodeWidthStr::width(line.as_str()) <= 50), "{shown:?}");
-        // Narrow: no hanging indent to spare.
-        let mut renderer = Renderer::new(Detail::Collapsed, 4.0);
-        let mut text = String::new();
-        renderer.apply(&mut Out { text: &mut text, columns: 12, wrapping: true }, Instant::now(), Instant::now(), &operator("hi"));
-        assert_eq!(screen(&text), vec!["you>  hi"]);
-        // The same in the expanded view.
-        assert_eq!(at(50, Detail::Expanded, &[operator(message)])[1], "      you find out why");
-    }
-
-    #[test]
-    fn a_status_block_keeps_its_lines_under_the_first() {
-        let block = Entry::Notice {
-            brief: "mcp · config: /x/mcp.json\n  fs      connected · local\n  github  failed (logs: /x)".into(),
-            full: "[mcp] config: /x/mcp.json".into(),
-            mark: Mark::Work,
-        };
-        let shown = screen(&render(Detail::Collapsed, &[(0, operator("/mcp")), (10, block)]));
-        assert_eq!(
-            shown,
-            vec![
-                "you>  /mcp",
-                "      [*] mcp · config: /x/mcp.json",
-                "            fs      connected · local",
-                "            github  failed (logs: /x)",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_turn_marker_alone_is_nothing_to_show() {
-        let mut record = TranscriptRecord::default();
-        record.push(Instant::now(), Entry::Turn);
-        record.push(Instant::now(), Entry::Pass);
-        assert!(record.is_empty());
-    }
-
-    #[test]
-    fn many_small_pieces_of_output_are_kept_together() {
-        let base = Instant::now();
-        let mut record = TranscriptRecord::default();
-        for _ in 0..10_000 {
-            record.push(base, Entry::Raw { text: "ab".into(), operator: false });
-        }
-        assert_eq!(record.entries.len(), 1);
-        // An operator line is never merged into the output around it.
-        record.push(base, Entry::Raw { text: "you> hi\r\n".into(), operator: true });
-        record.push(base, Entry::Raw { text: "cd".into(), operator: false });
-        assert_eq!(record.entries.len(), 3);
-        // Entries that can't merge are counted with their overhead.
-        let mut record = TranscriptRecord::default();
-        for _ in 0..200_000 {
-            record.push(base, Entry::Pass);
-            record.push(base, Entry::Line("x".into()));
-        }
-        assert!(record.bytes <= RECORD_LIMIT && record.entries.len() < 200_000, "{}", record.entries.len());
     }
 }

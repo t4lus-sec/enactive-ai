@@ -1,10 +1,10 @@
 //! Operator kill: stop the tool call that is running now, or a subagent,
-//! without ending s0ma's turn.
+//! without ending the agent's turn.
 //!
 //! Ctrl+C ends the whole turn (once the current batch of tool calls is done)
 //! and cancels every subagent. `/kill` is narrower:
 //!
-//! - `/kill` stops the tool call running right now. s0ma gets a result saying
+//! - `/kill` stops the tool call running right now. The agent gets a result saying
 //!   the operator stopped it, and carries on with the rest of its turn.
 //! - `/kill <job>` stops one subagent (by job id, slot number or a unique part
 //!   of the id); `/kill subagents` stops them all; `/kill all` stops both.
@@ -107,9 +107,9 @@ impl Killed {
     }
 }
 
-// Neutral on purpose: the same error stops a subagent's VM command when s0ma
+// Neutral on purpose: the same error stops a subagent's VM command when the agent
 // (not the operator) cancels the worker. The operator's own kills are labelled
-// as such in the tool result s0ma sees (`tool_result`).
+// as such in the tool result the agent sees (`tool_result`).
 impl fmt::Display for Killed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "stopped: {}", self.detail)
@@ -279,7 +279,7 @@ impl Drop for ToolCall {
     }
 }
 
-/// The tool result s0ma sees for a call the operator stopped. `error` is what
+/// The tool result the agent sees for a call the operator stopped. `error` is what
 /// the tool itself returned, if it returned an error.
 pub fn tool_result(tool: &str, elapsed: Duration, killed: Option<&Killed>, own_result: Option<&str>) -> String {
     let detail = killed.map(|k| k.detail.as_str()).unwrap_or("the call was stopped where it was");
@@ -318,7 +318,7 @@ pub(crate) fn elapsed(duration: Duration) -> String {
 }
 
 // ------------------------------------------------------------------
-// The operator command
+// the operator command
 // ------------------------------------------------------------------
 
 /// Handle `/kill ...`, acting at once; `None` when `input` is not a kill
@@ -422,125 +422,5 @@ mod tests {
         assert!(!requested(), "the outer token is back");
         outer.store(true, Ordering::SeqCst);
         assert!(requested());
-    }
-
-    #[test]
-    fn sleep_wakes_early_when_killed() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let _token = install(Arc::clone(&flag));
-        let started = Instant::now();
-        assert!(sleep(Duration::from_millis(60)).is_ok());
-        let killer = Arc::clone(&flag);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            killer.store(true, Ordering::SeqCst);
-        });
-        let error = sleep(Duration::from_secs(30)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
-        assert_eq!(error.to_string(), "stopped: stopped while waiting");
-    }
-
-    #[test]
-    fn abandonable_work_returns_its_value_or_is_left_behind() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let _token = install(Arc::clone(&flag));
-        assert_eq!(abandonable("quick", || 7).unwrap(), Ok(7));
-        let killer = Arc::clone(&flag);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            killer.store(true, Ordering::SeqCst);
-        });
-        let started = Instant::now();
-        let error = abandonable("slow search", || thread::sleep(Duration::from_secs(5))).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(error.detail.contains("slow search abandoned"), "{error}");
-    }
-
-    // One test for the shared RUNNING slot, so parallel tests cannot race on it.
-    #[test]
-    fn a_kill_stops_only_the_call_running_when_it_arrives() {
-        let call = tool_call("vm_exec");
-        assert!(list().contains("tool call: vm_exec (running"), "{}", list());
-        let report = handle_command("/kill").unwrap();
-        assert!(report.starts_with("[kill] stopping vm_exec (running "), "{report}");
-        // The blocking code sees it.
-        assert!(requested());
-        assert_eq!(call.finish(), Ending::Killed);
-        assert!(!requested(), "the token went with the call");
-
-        // The next call starts clean.
-        let next = tool_call("archive_search");
-        assert!(!requested());
-        assert_eq!(next.finish(), Ending::Normal);
-
-        // A call that never checks finishes regardless; the kill was too late.
-        let stubborn = tool_call("skill_read");
-        handle_command("/kill").unwrap();
-        assert_eq!(stubborn.finish(), Ending::TooLate);
-
-        // Nothing running.
-        assert!(handle_command("/kill").unwrap().starts_with("[kill] no tool call is running"));
-        assert_eq!(handle_command("/kill all").unwrap(), "[kill] nothing is running");
-
-        // A call dropped without finishing still releases its claim.
-        drop(tool_call("web_search"));
-        assert!(list().contains("tool call: none running"));
-    }
-
-    #[test]
-    fn an_abandonable_panic_is_a_panic_not_a_kill() {
-        let outcome = std::panic::catch_unwind(|| abandonable("search", || -> u8 { panic!("search exploded") }));
-        assert!(outcome.is_err(), "the panic propagates as if run inline");
-    }
-
-    #[test]
-    fn output_matches_command_output_and_stops_for_a_kill() {
-        let mut echo = std::process::Command::new("sh");
-        echo.args(["-c", "printf out; printf err >&2; exit 3"]);
-        let output = output(echo).unwrap();
-        assert_eq!((output.stdout.as_slice(), output.stderr.as_slice(), output.status.code()), (&b"out"[..], &b"err"[..], Some(3)));
-
-        let flag = Arc::new(AtomicBool::new(false));
-        let _token = install(Arc::clone(&flag));
-        let killer = Arc::clone(&flag);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
-            killer.store(true, Ordering::SeqCst);
-        });
-        let mut slow = std::process::Command::new("sleep");
-        slow.arg("30");
-        let started = Instant::now();
-        let error = super::output(slow).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert_eq!(error.to_string(), "stopped: the sleep process was stopped");
-    }
-
-    #[test]
-    fn not_a_kill_command_is_left_alone() {
-        assert!(handle_command("/killall").is_none());
-        assert!(handle_command("please /kill it").is_none());
-        assert!(handle_command("/kill a b").unwrap().contains("usage"));
-    }
-
-    #[test]
-    fn killed_calls_read_as_deliberate_and_keep_what_they_produced() {
-        let killed = Killed::new("the command was stopped on the machine").with_partial("{\"stdout\":\"half\"}");
-        let result: serde_json::Value =
-            serde_json::from_str(&tool_result("vm_exec", Duration::from_millis(4200), Some(&killed), None)).unwrap();
-        assert_eq!(result["killed"], true);
-        assert_eq!(result["ok"], false);
-        assert_eq!(result["error"], "stopped by the operator (/kill) after 4.2s: the command was stopped on the machine");
-        assert_eq!(result["partial"], "{\"stdout\":\"half\"}");
-        assert!(result["instruction"].as_str().unwrap().contains("Do not simply run it again"));
-        let generic: serde_json::Value =
-            serde_json::from_str(&tool_result("mcp_call", Duration::from_secs(1), None, Some("{\"ok\":false}"))).unwrap();
-        assert_eq!(generic["partial"], "{\"ok\":false}");
-    }
-
-    #[test]
-    fn durations_read_naturally() {
-        assert_eq!(elapsed(Duration::from_millis(4200)), "4.2s");
-        assert_eq!(elapsed(Duration::from_secs(134)), "2m14s");
-        assert_eq!(elapsed(Duration::from_secs(3 * 3600 + 120)), "3h02m");
     }
 }

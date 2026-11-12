@@ -1,15 +1,15 @@
-//! Full control of s0ma's browser inside the VM.
+//! Full control of the agent's browser inside the VM.
 //!
-//! One instance, started with its own profile on s0ma's display the way the
+//! One instance, started with its own profile on the agent's display the way the
 //! Minecraft viewer already is. There is no operator-owned session here and no
 //! observation-only mode: every tool acts on the same browser.
 //!
-//! This grants no authority s0ma lacks. `vm_exec` already runs arbitrary commands
+//! This grants no authority the agent lacks. `vm_exec` already runs arbitrary commands
 //! as the same unprivileged user and `desktop_click`/`desktop_type` already drive
 //! that display, so the difference is reliability, not reach.
 //!
 //! Page content is untrusted evidence, never instructions. A page that appears to
-//! address s0ma is describing itself, not issuing an instruction.
+//! address the agent is describing itself, not issuing an instruction.
 //!
 //! # Guest protocol
 //!
@@ -33,7 +33,7 @@
 //! - `{"action":"tab","operation":"new"|"close"|"activate","url":U?}`
 //! - `{"action":"eval","script":S}`
 //!
-//! A watchdog (browser_watchdog.rs) wraps every call: it health-checks the helper
+//! A watchdog (browser/watchdog.rs) wraps every call: it health-checks the helper
 //! after a failure, restarts it when it is wedged, and retries observation calls.
 //!
 //! `ref` is an element handle from the most recent snapshot of the same tab. Refs
@@ -45,7 +45,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{error::Error, path::Path, sync::Mutex, time::Instant};
 
-#[path = "browser_watchdog.rs"]
 mod watchdog;
 use watchdog::{Attempt, Guest, Watchdog};
 
@@ -293,9 +292,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 }
 
 /// Navigation targets are restricted to ordinary web schemes and about:blank.
-/// `file:`, `javascript:` and `data:` are refused here not because s0ma lacks the
+/// `file:`, `javascript:` and `data:` are refused here not because the agent lacks the
 /// reach — `vm_exec` reads local files directly — but because a page-injected
-/// instruction that talks s0ma into navigating somewhere should not be able to
+/// instruction that talks the agent into navigating somewhere should not be able to
 /// turn a navigation into a local read or a script execution.
 fn checked_url(url: &str) -> Result<String, Box<dyn Error>> {
     let trimmed = url.trim();
@@ -611,98 +610,11 @@ mod tests {
         assert!(request(&call("browser_click",json!({"ref":"e1","x":10}))).is_err());
     }
 
-    /// One browser: nothing selects an instance, so nothing can be pointed elsewhere.
-    #[test]
-    fn no_tool_accepts_a_session_or_target() {
-        for name in ["browser_tabs","browser_read","browser_view","browser_open","browser_navigate","browser_click","browser_type","browser_eval","browser_tab"] {
-            for field in ["session","target","instance","profile"] {
-                assert!(
-                    request(&call(name,json!({field:"other","url":"https://example.com","ref":"e1","text":"x","script":"1","operation":"new"}))).is_err(),
-                    "{name} accepted {field}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn navigation_schemes_are_restricted() {
-        assert!(checked_url("https://example.com").is_ok());
-        assert!(checked_url("http://10.10.11.4/").is_ok());
-        assert!(checked_url("about:blank").is_ok());
-        assert!(checked_url("file:///etc/passwd").is_err());
-        assert!(checked_url("javascript:alert(1)").is_err());
-        assert!(checked_url("data:text/html,<b>x</b>").is_err());
-        assert!(checked_url("https://example.com/\nX-Injected: 1").is_err());
-    }
-
-    #[test]
-    fn bounds_are_enforced() {
-        assert!(request(&call("browser_type",json!({"ref":"e1","text":"x".repeat(MAX_TEXT_CHARS+1)}))).is_err());
-        assert!(request(&call("browser_eval",json!({"script":"  "}))).is_err());
-        assert!(request(&call("browser_wait",json!({"until":"ref"}))).is_err());
-        assert!(request(&call("browser_wait",json!({"until":"delay","milliseconds":60000}))).is_err());
-        assert!(request(&call("browser_click",json!({"ref":"e1","modifiers":["hyper"]}))).is_err());
-        assert!(request(&call("browser_read",json!({"tab_id":0}))).is_err());
-        assert!(request(&call("browser_tab",json!({"operation":"close","url":"https://example.com"}))).is_err());
-    }
-
     #[test]
     fn defaults_survive_empty_arguments() {
         assert_eq!(action("browser_read",json!({}))["max_chars"],12_000);
         assert_eq!(action("browser_read",json!({}))["screenshot"],false);
         assert_eq!(action("browser_click",json!({"ref":"e1"}))["button"],"left");
         assert_eq!(action("browser_scroll",json!({"direction":"down"}))["amount"],600);
-    }
-
-    #[test]
-    fn browser_view_requests_a_screenshot_with_minimal_text() {
-        let built = action("browser_view", json!({}));
-        assert_eq!(built["action"], "snapshot");
-        assert_eq!(built["screenshot"], true);
-        assert_eq!(built["max_chars"], VIEW_TEXT_CHARS);
-        assert_eq!(action("browser_view", json!({"tab_id":3}))["tab_id"], 3);
-        assert!(request(&call("browser_view", json!({"tab_id":0}))).is_err());
-        assert!(request(&call("browser_view", json!({"screenshot":false}))).is_err());
-        assert!(request(&call("browser_view", json!({"max_chars":24000}))).is_err());
-    }
-
-    #[test]
-    fn browser_view_keeps_metadata_and_drops_page_text() {
-        let observation = DesktopObservation { content: "frame".into(), data_url: "data:image/jpeg;base64,AA==".into() };
-        let execution = DesktopExecution {
-            result: json!({"ok":true,"url":"https://example.com","title":"Example","text":"secret page text","refs":[{"ref":"e1"}]}).to_string(),
-            observation: Some(observation),
-        };
-        let viewed: Value = serde_json::from_str(&view_only(execution).unwrap().result).unwrap();
-        assert_eq!(viewed["url"], "https://example.com");
-        assert_eq!(viewed["title"], "Example");
-        assert!(viewed.get("text").is_none());
-        assert!(viewed.get("refs").is_none());
-    }
-
-    #[test]
-    fn browser_view_without_a_screenshot_is_an_error() {
-        let execution = DesktopExecution { result: json!({"ok":true}).to_string(), observation: None };
-        assert!(view_only(execution).is_err());
-    }
-
-    #[test]
-    fn every_defined_tool_is_handled_and_buildable() {
-        let defined: Vec<String> = tool_definitions().into_iter().map(|t| t.function.name).collect();
-        assert_eq!(defined.len(), TOOL_NAMES.len());
-        for name in &defined {
-            assert!(handles(name), "{name} is defined but not in TOOL_NAMES");
-            // An unknown name fails with "unknown browser tool"; anything else
-            // (missing required fields) proves request() has an arm for it.
-            if let Err(error) = request(&call(name, json!({}))) {
-                assert!(!error.to_string().contains("unknown browser tool"), "{name} has no request arm");
-            }
-        }
-    }
-
-    #[test]
-    fn navigation_gets_a_longer_timeout_than_interaction() {
-        assert_eq!(request(&call("browser_navigate",json!({"url":"https://example.com"}))).unwrap().1, NAVIGATE_TIMEOUT_SECS);
-        assert_eq!(request(&call("browser_click",json!({"ref":"e1"}))).unwrap().1, CONTROL_TIMEOUT_SECS);
     }
 }

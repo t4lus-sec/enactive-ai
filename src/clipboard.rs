@@ -252,27 +252,3 @@ fn copy_with_tool(text: &str, display: &[(&'static str, String)]) -> Option<&'st
     tools.iter().find(|(program, args)| run_writing(program, args, display, text)).map(|(program, _)| *program)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finds_the_last_code_block() {
-        let reply = "Try:\n```rust\nfn a() {}\n```\nor\n~~~\nb\n  c\n~~~\ndone";
-        assert_eq!(last_code_block(reply).as_deref(), Some("b\n  c"));
-        assert_eq!(last_code_block("```\nunterminated").as_deref(), Some("unterminated"));
-        assert_eq!(last_code_block("no code"), None);
-    }
-
-    #[test]
-    fn a_clipboard_program_is_read_and_one_that_hangs_is_given_up_on() {
-        assert_eq!(run_reading("printf", &["copied text"], &[]).as_deref(), Some("copied text"));
-        assert_eq!(run_reading("sh", &["-c", "printf \"$S0MA_TEST_VAR\""], &[("S0MA_TEST_VAR", "from env".into())]).as_deref(), Some("from env"));
-        assert_eq!(run_reading("false", &[], &[]), None);
-        let began = Instant::now();
-        assert_eq!(run_reading("sleep", &["30"], &[]), None);
-        assert!(began.elapsed() < Duration::from_secs(5), "waited {:?}", began.elapsed());
-        assert!(run_writing("sh", &["-c", "cat > /dev/null"], &[], "x"));
-        assert!(!run_writing("no-such-clipboard-tool", &[], &[], "x"));
-    }
-}

@@ -23,16 +23,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// s0ma's `s0ma>`, name and `>` alike: CRT phosphor green (#33FF33), the
+/// The agent's `s0ma>`, name and `>` alike: CRT phosphor green (#33FF33), the
 /// markdown headings' colour, 24-bit so a terminal theme can't remap it.
 pub const NAME_STYLE: &str = "\x1b[1;38;2;51;255;51m";
 pub const CHEVRON_STYLE: &str = "\x1b[1;96m";
 pub const TEXT_STYLE: &str = "\x1b[37m";
-/// The operator's `you>`: blue beside s0ma's green, so a glance down the
+/// The operator's `you>`: blue beside the agent's green, so a glance down the
 /// left edge shows who is speaking. 24-bit, like the markdown headings, so a
 /// terminal theme can't remap it.
 pub const OPERATOR_STYLE: &str = "\x1b[1;38;2;95;175;255m";
-/// The operator's words: a step brighter than s0ma's reply text (`37`).
+/// The operator's words: a step brighter than the agent's reply text (`37`).
 pub const OPERATOR_TEXT_STYLE: &str = "\x1b[97m";
 pub const THINKING_STYLE: &str = "\x1b[3;37m";
 pub const STATUS_STYLE: &str = "\x1b[2;36m";
@@ -102,7 +102,7 @@ pub fn leave_page() {
 /// from the record (Ctrl+O, a resize, a tab closing) keeps them.
 static SHARED: OnceLock<ActiveDisplay> = OnceLock::new();
 
-/// What this s0ma's display does that a terminal attached to it does too
+/// What this agent's display does that a terminal attached to it does too
 /// (`session.rs`): the attached terminal draws each the way this one does,
 /// at its own width and in its own mode, so it looks and works the same.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -378,7 +378,7 @@ pub fn reflection_end() {
 // ACTIVE DISPLAY
 // ============================================================
 
-/// Terminal renderer used while s0ma is actively running.
+/// Terminal renderer used while the agent is actively running.
 ///
 /// The terminal is split into two logical areas:
 ///
@@ -386,7 +386,7 @@ pub fn reflection_end() {
 /// - final rows: a progress line, then persistent multiline operator input
 ///
 /// There is only one real hardware cursor. We use the terminal's saved
-/// cursor position as s0ma's logical output cursor, while leaving the
+/// cursor position as the agent's logical output cursor, while leaving the
 /// physical cursor on the operator input row between streamed chunks.
 #[derive(Clone)]
 pub struct ActiveDisplay {
@@ -397,7 +397,7 @@ pub struct ActiveDisplay {
     queued: Arc<AtomicUsize>,
 }
 
-/// What s0ma is doing, for the progress line.
+/// What the agent is doing, for the progress line.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Activity {
     Waiting,
@@ -450,7 +450,7 @@ struct DisplayState {
     frame_drawn: u128,
     /// Shown on the progress line until the next key (completion lists etc.).
     hint: Option<String>,
-    /// Operator messages sent during the turn and not yet handed to s0ma
+    /// Operator messages sent during the turn and not yet handed to the agent
     /// (they wait for a safe point; see `agent::SteerPoint`).
     queued: Arc<AtomicUsize>,
     /// A tab has the screen (`tabs.rs`, Alt+2…): output is held and nothing
@@ -476,10 +476,9 @@ struct DisplayState {
     bar: String,
 }
 
-
 /// Set while a `/mistake` view has the alternate screen (`note_view_screen`).
 static VIEW_SCREEN: AtomicBool = AtomicBool::new(false);
-/// Set once `emergency_restore` has put the terminal back: s0ma is ending,
+/// Set once `emergency_restore` has put the terminal back: the agent is ending,
 /// and nothing draws on the shell's terminal any more.
 static TORN_DOWN: AtomicBool = AtomicBool::new(false);
 
@@ -497,10 +496,10 @@ pub fn torn_down() -> bool {
 }
 
 /// Put the terminal back the way a shell expects it, without taking any lock
-/// and without the display's state: for a panic that ends s0ma, which may
+/// and without the display's state: for a panic that ends the agent, which may
 /// have happened while the display or stdout was held. Writes straight to the
-/// terminal (fd 1): leaves s0ma's page, resets the scroll region the
-/// steering pane set, pops every keyboard-protocol level s0ma pushed (on
+/// terminal (fd 1): leaves the agent's page, resets the scroll region the
+/// steering pane set, pops every keyboard-protocol level the agent pushed (on
 /// both screens), turns off bracketed paste, focus and mouse reports, shows
 /// the cursor and resets colours, and leaves raw mode.
 pub fn emergency_restore() {
@@ -537,7 +536,7 @@ fn restore_codes(alternate: bool) -> String {
 
 /// While keys are being read (raw mode), the terminal reports the mouse's
 /// buttons and wheel (xterm's 1000, in SGR form): the wheel scrolls a tab, or
-/// back through s0ma's conversation on its page (`tabs::history`). Not
+/// back through the agent's conversation on its page (`tabs::history`). Not
 /// movement (crossterm's EnableMouseCapture asks for every motion too). Off
 /// whenever raw mode is, or the wheel's reports would be echoed as text.
 /// Selecting text with the mouse takes Shift in most terminals meanwhile.
@@ -574,7 +573,7 @@ pub enum OperatorNote {
     /// Acted on at once (`/kill`), or nothing to say.
     Plain,
     /// Sent with "send now": cuts the model's output short. (A message that
-    /// waits for s0ma's current step to end is shown when s0ma takes it;
+    /// waits for the agent's current step to end is shown when the agent takes it;
     /// see `ActiveDisplay::queued`.)
     SendNow,
 }
@@ -630,7 +629,7 @@ impl ActiveDisplay {
     /// Enter active display mode.
     ///
     /// The final terminal rows are reserved for progress and operator input.
-    /// s0ma's current output location is saved as the logical model cursor.
+    /// The agent's current output location is saved as the logical model cursor.
     /// The physical cursor is then moved to the operator row and left there.
     pub fn begin(&self) -> io::Result<()> {
         // The tab bar the page has, made before the lock is taken.
@@ -720,7 +719,7 @@ impl ActiveDisplay {
         mirror(|| Mirrored::BeginTurn);
         state.started = Instant::now();
         state.frame_drawn = 0;
-        // s0ma's first words this turn start a message of their own, under
+        // The agent's first words this turn start a message of their own, under
         // its name, even with no `you>` above them (an autonomous turn).
         let mut stdout = io::stdout().lock();
         emit_locked(&mut stdout, &mut state, Entry::Turn)?;
@@ -791,7 +790,7 @@ impl ActiveDisplay {
                 return Ok(());
             }
 
-        // Return from the visible operator cursor to s0ma's saved
+        // Return from the visible operator cursor to the agent's saved
         // logical output location.
         queue!(stdout, RestorePosition)?;
         write_normalized(&mut stdout, &pending)?;
@@ -801,7 +800,7 @@ impl ActiveDisplay {
         // under the page's top rows.
         //
         // Changing scrolling margins can affect the physical cursor on
-        // some terminals, so s0ma's location was saved again immediately
+        // some terminals, so the agent's location was saved again immediately
         // before this.
         write!(stdout, "{}", page::region(state.rows))?;
 
@@ -977,7 +976,7 @@ impl ActiveDisplay {
     /// Update the live operator edit shown on the reserved bottom row.
     /// `cursor` is a byte offset into `input`.
     ///
-    /// This does not touch s0ma's saved logical output cursor.
+    /// This does not touch the agent's saved logical output cursor.
     pub fn set_input(&self, input: &str, cursor: usize) -> io::Result<()> {
         let mut state = self.lock()?;
 
@@ -1101,14 +1100,14 @@ impl ActiveDisplay {
     ///
     /// The live input row is cleared, then the submitted operator
     /// message is written into the normal scrolling transcript, with a status
-    /// line under it saying when s0ma will read it.
+    /// line under it saying when the agent will read it.
     pub fn commit_operator(&self, input: &str, note: OperatorNote) -> io::Result<()> {
         let mut state = self.lock()?;
         let mut stdout = io::stdout().lock();
         state.input.clear();
         state.input_cursor = 0;
         let note = operator_note_text(note, &state.activity);
-        mirror(|| Mirrored::Entry(Entry::Operator(safe_text(input))));
+        mirror(|| Mirrored::Entry(operator_entry(input)));
         emit_operator_locked(&mut stdout, &mut state, input)?;
         if let Some(note) = note {
             mirror(|| Mirrored::Entry(status_notice(&note, &note)));
@@ -1123,7 +1122,7 @@ impl ActiveDisplay {
         let mut state = self.lock()?;
         let mut stdout = io::stdout().lock();
         let note = operator_note_text(note, &state.activity);
-        mirror(|| Mirrored::Entry(Entry::Operator(safe_text(input))));
+        mirror(|| Mirrored::Entry(operator_entry(input)));
         emit_operator_locked(&mut stdout, &mut state, input)?;
         if let Some(note) = note {
             mirror(|| Mirrored::Entry(status_notice(&note, &note)));
@@ -1132,19 +1131,19 @@ impl ActiveDisplay {
         stdout.flush()
     }
 
-    /// An operator message written into the transcript where s0ma takes it
+    /// An operator message written into the transcript where the agent takes it
     /// (a queued message, at the safe point it waited for), leaving the
     /// draft being typed alone.
     pub fn show_operator(&self, input: &str) -> io::Result<()> {
         let mut state = self.lock()?;
         let mut stdout = io::stdout().lock();
-        mirror(|| Mirrored::Entry(Entry::Operator(safe_text(input))));
+        mirror(|| Mirrored::Entry(operator_entry(input)));
         emit_operator_locked(&mut stdout, &mut state, input)?;
         stdout.flush()
     }
 
-    /// A message was queued for s0ma's next safe point: a status line now;
-    /// the message itself goes into the transcript when s0ma takes it.
+    /// A message was queued for the agent's next safe point: a status line now;
+    /// the message itself goes into the transcript when the agent takes it.
     pub fn queued(&self, input: &str) -> io::Result<()> {
         let sleeping = self.lock()?.activity == Activity::Sleeping;
         let mut note = queued_note(input);
@@ -1154,14 +1153,14 @@ impl ActiveDisplay {
         self.emit(status_notice(&note, &note))
     }
 
-    /// `count` messages reached s0ma.
+    /// `count` messages reached the agent.
     pub fn delivered(&self, count: usize) -> io::Result<()> {
         let note = delivered_note(count);
         self.emit(status_notice(&note, &format!("↳ {note}")))
     }
 
     /// A status line of the operator's own doing in the transcript (not
-    /// s0ma's output), such as "sending your queued messages now".
+    /// the agent's output), such as "sending your queued messages now".
     pub fn operator_line(&self, line: &str) -> io::Result<()> {
         let mut state = self.lock()?;
         let mut stdout = io::stdout().lock();
@@ -1203,9 +1202,9 @@ impl ActiveDisplay {
         let (_, rows) = prompt_geometry(input, input.len(), columns);
         let mut state = self.lock()?;
         let mut stdout = io::stdout().lock();
-        mirror(|| Mirrored::Entry(Entry::Operator(safe_text(input))));
+        mirror(|| Mirrored::Entry(operator_entry(input)));
         if state.covered.is_some() {
-            return emit_locked(&mut stdout, &mut state, Entry::Operator(safe_text(input)));
+            return emit_locked(&mut stdout, &mut state, operator_entry(input));
         }
         write!(stdout, "\x1b[{rows}A\r\x1b[J")?;
         state.columns = columns;
@@ -1227,7 +1226,7 @@ impl ActiveDisplay {
             state.renderer.wrap.col = 0;
             state.renderer.wrap.indent = 0;
         }
-        emit_locked(&mut stdout, &mut state, Entry::Operator(safe_text(input)))?;
+        emit_locked(&mut stdout, &mut state, operator_entry(input))?;
         stdout.flush()
     }
 
@@ -1253,7 +1252,7 @@ impl ActiveDisplay {
         stdout.flush()
     }
 
-    /// A message was queued for s0ma; the progress line counts it until
+    /// A message was queued for the agent; the progress line counts it until
     /// `release_steers` says it was handed over. The line catches up at the
     /// next spinner frame.
     pub fn queue_steer(&self) -> io::Result<()> {
@@ -1263,7 +1262,7 @@ impl ActiveDisplay {
         Ok(())
     }
 
-    /// `count` queued messages were handed to s0ma (or started a turn).
+    /// `count` queued messages were handed to the agent (or started a turn).
     pub fn release_steers(&self, count: usize) -> io::Result<()> {
         let _state = self.lock()?;
         let before = self
@@ -1274,7 +1273,7 @@ impl ActiveDisplay {
         Ok(())
     }
 
-    /// Messages queued and not yet handed to s0ma.
+    /// Messages queued and not yet handed to the agent.
     pub fn queued_steers(&self) -> usize {
         self.queued.load(Ordering::SeqCst)
     }
@@ -1301,9 +1300,9 @@ impl ActiveDisplay {
     ///
     /// For each streamed chunk:
     ///
-    /// 1. restore s0ma's saved logical cursor;
+    /// 1. restore the agent's saved logical cursor;
     /// 2. write the new chunk;
-    /// 3. save the new s0ma cursor;
+    /// 3. save the new agent cursor;
     /// 4. redraw `you>`;
     /// 5. leave the physical cursor on `you>`.
     pub fn write_stream(&self, text: &str) -> io::Result<()> {
@@ -1503,7 +1502,7 @@ impl ActiveDisplay {
     }
 
     /// The end of the conversation as the page shows it now, for the shell's
-    /// screen when s0ma leaves the page (`page::leave_with`).
+    /// screen when the agent leaves the page (`page::leave_with`).
     pub fn last_rows(&self) -> Vec<String> {
         let Ok((columns, rows)) = terminal::size() else {
             return Vec::new();
@@ -1555,11 +1554,6 @@ impl ActiveDisplay {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn input_for_test(&self) -> String {
-        self.lock().map(|state| state.input.clone()).unwrap_or_default()
-    }
-
     /// The idle prompt is being read (`prompt_up`), or not any more.
     pub fn prompt_up(&self, up: bool) {
         if let Ok(mut state) = self.lock() {
@@ -1599,7 +1593,7 @@ impl ActiveDisplay {
     }
 
     /// The submitted line reedline left on the screen, taken off it: on an
-    /// attached terminal it is shown when this s0ma takes it, as everywhere.
+    /// attached terminal it is shown when this agent takes it, as everywhere.
     pub fn erase_submitted(&self, input: &str) -> io::Result<()> {
         let (columns, _) = terminal::size()?;
         let (_, rows) = prompt_geometry(input, input.len(), columns);
@@ -1645,7 +1639,7 @@ impl ActiveDisplay {
         Ok(detail)
     }
 
-    /// A tab takes the whole screen (`tabs.rs`). Everything s0ma and the
+    /// A tab takes the whole screen (`tabs.rs`). Everything the agent and the
     /// harness write meanwhile is held, a turn may begin or end behind it,
     /// and `uncover` draws the page again. `idle_prompt`: the idle prompt's
     /// draft and cursor, when the tab opens from it.
@@ -1718,7 +1712,7 @@ impl ActiveDisplay {
         Ok(())
     }
 
-    /// What s0ma is doing, for a tab's bar: None between turns.
+    /// What the agent is doing, for a tab's bar: None between turns.
     pub fn working(&self) -> Option<String> {
         let state = self.lock().ok()?;
         state.active.then(|| format!("{} · {}", state.activity.label(), format_elapsed(state.started.elapsed())))
@@ -1778,7 +1772,7 @@ fn redraw_active_locked(stdout: &mut impl Write, state: &mut DisplayState, colum
     let output_rows = rows - pane_rows(rows);
     state.renderer = draw_page_locked(stdout, state, columns, output_rows, false)?;
     state.transient = None;
-    // s0ma's output goes on from where the conversation ends.
+    // The agent's output goes on from where the conversation ends.
     queue!(stdout, SavePosition)?;
     render_input_locked(stdout, state)?;
     stdout.flush()
@@ -1966,7 +1960,7 @@ pub fn erase_idle_prompt(draft: &str, cursor: usize) -> io::Result<()> {
     stdout.flush()
 }
 
-/// Reserve the bottom pane and place s0ma's output cursor.
+/// Reserve the bottom pane and place the agent's output cursor.
 ///
 /// `keep_column`: continue at (`column`, `row`) if that is inside the output
 /// area (used after an editor returns the screen); otherwise start a fresh
@@ -2007,7 +2001,7 @@ fn establish_layout_locked(
     // rather than forcing steering through one physical line.
     write!(stdout, "{}", page::region(output_rows))?;
 
-    // Establish and save s0ma's logical output position.
+    // Establish and save the agent's logical output position.
     queue!(stdout, MoveTo(model_column, model_row), SavePosition)?;
     state.renderer.wrap.col = model_column as usize;
 
@@ -2231,7 +2225,7 @@ impl StreamPrinter {
 ///
 /// Crucially, this function DOES NOT use SavePosition / RestorePosition.
 ///
-/// The terminal's saved position belongs exclusively to s0ma's logical
+/// The terminal's saved position belongs exclusively to the agent's logical
 /// output cursor. The physical cursor is intentionally left at the
 /// operator's cursor so typing feels normal.
 fn render_input_locked(stdout: &mut impl Write, state: &DisplayState) -> io::Result<()> {
@@ -2382,13 +2376,13 @@ fn fit_segments(segments: &[(String, u8)], room: usize) -> String {
         .join(" · ")
 }
 
-/// Printed where operator messages sent mid-turn reach s0ma.
+/// Printed where operator messages sent mid-turn reach the agent.
 pub fn delivered_note(count: usize) -> String {
     let what = if count == 1 { "your message".to_string() } else { format!("your {count} messages") };
     format!("s0ma has {what}")
 }
 
-/// The status line for a message queued for s0ma's next safe point, with
+/// The status line for a message queued for the agent's next safe point, with
 /// the start of it (the line is cut to the terminal's width when drawn).
 fn queued_note(input: &str) -> String {
     let preview = safe_text(input).split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2402,10 +2396,16 @@ fn status_notice(brief: &str, full: &str) -> Entry {
     Entry::Notice { brief: brief.to_string(), full: format!("{STATUS_STYLE}{full}{RESET}"), mark: Mark::Work }
 }
 
+/// The operator's line as the transcript keeps it: made safe, and a key typed
+/// at the prompt (`/model key …`) never drawn back whole.
+pub(crate) fn operator_entry(input: &str) -> Entry {
+    Entry::Operator(safe_text(&crate::model_config::hide_key(input)))
+}
+
 /// `you>  …` into the transcript, as the operator's own line.
 fn emit_operator_locked(writer: &mut impl Write, state: &mut DisplayState, input: &str) -> io::Result<()> {
     state.operator_revision = state.operator_revision.wrapping_add(1);
-    emit_locked(writer, state, Entry::Operator(safe_text(input)))
+    emit_locked(writer, state, operator_entry(input))
 }
 
 /// The dim line under an operator message sent mid-turn.
@@ -2737,7 +2737,7 @@ fn render_held_locked(state: &mut DisplayState) -> String {
     text
 }
 
-/// Write rendered transcript text at s0ma's output cursor, then redraw the
+/// Write rendered transcript text at the agent's output cursor, then redraw the
 /// pane and leave the cursor on the operator's input. Outside the active
 /// display it is written as is. Never called while an editor has the screen:
 /// output is held as entries then (`emit_locked`).
@@ -2773,710 +2773,6 @@ fn write_rendered_locked(writer: &mut impl Write, state: &mut DisplayState, text
     render_input_locked(&mut frame, state)?;
     queue!(frame, Show, EndSynchronizedUpdate)?;
     writer.write_all(&frame)
-}
-
-#[cfg(test)]
-mod scheduled_io_tests {
-    use super::*;
-
-    fn wrap(chunks: &[&str], columns: usize) -> String {
-        let mut wrap = WordWrap::default();
-        let mut out = String::new();
-        for chunk in chunks {
-            wrap.push(chunk, columns, &mut out);
-        }
-        out.push_str(&wrap.take_pending(columns));
-        out
-    }
-
-    #[test]
-    fn words_move_to_the_next_line_instead_of_splitting() {
-        assert_eq!(wrap(&["the quick brown fox"], 10), "the quick\nbrown fox");
-        // Streaming in odd pieces gives the same breaks.
-        assert_eq!(wrap(&["the qu", "ick br", "own", " fox"], 10), "the quick\nbrown fox");
-        // A word that exactly fills the line, then a space: one break, no blank line.
-        assert_eq!(wrap(&["abcde fghij klm"], 5), "abcde\nfghij\nklm");
-        // Explicit newlines reset the column.
-        assert_eq!(wrap(&["aaaa\nbbbb cc"], 8), "aaaa\nbbbb cc");
-        // Indentation (code blocks, table padding) is kept.
-        assert_eq!(wrap(&["│     x  │\n    y"], 40), "│     x  │\n    y");
-    }
-
-    fn wrap_indented(chunks: &[&str], columns: usize, indent: usize) -> String {
-        let mut wrap = WordWrap { indent, ..WordWrap::default() };
-        let mut out = String::new();
-        for chunk in chunks {
-            wrap.push(chunk, columns, &mut out);
-        }
-        out.push_str(&wrap.take_pending(columns));
-        out
-    }
-
-    #[test]
-    fn a_hanging_indent_starts_every_line_that_has_text() {
-        assert_eq!(wrap_indented(&["one two three four five\nsix"], 14, 4), "    one two\n    three four\n    five\n    six");
-        // Streaming in odd pieces gives the same lines.
-        assert_eq!(wrap_indented(&["one tw", "o thr", "ee four five\n", "six"], 14, 4), "    one two\n    three four\n    five\n    six");
-        // A blank line stays blank, and a final line break leaves nothing after it.
-        assert_eq!(wrap_indented(&["a\n\nb\n"], 10, 2), "  a\n\n  b\n");
-        // Indentation of the text itself (code) comes after the gutter.
-        assert_eq!(wrap_indented(&["fn x\n    y"], 20, 2), "  fn x\n      y");
-        // Styling at the start of a line waits for its text: the gutter is never underlined.
-        assert_eq!(wrap_indented(&["\x1b[4m  indented"], 20, 2), "    \x1b[4mindented");
-        // A word too long for what is left of the line is broken to fit it.
-        assert_eq!(wrap_indented(&[&"x".repeat(17)], 10, 2), "  xxxxxxxx\n  xxxxxxxx\n  x");
-        // No room for a gutter: none.
-        assert_eq!(wrap_indented(&["ab"], 1, 6), "a\nb");
-    }
-
-    #[test]
-    fn wrapping_ignores_styling_and_counts_wide_chars() {
-        let styled = "\x1b[0;1mbold\x1b[0m word";
-        assert_eq!(wrap(&[styled], 9), styled);
-        assert_eq!(wrap(&["你好 世界"], 6), "你好\n世界");
-    }
-
-    #[test]
-    fn overlong_words_are_not_held_back_forever() {
-        let mut w = WordWrap::default();
-        let mut out = String::new();
-        w.push("ab https://example.com/very/long", 10, &mut out);
-        // The URL is released as soon as it fills a line, on a fresh line.
-        assert!(out.starts_with("ab\nhttps://ex"));
-    }
-
-    #[test]
-    fn entering_at_bottom_scrolls_instead_of_overwriting_the_prompt() {
-        // A pane of six rows: the progress line, five of input.
-        assert_eq!(reserve_layout(23, 0, 24), (17, 6));
-        assert_eq!(reserve_layout(23, 7, 24), (17, 7));
-        assert_eq!(reserve_layout(8, 0, 24), (8, 0));
-        assert_eq!(reserve_layout(8, 7, 24), (9, 0));
-    }
-
-    #[test]
-    fn content_cannot_move_the_cursor_or_erase_other_messages() {
-        let text = safe_text("hello\x1b[2J\x1b8\rbye\x08\u{009b}2J");
-        assert!(!text.contains('\x1b'));
-        assert!(!text.contains('\r'));
-        assert!(!text.contains('\x08'));
-        assert!(!text.contains('\u{009b}'));
-        assert!(text.contains("\nbye"));
-    }
-
-    fn active_state() -> DisplayState {
-        DisplayState {
-            active: true,
-            columns: 40,
-            rows: 24,
-            input: String::new(),
-            input_cursor: 0,
-            operator_revision: 0,
-            renderer: Renderer::new(Detail::Collapsed, DEFAULT_CHARS_PER_TOKEN),
-            record: TranscriptRecord::default(),
-            transient: None,
-            meter: TokenMeter::default(),
-            suspended: false,
-            held: Vec::new(),
-            activity: Activity::Waiting,
-            started: Instant::now(),
-            frame_drawn: 0,
-            hint: None,
-            queued: Arc::default(),
-            covered: None,
-            quiet_pass: false,
-            shrunk: false,
-            waiting_resize: None,
-            laid_out_at: None,
-            bar: String::new(),
-            prompt_up: false,
-        }
-    }
-
-    #[test]
-    fn the_sleep_reflection_is_one_line_collapsed_and_output_keeps_a_transient_line() {
-        let mut state = active_state();
-        state.active = false;
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Pass).unwrap();
-        for _ in 0..50 {
-            emit_locked(&mut bytes, &mut state, Entry::Reasoning("weighing what to keep ".into())).unwrap();
-        }
-        emit_locked(&mut bytes, &mut state, Entry::Note("[sleep] integration/reflection request: 3.20s".into())).unwrap();
-        emit_locked(&mut bytes, &mut state, Entry::Pass).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(!text.contains("weighing") && !text.contains("[sleep]"), "{text:?}");
-        let summary = text.rfind("[*] thought for").expect(&text);
-        assert!(text[summary..].ends_with("\r\n"), "{text:?}");
-        // Fifty chunks, one record entry.
-        let (entries, _) = state.record.replay(Detail::Expanded);
-        assert_eq!(entries.iter().filter(|recorded| matches!(recorded.entry, Entry::Reasoning(_))).count(), 1);
-
-        // Expanded, the note after it still starts a line of its own.
-        let mut state = active_state();
-        state.active = false;
-        state.renderer = Renderer::new(Detail::Expanded, DEFAULT_CHARS_PER_TOKEN);
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Pass).unwrap();
-        emit_locked(&mut bytes, &mut state, Entry::Reasoning("weighing what to keep".into())).unwrap();
-        emit_locked(&mut bytes, &mut state, Entry::Note("[sleep] integration/reflection request: 3.20s".into())).unwrap();
-        emit_locked(&mut bytes, &mut state, Entry::Pass).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("[Thinking]") && text.contains(&format!("keep{RESET}\r\n[sleep]")), "{text:?}");
-
-        // A transient line comes back below a warning printed while it is up.
-        state.transient = Some("[*] folding the context to make room…".into());
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Line("[llm] repaired 1 argument".into())).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        let warning = text.find("[llm] repaired").unwrap();
-        assert!(text.starts_with("\r\x1b[2K") && text[warning..].contains("folding the context"), "{text:?}");
-        assert!(text[warning..].contains("\r      \x1b[3;90m[*] folding"), "in the gutter: {text:?}");
-        assert!(state.transient.is_some());
-    }
-
-    #[test]
-    fn output_is_held_while_an_editor_has_the_screen() {
-        let mut state = active_state();
-        state.suspended = true;
-        // The editor opened mid-line, after "two ".
-        let mut bytes = Vec::new();
-        let mut written = String::new();
-        state.renderer.wrap.push("one two ", 40, &mut written);
-        written.push_str(&state.renderer.wrap.take_word(40));
-        assert_eq!(written, "one two", "the space after it stays held");
-        let raw = |text: &str| Entry::Raw { text: text.into(), operator: false };
-        emit_locked(&mut bytes, &mut state, raw("three four five six seven eight nine ")).unwrap();
-        assert!(bytes.is_empty() && state.held.len() == 1);
-        // A long editor session holds one entry per run of chunks, not per chunk.
-        let mut thinking = active_state();
-        thinking.suspended = true;
-        for _ in 0..100 {
-            emit_locked(&mut bytes, &mut thinking, Entry::Reasoning("more ".into())).unwrap();
-        }
-        assert_eq!(thinking.held.len(), 1);
-        assert!(!state.record.is_empty(), "kept for Ctrl+O as well");
-
-        // On resume it is laid out from where the transcript really is: here
-        // column 7, so the line breaks before a word that would cross 40.
-        state.suspended = false;
-        let text = render_held_locked(&mut state);
-        assert_eq!(text, " three four five six seven eight\nnine");
-        assert!(state.held.is_empty());
-    }
-
-    #[test]
-    fn escapes_inside_tool_arguments_never_reach_the_terminal() {
-        let mut state = active_state();
-        // What StreamPrinter::status passes on: the agent's line, made safe.
-        // Collapsed, the arguments are decoded from JSON, escapes and all.
-        let message = safe_text(r#"[tool] running: vm_shell_input, arguments: {"text": "\u001b[2J\u001b[r\u001b7\u001b]52;c;aGk=\u0007:wq"}"#);
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Status(message)).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        let line = text.split("[*] ").nth(1).unwrap();
-        // Up to the end of the call's arguments, before the display's own
-        // cursor bookkeeping.
-        let line = &line[..line.find(")\x1b[0m").unwrap()];
-        for sequence in ["\x1b[2J", "\x1b[r", "\x1b7", "\x1b]52", "\u{7}"] {
-            assert!(!line.contains(sequence), "{sequence:?} in {line:?}");
-        }
-        assert!(line.contains("␛[2J"), "{line:?}");
-    }
-
-    #[test]
-    fn the_idle_prompts_shape_is_known_for_erasing_it() {
-        // One row: the cursor's row is where it starts.
-        assert_eq!(prompt_geometry("half typed", 10, 80), (0, 1));
-        assert_eq!(prompt_geometry("", 0, 80), (0, 1));
-        // Wrapped: 5 + 100 columns at 80 is two rows, cursor on the second.
-        let long = "x".repeat(100);
-        assert_eq!(prompt_geometry(&long, 100, 80), (1, 2));
-        assert_eq!(prompt_geometry(&long, 10, 80), (0, 2));
-        // Several lines, cursor on the third.
-        assert_eq!(prompt_geometry("one\ntwo\nthree", 11, 80), (2, 3));
-        // A cursor inside a multibyte character is taken back to its start.
-        assert_eq!(prompt_geometry("héllo", 2, 80), (0, 1));
-        // A line filled exactly to the edge: the cursor waits at the start of
-        // the next row, which the prompt then takes too.
-        let full = "x".repeat(74);
-        assert_eq!(prompt_geometry(&full, 74, 80), (1, 2));
-        assert_eq!(prompt_geometry(&format!("{full}\nmore"), 74, 80), (1, 3));
-        // A wide character that would straddle the edge moves to the next row.
-        let wide = format!("{}界", "x".repeat(73));
-        assert_eq!(prompt_geometry(&wide, wide.len(), 80), (1, 2));
-        // Emoji sequences are as wide as one emoji (20 families fit on a row).
-        let family = "👨\u{200D}👩\u{200D}👧".repeat(20);
-        assert_eq!(prompt_geometry(&family, family.len(), 80), (0, 1));
-        assert_eq!(clusters("👍🏽❤\u{FE0F}🇫🇷e\u{301}x").collect::<Vec<_>>(), ["👍🏽", "❤\u{FE0F}", "🇫🇷", "e\u{301}", "x"]);
-        assert_eq!(clusters("🇫\u{FE0F}🇷🇫").collect::<Vec<_>>(), ["🇫\u{FE0F}", "🇷🇫"]);
-        assert_eq!(UnicodeWidthStr::width("❤\u{FE0F}"), 2);
-        // Later lines start six columns in too.
-        assert_eq!(prompt_geometry(&format!("a\n{}", "y".repeat(74)), 2, 80), (1, 2));
-        assert_eq!(prompt_geometry(&format!("a\n{}", "y".repeat(75)), 2, 80), (1, 3));
-    }
-
-    #[test]
-    fn a_turn_is_marked_in_the_record_without_writing_anything() {
-        let display = ActiveDisplay::new();
-        display.begin_turn().unwrap();
-        let state = display.lock().unwrap();
-        let (entries, _) = state.record.replay(Detail::Collapsed);
-        assert!(matches!(entries.as_slice(), [recorded] if recorded.entry == Entry::Turn));
-    }
-
-    #[test]
-    fn during_a_sleep_the_line_says_sleeping_and_a_message_waits_for_it() {
-        let display = ActiveDisplay::new();
-        display.set_activity(Activity::Sleeping).unwrap();
-        assert_eq!(display.lock().unwrap().activity.label(), "sleeping");
-        display.queued("after you wake").unwrap();
-        let state = display.lock().unwrap();
-        let (entries, _) = state.record.replay(Detail::Collapsed);
-        assert!(matches!(&entries[0].entry, Entry::Notice { brief, .. } if brief.starts_with("queued for after the sleep")), "{:?}", entries[0].entry);
-    }
-
-    #[test]
-    fn a_queued_message_waits_to_be_shown_until_s0ma_takes_it() {
-        let display = ActiveDisplay::new();
-        display.queued("also check /var").unwrap();
-        display.show_operator("also check /var").unwrap();
-        display.delivered(1).unwrap();
-        let state = display.lock().unwrap();
-        let (entries, _) = state.record.replay(Detail::Collapsed);
-        assert!(matches!(&entries[0].entry, Entry::Notice { brief, .. } if brief.starts_with("queued for after the current step")));
-        assert!(matches!(&entries[1].entry, Entry::Operator(text) if text == "also check /var"));
-        assert!(matches!(&entries[2].entry, Entry::Notice { brief, full, .. } if brief == "s0ma has your message" && full.contains("↳ s0ma")));
-        // Sent now, it shows at once with its status line under it.
-        drop(state);
-        display.commit_operator("stop", OperatorNote::SendNow).unwrap();
-        let state = display.lock().unwrap();
-        let (entries, _) = state.record.replay(Detail::Collapsed);
-        assert!(matches!(&entries[4].entry, Entry::Notice { brief, .. } if brief.starts_with("sending now")));
-    }
-
-    #[test]
-    fn notes_lines_and_operator_input_are_kept_for_the_redraw() {
-        let display = ActiveDisplay::new();
-        display.show_operator("check the disk\nand /home").unwrap();
-        display.note("[mode: work]").unwrap();
-        let state = display.lock().unwrap();
-        let (entries, _) = state.record.replay(Detail::Expanded);
-        assert_eq!(entries.len(), 2);
-        assert!(matches!(&entries[0].entry, Entry::Operator(text) if text == "check the disk\nand /home"));
-        assert!(matches!(&entries[1].entry, Entry::Note(text) if text == "[mode: work]"));
-    }
-
-    #[test]
-    fn a_reply_held_for_the_editor_is_not_erased_by_the_next_tool_line() {
-        let mut state = active_state();
-        state.suspended = true;
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Answer("Let me check the logs. ".into())).unwrap();
-        emit_locked(&mut bytes, &mut state, Entry::Status("[tool] running: vm_exec, arguments: {\"command\": \"ls\"}".into())).unwrap();
-        assert!(bytes.is_empty());
-        state.suspended = false;
-        let text = render_held_locked(&mut state);
-        // The tool line starts on a line of its own.
-        let reply_end = text.find("logs.").unwrap();
-        let tool = text.find("[*] ").unwrap();
-        assert!(text[reply_end..tool].contains("\r\n"), "{text:?}");
-    }
-
-    #[test]
-    fn progress_line_fits_and_shows_activity() {
-        let mut state = active_state();
-        state.activity = Activity::Tool("web_search".into());
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("running web_search · 0s") && !text.contains('…'));
-        assert!(!text.contains("ctrl+"), "the keys live in /help now: {text}");
-        measured(&mut state.meter);
-        state.columns = 80;
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        assert!(String::from_utf8(bytes).unwrap().contains("prefill 8.0k tok/s · decode 50 tok/s"));
-
-        // A narrow terminal truncates instead of wrapping into the input.
-        state.columns = 12;
-        state.hint = Some("/loop  /loops".into());
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        let visible: String = String::from_utf8(bytes)
-            .unwrap()
-            .split('\x1b')
-            .map(|part| part.split_once(['m', 'H', 'K']).map_or(part, |(_, rest)| rest))
-            .collect();
-        assert!(UnicodeWidthStr::width(visible.as_str()) <= 11, "{visible:?}");
-    }
-
-    fn visible(bytes: Vec<u8>) -> String {
-        String::from_utf8(bytes)
-            .unwrap()
-            .split('\x1b')
-            .map(|part| part.split_once(['m', 'H', 'K']).map_or(part, |(_, rest)| rest))
-            .collect()
-    }
-
-    #[test]
-    fn queued_messages_show_on_the_progress_line() {
-        let mut state = active_state();
-        state.columns = 120;
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        let idle = visible(bytes);
-        assert!(!idle.contains("queued"), "{idle}");
-
-        state.queued.store(2, Ordering::SeqCst);
-        state.input = "half typed".into();
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        let line = visible(bytes);
-        assert!(line.contains("waiting for the model · 0s · 2 queued"), "{line}");
-        assert!(!line.contains("ctrl+"), "no key help on the line any more: {line}");
-    }
-
-    /// A request measured in full: 12,000 prompt tokens of which the server
-    /// had 10,000 cached, first output 250 ms after the generation started,
-    /// then 100 tokens over two seconds. Prefill 8,000 tok/s, decode 50.
-    fn measured(meter: &mut TokenMeter) {
-        let base = Instant::now() - Duration::from_secs(10);
-        meter.started(base);
-        meter.prompt(Some(12_000), Some(10_000));
-        for step in 0..=20u64 {
-            let now = base + Duration::from_millis(250 + step * 100);
-            meter.text(17, now);
-            meter.usage(5 * step, false, now);
-        }
-        meter.usage(100, true, base + Duration::from_millis(2_250));
-    }
-
-    #[test]
-    fn the_corner_shows_prefill_then_decode_and_gives_up_prefill_first() {
-        let mut state = active_state();
-        assert!(status_segments(&state).is_empty(), "nothing measured yet");
-        measured(&mut state.meter);
-        let segments = status_segments(&state);
-        assert_eq!(fit_segments(&segments, 80), "prefill 8.0k tok/s · decode 50 tok/s");
-        assert_eq!(fit_segments(&segments, 20), "decode 50 tok/s", "decode is the one worth keeping");
-    }
-
-    #[test]
-    fn the_idle_prompt_shows_the_rates_or_where_the_keys_went() {
-        assert!(rate_segments(None, None).is_empty());
-        let both = rate_segments(Some("≈3.1k tok/s".into()), Some("57 tok/s".into()));
-        assert_eq!(both, vec![("prefill ≈3.1k tok/s".to_string(), 2), ("decode 57 tok/s".to_string(), 1)]);
-        // Decode alone, before any prefill was worth reporting.
-        assert_eq!(rate_segments(None, Some("57 tok/s".into())), vec![("decode 57 tok/s".to_string(), 1)]);
-    }
-
-    #[test]
-    fn segments_drop_the_least_needed_first_and_keep_order() {
-        let segments = vec![
-            ("first piece".to_string(), 1),
-            ("third rank".to_string(), 3),
-            ("second rank".to_string(), 2),
-        ];
-        assert_eq!(fit_segments(&segments, 80), "first piece · third rank · second rank");
-        assert_eq!(fit_segments(&segments, 27), "first piece · second rank");
-        assert_eq!(fit_segments(&segments, 12), "first piece");
-        assert_eq!(fit_segments(&segments, 5), "");
-        // A piece too wide to fit doesn't crowd out a narrower, less needed one.
-        let segments = vec![("a rather long piece".to_string(), 1), ("short".to_string(), 2)];
-        assert_eq!(fit_segments(&segments, 12), "short");
-    }
-
-    #[test]
-    fn the_corner_carries_no_key_help_in_either_detail_mode() {
-        // The keys are listed by /help; the corner is for the rates.
-        let mut state = active_state();
-        state.columns = 80;
-        for detail in [Detail::Collapsed, Detail::Expanded] {
-            state.renderer = Renderer::new(detail, DEFAULT_CHARS_PER_TOKEN);
-            let mut bytes = Vec::new();
-            draw_status_locked(&mut bytes, &state).unwrap();
-            let line = visible(bytes);
-            assert!(!line.contains("ctrl+") && line.trim_end().ends_with("0s"), "{line}");
-        }
-    }
-
-    #[test]
-    fn the_corner_shows_the_decode_rate_once_there_is_one() {
-        let mut state = active_state();
-        state.columns = 100;
-        let base = Instant::now();
-        // Three chunks, two measured intervals: 20 estimated tokens of decode
-        // in half a second. (The first chunk's arrival is prefill, not decode,
-        // so it sets the baseline rather than counting towards the rate.)
-        state.meter.request();
-        state.meter.text(38, base - Duration::from_millis(900));
-        state.meter.text(38, base - Duration::from_millis(650));
-        state.meter.text(38, base - Duration::from_millis(400));
-        state.meter.end_request();
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        let line = visible(bytes);
-        // No prompt counts, so no prefill: decode alone, as estimated.
-        assert!(line.ends_with("decode ≈40 tok/s"), "{line}");
-        // Narrow: the rate is the last thing to go.
-        state.columns = 48;
-        let mut bytes = Vec::new();
-        draw_status_locked(&mut bytes, &state).unwrap();
-        assert!(visible(bytes).ends_with("decode ≈40 tok/s"));
-    }
-
-    #[test]
-    fn output_waits_while_the_terminal_has_a_size_the_pane_was_not_laid_out_for() {
-        let mut state = active_state();
-        let laid_out = (state.columns, state.rows);
-        TEST_SIZE.with(|size| size.set(Some((laid_out.0 - 20, laid_out.1 - 4))));
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Raw { text: "after the resize\n".into(), operator: false }).unwrap();
-        assert!(bytes.is_empty(), "nothing drawn at the old size");
-        assert!(state.suspended && state.waiting_resize.is_some());
-        assert_eq!(state.held.len(), 1, "held, to be laid out after the resize");
-        // The spinner's redraw notices it too, with nothing written before it.
-        let mut quiet = active_state();
-        redraw_status(&mut quiet).unwrap();
-        assert!(quiet.suspended && quiet.waiting_resize.is_some(), "the status line is not drawn at the old size");
-        // The same size again (laid out, or the terminal came back to it).
-        TEST_SIZE.with(|size| size.set(Some(laid_out)));
-        state.suspended = false;
-        state.waiting_resize = None;
-        emit_locked(&mut bytes, &mut state, Entry::Raw { text: "drawn\n".into(), operator: false }).unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains("drawn"));
-        TEST_SIZE.with(|size| size.set(None));
-    }
-
-    #[test]
-    fn the_emergency_restore_keeps_the_cursor_off_the_conversation() {
-        let codes = restore_codes(false);
-        // The scroll region's reset (which homes the cursor) is wrapped in a
-        // save and restore, before the newline the message follows.
-        let reset = codes.find("\x1b7\x1b[r\x1b8").expect("wrapped reset");
-        assert!(reset < codes.find("\r\n").unwrap(), "{codes:?}");
-        assert!(!codes.contains("\x1b[?1049l"));
-        let codes = restore_codes(true);
-        assert!(codes.starts_with("\x1b[<99u\x1b[?1049l"), "the page's screen left first: {codes:?}");
-    }
-
-    #[test]
-    fn collapsed_output_reaches_the_screen_through_the_display() {
-        let mut state = active_state();
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Reasoning("weighing it".into())).unwrap();
-        emit_locked(&mut bytes, &mut state, Entry::Status("[tool] running: vm_exec, arguments: {\"command\": \"ls\"}".into())).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("[*] thinking · ~3 tokens"), "{text:?}");
-        // The call takes over the same line: one line per stretch of work.
-        let call = text.rfind("[*] ").expect("the call is shown");
-        assert!(text[..call].ends_with("\r\x1b[2K      \x1b[2;36m"), "rewritten in place, in the gutter: {text:?}");
-        assert!(text.contains("vm_exec") && text.contains("(ls)"), "{text:?}");
-        // Each write goes to s0ma's cursor and puts the operator's back.
-        assert_eq!(text.matches("\x1b8").count(), 2);
-        assert_eq!(state.record.replay(Detail::Expanded).0.len(), 2);
-    }
-
-    #[test]
-    fn a_tagged_harness_line_reads_as_a_status() {
-        assert_eq!(tagged_brief("[compaction] no newer completed history to activate"), "compaction · no newer completed history to activate");
-        assert_eq!(tagged_brief("\n[compaction] window #1..#4: kept"), "compaction · window #1..#4: kept");
-        assert_eq!(tagged_brief("plain text"), "plain text");
-        assert_eq!(tagged_brief("[not a tag]"), "[not a tag]");
-        // A block keeps its shape: one tag, later lines as they were.
-        assert_eq!(
-            tagged_brief("[mcp] config: /x/mcp.json\n  fs      connected · local\n  github  failed (logs: /x)\n  ! fs says its tool list changed"),
-            "mcp · config: /x/mcp.json\n  fs      connected · local\n  github  failed (logs: /x)\n  ! fs says its tool list changed"
-        );
-        assert_eq!(tagged_brief("[mcp] fs: reconnected\n[mcp] github: failed"), "mcp · fs: reconnected\ngithub: failed");
-    }
-
-    #[test]
-    fn notes_say_when_s0ma_reads_a_message() {
-        assert_eq!(operator_note_text(OperatorNote::Plain, &Activity::Writing), None);
-        assert_eq!(
-            queued_note("hey s0ma\n  can you   check"),
-            "queued for after the current step: \u{201c}hey s0ma can you check\u{201d}"
-        );
-        assert!(queued_note(&"word ".repeat(40)).contains('…'));
-        assert!(UnicodeWidthStr::width(queued_note(&"word ".repeat(40)).as_str()) <= 80);
-        assert_eq!(operator_note_text(OperatorNote::SendNow, &Activity::Thinking).unwrap(), "sending now");
-        let during_tool = operator_note_text(OperatorNote::SendNow, &Activity::Tool("vm_exec".into())).unwrap();
-        assert!(during_tool.contains("when vm_exec returns") && during_tool.contains("/kill"), "{during_tool}");
-        assert_eq!(delivered_note(1), "s0ma has your message");
-        assert_eq!(delivered_note(3), "s0ma has your 3 messages");
-    }
-
-    #[test]
-    fn cut_text_always_says_so() {
-        assert_eq!(truncate_to_width("short", 10), "short");
-        assert_eq!(truncate_to_width("exactly ten", 11), "exactly ten");
-        assert_eq!(truncate_to_width("abcdefghij", 5), "abcd…");
-        assert_eq!(truncate_to_width("你好世界", 5), "你好…");
-        assert_eq!(truncate_to_width("abc", 1), "…");
-        assert_eq!(truncate_to_width("abc", 0), "");
-    }
-
-    #[test]
-    fn pane_geometry_reserves_a_status_row_when_there_is_room() {
-        // The progress line over five input rows.
-        assert_eq!(pane_geometry(24), (18, 1, 5));
-        // Short of room (the page's two top rows and two of conversation
-        // kept): the progress line goes first.
-        assert_eq!(pane_geometry(7), (4, 1, 2));
-        assert_eq!(pane_geometry(6), (4, 0, 2));
-        assert_eq!(pane_geometry(5), (4, 0, 1));
-        assert_eq!(format_elapsed(Duration::from_secs(64)), "1m 04s");
-    }
-
-    #[test]
-    fn the_pane_follows_the_cursor() {
-        let input = "1\n2\n3\n4\n5\n6\n7";
-        // Cursor at the end: the last five lines are shown.
-        let end = input_layout(input, input.len(), 40, 5);
-        assert_eq!((end.first, end.cursor), (2, (6, 1)));
-        // Cursor on the first line: the pane scrolls back to the top.
-        let top = input_layout(input, 0, 40, 5);
-        assert_eq!((top.first, top.cursor), (0, (0, 0)));
-        // Cursor before a character that wraps: it is drawn on the new line.
-        let wrapped = input_layout("abcdefgh", 6, 13, 5);
-        assert_eq!(wrapped.cursor, (1, 0));
-    }
-
-    #[test]
-    fn unicode_drafts_fit_without_wrapping_into_the_transcript() {
-        for input in [
-            "你好世界你好世界",
-            "e\u{0301}e\u{0301}e\u{0301}",
-            "🌱🌱🌱🌱",
-            "a\nb\nc\nd\ne\nf",
-            "\t\x1b[H",
-        ] {
-            let layout = input_layout(input, input.len(), 12, 5);
-            let shown = &layout.lines[layout.first..];
-            assert!(shown.len() <= 5);
-            assert!(
-                shown
-                    .iter()
-                    .all(|line| UnicodeWidthStr::width(line.as_str()) <= 6)
-            );
-        }
-    }
-
-    #[test]
-    fn while_the_idle_prompt_is_read_harness_lines_wait_to_go_above_it() {
-        let mut state = active_state();
-        state.active = false;
-        state.prompt_up = true;
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Line("[archive] indexing is stalled".into())).unwrap();
-        assert!(bytes.is_empty(), "not written after what is being typed");
-        assert_eq!(state.held.len(), 1);
-        assert!(!state.record.is_empty());
-        // During a turn the pane is there for it: written at once.
-        state.held.clear();
-        state.active = true;
-        emit_locked(&mut bytes, &mut state, Entry::Line("[tool] ran".into())).unwrap();
-        assert!(state.held.is_empty() && !bytes.is_empty());
-    }
-
-    #[test]
-    fn a_snapshot_loads_into_another_display_as_it_was() {
-        let primary = ActiveDisplay::new();
-        primary.transcript_line("one").unwrap();
-        primary.reasoning("weighing it").unwrap();
-        primary.set_activity(Activity::Thinking).unwrap();
-        let mut taken = None;
-        primary.snapshot(|snapshot| taken = Some(snapshot)).unwrap();
-        let taken: DisplaySnapshot = serde_json::from_str(&serde_json::to_string(&taken.unwrap()).unwrap()).unwrap();
-        let attached = ActiveDisplay::new();
-        attached.load(taken).unwrap();
-        let state = attached.lock().unwrap();
-        let (entries, _) = state.record.all();
-        let entries: Vec<Entry> = entries.map(|recorded| recorded.entry.clone()).collect();
-        assert_eq!(entries, [Entry::Line("one".into()), Entry::Reasoning("weighing it".into())]);
-        assert_eq!(state.activity, Activity::Thinking);
-        assert!(!state.quiet_pass, "between turns: the next turn starts a pass of its own");
-    }
-
-    #[test]
-    fn the_page_is_drawn_from_the_record_with_as_much_as_fits() {
-        let mut state = active_state();
-        for i in 1..=60 {
-            state.record.push(Instant::now(), Entry::Line(format!("line {i}")));
-        }
-        state.suspended = true;
-        let mut bytes = Vec::new();
-        redraw_active_locked(&mut bytes, &mut state, 40, 24).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        // Cleared, then the region (the rows under the top two, above the
-        // pane's six), then the rows from under the top two.
-        assert!(text.starts_with("\x1b[r\x1b[H\x1b[2J"), "{text:?}");
-        let region = text.find("\x1b[3;18r").expect("the conversation's rows scroll");
-        let first = text.find("\x1b[3;1H").expect("drawn from under the rule");
-        assert!(region < first);
-        // Sixteen rows fit: the last fifteen lines and the row after them.
-        assert!(text.contains("\x1b[3;1Hline 46\r\n") && text.contains("line 60\r\n\x1b7"), "{text:?}");
-        assert!(!text.contains("line 45"), "{text:?}");
-        assert!(!state.suspended, "drawn: output goes on");
-        assert!(text.contains("you>"), "the pane under it");
-    }
-
-    #[test]
-    fn under_a_tab_output_is_held_and_kept_and_nothing_is_written() {
-        for active in [false, true] {
-            let mut state = active_state();
-            state.active = active;
-            state.covered = Some(Cover { prompt: None });
-            let mut bytes = Vec::new();
-            emit_locked(&mut bytes, &mut state, Entry::Line("[subagent] done".into())).unwrap();
-            emit_locked(&mut bytes, &mut state, Entry::Answer("The worker ".into())).unwrap();
-            emit_locked(&mut bytes, &mut state, Entry::Answer("reported.".into())).unwrap();
-            assert!(bytes.is_empty(), "a tab has the screen: nothing is drawn under it");
-            assert_eq!(state.held.len(), 2, "held for when it closes, streamed text joined");
-            assert!(matches!(&state.held[1].2, Entry::Answer(text) if text == "The worker reported."));
-            assert!(!state.record.is_empty(), "and kept for the redraw");
-            let (kept, _) = state.record.replay(Detail::Expanded);
-            assert!(kept.iter().any(|recorded| matches!(&recorded.entry, Entry::Line(text) if text == "[subagent] done")));
-        }
-    }
-
-    #[test]
-    fn stream_transaction_restores_output_before_writing_and_redraws_input_last() {
-        let mut state = DisplayState {
-            active: true,
-            columns: 80,
-            rows: 24,
-            input: "my unfinished draft".into(),
-            input_cursor: 19,
-            operator_revision: 0,
-            renderer: Renderer::new(Detail::Expanded, DEFAULT_CHARS_PER_TOKEN),
-            record: TranscriptRecord::default(),
-            transient: None,
-            meter: TokenMeter::default(),
-            suspended: false,
-            held: Vec::new(),
-            activity: Activity::Writing,
-            started: Instant::now(),
-            frame_drawn: 0,
-            hint: None,
-            queued: Arc::default(),
-            covered: None,
-            quiet_pass: false,
-            shrunk: false,
-            waiting_resize: None,
-            laid_out_at: None,
-            bar: String::new(),
-            prompt_up: false,
-        };
-        let mut bytes = Vec::new();
-        emit_locked(&mut bytes, &mut state, Entry::Raw { text: "model output\n".into(), operator: false }).unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.find("model output").unwrap() < text.find("my unfinished draft").unwrap());
-        assert_eq!(state.input, "my unfinished draft");
-        assert!(text.contains("model output\r\n"));
-    }
 }
 
 fn clear_input_pane(stdout: &mut impl Write, state: &DisplayState) -> io::Result<()> {
@@ -3529,49 +2825,54 @@ fn write_normalized(writer: &mut impl Write, text: &str) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod table_layout_tests {
+mod scheduled_io_tests {
     use super::*;
 
-    const WIDE: &str = "| Port | Service | Version | Notes |\n|---|---|---|---|\n| 22 | ssh | OpenSSH 9.6p1 Ubuntu 3ubuntu13.5 | Password auth enabled; root login permitted, worth checking against the hardening baseline |\n| 80 | http | nginx 1.24.0 | Redirects to 443 |\n| 8080 | http-proxy | Apache Tomcat 9.0.65 | Manager app exposed at /manager/html with default credentials suspected |\n";
-
-    /// What the transcript gets: rendered for `width` (if any), then word-wrapped at it.
-    fn through_the_display(width: usize, set_width: bool) -> (String, String) {
-        let mut md = crate::markdown::MarkdownStream::new();
-        if set_width {
-            md.set_width(Some(width));
-        }
-        let styled = md.push(&safe_text(WIDE)) + &md.finish();
-        let mut wrap = WordWrap::default();
-        let mut out = String::new();
-        wrap.push(&styled, width, &mut out);
-        out.push_str(&wrap.take_pending(width));
-        (styled, out)
-    }
-
-    #[test]
-    fn tables_fitted_beside_the_gutter_pass_through_word_wrap_untouched() {
-        for width in [100, 70, 44] {
-            let gutter = gutter_width(width);
-            let mut md = crate::markdown::MarkdownStream::new();
-            md.set_width(Some(width - gutter));
-            let styled = md.push(&safe_text(WIDE)) + &md.finish();
-            let mut wrap = WordWrap { indent: gutter, ..WordWrap::default() };
-            let mut out = String::new();
-            wrap.push(&styled, width, &mut out);
-            out.push_str(&wrap.take_pending(width));
-            assert_eq!(out.matches('\n').count(), styled.matches('\n').count(), "a line was broken at {width} columns");
+    fn active_state() -> DisplayState {
+        DisplayState {
+            active: true,
+            columns: 40,
+            rows: 24,
+            input: String::new(),
+            input_cursor: 0,
+            operator_revision: 0,
+            renderer: Renderer::new(Detail::Collapsed, DEFAULT_CHARS_PER_TOKEN),
+            record: TranscriptRecord::default(),
+            transient: None,
+            meter: TokenMeter::default(),
+            suspended: false,
+            held: Vec::new(),
+            activity: Activity::Waiting,
+            started: Instant::now(),
+            frame_drawn: 0,
+            hint: None,
+            queued: Arc::default(),
+            covered: None,
+            quiet_pass: false,
+            shrunk: false,
+            waiting_resize: None,
+            laid_out_at: None,
+            bar: String::new(),
+            prompt_up: false,
         }
     }
 
     #[test]
-    fn fitted_tables_pass_through_word_wrap_untouched() {
-        // The bug: laid out at natural width, the wrapper breaks rows apart.
-        let (styled, wrapped) = through_the_display(70, false);
-        assert!(wrapped.matches('\n').count() > styled.matches('\n').count());
-        // Fitted to the width, as a grid or as records, it never has to.
-        for width in [100, 70, 44, 30] {
-            let (styled, wrapped) = through_the_display(width, true);
-            assert_eq!(wrapped.matches('\n').count(), styled.matches('\n').count(), "a line was broken at {width} columns");
+    fn escapes_inside_tool_arguments_never_reach_the_terminal() {
+        let mut state = active_state();
+        // What StreamPrinter::status passes on: the agent's line, made safe.
+        // Collapsed, the arguments are decoded from JSON, escapes and all.
+        let message = safe_text(r#"[tool] running: vm_shell_input, arguments: {"text": "\u001b[2J\u001b[r\u001b7\u001b]52;c;aGk=\u0007:wq"}"#);
+        let mut bytes = Vec::new();
+        emit_locked(&mut bytes, &mut state, Entry::Status(message)).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let line = text.split("[*] ").nth(1).unwrap();
+        // Up to the end of the call's arguments, before the display's own
+        // cursor bookkeeping.
+        let line = &line[..line.find(")\x1b[0m").unwrap()];
+        for sequence in ["\x1b[2J", "\x1b[r", "\x1b7", "\x1b]52", "\u{7}"] {
+            assert!(!line.contains(sequence), "{sequence:?} in {line:?}");
         }
+        assert!(line.contains("␛[2J"), "{line:?}");
     }
 }

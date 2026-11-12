@@ -1,22 +1,22 @@
+mod db;
+mod style;
+mod memory;
+mod context;
 mod agent;
 mod app;
+mod audit;
 mod browser;
 mod calls;
 mod board;
-mod board_flow;
 mod page;
 mod clipboard;
 mod clock;
 mod completion;
 mod conversations;
 mod editor;
-mod editor_highlight;
-mod editor_live;
 mod archive;
 mod attachments;
 mod attention;
-mod context_guard;
-mod context_resume;
 mod edit_check;
 mod exec_feed;
 mod evidence;
@@ -33,11 +33,9 @@ mod llm;
 mod markdown;
 mod mcp;
 mod media;
-mod memory_fold;
-mod memory_layers;
 mod minecraft;
-mod mistake_view;
 mod mistakes;
+mod model_config;
 mod notify;
 mod observation_mask;
 mod open_loops;
@@ -49,19 +47,13 @@ mod search;
 mod session;
 mod overview;
 mod share;
-mod share_sync;
-mod share_backup;
 mod facts;
 mod transfer;
 mod util;
 mod crash;
 mod approval;
-mod recall_eval;
-mod recall_push;
-mod shared_files;
 mod tty_guard;
 mod sleep;
-mod sleep_schedule;
 mod streak;
 mod skill_match;
 mod skills;
@@ -71,21 +63,12 @@ mod terminal;
 mod transcript;
 mod threads;
 mod token_meter;
-mod worker_context;
-mod worker_fold;
 mod world_model;
 mod types;
 mod vm;
-mod vm_image;
-mod vm_wake;
-mod vm_terms;
-mod netboxes;
-mod netbox_run;
 mod voice;
 mod weaknesses;
-mod worker_feed;
 mod tabs;
-mod vm_access;
 
 use std::path::Path;
 
@@ -130,16 +113,21 @@ Environment read by both:
 ";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Ctrl+Z and Ctrl+S never stop or freeze s0ma (tty_guard.rs).
+    // Ctrl+Z and Ctrl+S never stop or freeze the agent (tty_guard.rs).
     tty_guard::install();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The model server, its key and the embeddings switch, as kept: read
+    // before anything here talks to a model.
+    model_config::init(&root.join("data"));
+    // Where the agent works: its VM, or this computer (host mode).
+    crate::vm::machine::init(&root.join("data"));
 
     // Argument handling before the attach check, deliberately. Attaching
-    // would make this terminal a window onto a running s0ma, and
+    // would make this terminal a window onto a running agent, and
     // --print-system-prompt has to assemble a prompt here, in this process,
     // under this process's environment -- that is the whole point of it.
     // The review window works on the data folder's files, beside a running
-    // s0ma or without one, so it never attaches.
+    // the agent or without one, so it never attaches.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("--mistake-view") {
         let start = match arguments.get(1..).unwrap_or_default() {
@@ -156,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(2);
             }
         };
-        return mistake_view::run_standalone(root, start);
+        return crate::mistakes::view::run_standalone(root, start);
     }
 
     if arguments.first().map(String::as_str) == Some("--recall-eval") {
@@ -164,10 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let memory = hippocampus::Hippocampus::new(data.join("hippocampus.jsonl"))?;
         let rest: Vec<&str> = arguments[1..].iter().map(String::as_str).collect();
         let result = match rest.as_slice() {
-            [] | ["run"] => recall_eval::run(&memory, &data),
-            ["generate"] => recall_eval::generate(&memory, &data, 40).map(|n| format!("{n} case(s) added to data/recall_eval.jsonl\n")),
+            [] | ["run"] => crate::memory::recall_eval::run(&memory, &data),
+            ["generate"] => crate::memory::recall_eval::generate(&memory, &data, 40).map(|n| format!("{n} case(s) added to data/recall_eval.jsonl\n")),
             ["generate", n] => match n.parse::<usize>() {
-                Ok(n) if n > 0 => recall_eval::generate(&memory, &data, n).map(|n| format!("{n} case(s) added to data/recall_eval.jsonl\n")),
+                Ok(n) if n > 0 => crate::memory::recall_eval::generate(&memory, &data, n).map(|n| format!("{n} case(s) added to data/recall_eval.jsonl\n")),
                 _ => Err(format!("--recall-eval generate takes a number of facts, not {n:?}").into()),
             },
             _ => Err("usage: s0ma --recall-eval [run | generate [n]]".into()),
@@ -219,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    // A terminal onto the s0ma running on another machine, over SSH.
+    // A terminal onto the agent running on another machine, over SSH.
     if arguments.first().map(String::as_str) == Some("connect") {
         let mut target = None;
         let mut remote = std::env::var("S0MA_REMOTE_COMMAND").ok().filter(|c| !c.trim().is_empty()).unwrap_or_else(|| "s0ma".into());
@@ -295,13 +283,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
 
-    // s0ma's page (the alternate screen, the tab bar on top), for this s0ma
+    // The agent's page (the alternate screen, the tab bar on top), for this agent
     // or a window onto a running one; the shell's screen comes back on the
     // way out.
     let _page = page::enter();
 
     // Before anything else touches the archive, the self-model or the sqlite
-    // stores: if an s0ma is already running, this terminal becomes a window onto
+    // stores: if an agent is already running, this terminal becomes a window onto
     // it instead of a second instance sharing its memory. That is also what
     // makes reconnecting after a dropped SSH session rejoin the turn already in
     // progress rather than starting a rival one.
@@ -314,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = app::App::load(root, app::RuntimeMode::Conversation)?;
     let ran = app.run();
     // The shell's screen, with the conversation's last rows under what it
-    // had; an error that ends s0ma is printed after them.
+    // had; an error that ends the agent is printed after them.
     terminal::leave_page();
     ran
 }

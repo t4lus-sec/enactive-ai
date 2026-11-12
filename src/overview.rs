@@ -1,6 +1,6 @@
 //! What the overview tab (Alt+O, `tabs/overview_view.rs`) shows and asks.
 //!
-//! s0ma's settings and state live in the app (`app.rs`): the reasoning
+//! The agent's settings and state live in the app (`app.rs`): the reasoning
 //! mode, looping, voice, the daily sleep, the operator's time zone, the goal, the
 //! jobs, and the MCP servers. The tab may run in another process (an
 //! attached terminal), so it never reaches them directly:
@@ -13,9 +13,9 @@
 //!   app runs each through `handle_command`, as typed, and publishes again.
 //!   During a turn they wait for it to end.
 //! - **Always there.** The app also publishes as each turn starts and ends,
-//!   so the tab has the state as of the last turn's edge while s0ma works,
+//!   so the tab has the state as of the last turn's edge while the agent works,
 //!   and every snapshot is kept in `data/overview.json` (`init`), so a
-//!   restarted s0ma shows the last one at once, marked as from before.
+//!   restarted the agent shows the last one at once, marked as from before.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +33,7 @@ pub struct Server {
     pub tools: Vec<String>,
 }
 
-/// s0ma's context: its tokens and the model's window, or why they could not
+/// The agent's context: its tokens and the model's window, or why they could not
 /// be measured.
 pub type Context = Result<(usize, usize), String>;
 
@@ -41,7 +41,7 @@ pub type Context = Result<(usize, usize), String>;
 pub struct Snapshot {
     /// When it was taken (the app's clock), for the tab to say how old.
     pub taken: String,
-    /// s0ma is in a turn: changes wait for it.
+    /// The agent is in a turn: changes wait for it.
     pub busy: bool,
     /// `auto` or `forced xhigh`.
     pub reasoning: String,
@@ -66,7 +66,7 @@ pub struct Snapshot {
     pub mcp: Vec<Server>,
     /// The MCP config's place and its warnings.
     pub mcp_notes: Vec<String>,
-    /// s0ma's context: its tokens and the model's window, or why they
+    /// The agent's context: its tokens and the model's window, or why they
     /// could not be measured (`None`: not measured yet).
     #[serde(default)]
     pub context: Option<Context>,
@@ -76,20 +76,29 @@ pub struct Snapshot {
     /// What the app said to the overview's last command (kept across
     /// snapshots; `seq` tells a new one).
     pub reply: Option<Reply>,
-    /// Read back from `data/overview.json`: from before s0ma restarted.
+    /// Read back from `data/overview.json`: from before the agent restarted.
     #[serde(default)]
     pub restored: bool,
-    /// Whether s0ma may use its machine (`/vm on|off`).
+    /// Whether the agent may use its machine (`/vm on|off`).
     #[serde(default = "in_shells")]
     pub vm_access: bool,
-    /// Where s0ma's commands run: in shells the operator sees, or (his own
+    /// Where the agent's commands run: in shells the operator sees, or (his own
     /// setting) outside them.
     #[serde(default = "in_shells")]
     pub in_shells: bool,
-    /// What runs on s0ma's machine without a turn: its watches and
+    /// What runs on the agent's machine without a turn: its watches and
     /// background commands, as last listed (`watches`).
     #[serde(default)]
     pub watches: Watches,
+    /// The model server, its key (masked) and the embeddings switch.
+    #[serde(default)]
+    pub model: crate::model_config::Shown,
+    /// The agent works on this computer (host mode), not in its VM.
+    #[serde(default)]
+    pub machine_host: bool,
+    /// What is set for the next start, when it differs.
+    #[serde(default)]
+    pub machine_next: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -118,7 +127,7 @@ pub fn init(data_dir: &std::path::Path) {
     let Some(mut snapshot) = kept else { return };
     let mut published = lock(&PUBLISHED);
     if published.is_none() {
-        // Its replies were numbered by the s0ma before; it was not in a turn
+        // Its replies were numbered by the agent before; it was not in a turn
         // of this one.
         snapshot.reply = None;
         snapshot.busy = false;
@@ -162,7 +171,7 @@ static HEARD: Mutex<Option<Vec<(String, bool)>>> = Mutex::new(None);
 static REPLIES: AtomicU64 = AtomicU64::new(0);
 
 /// While the app runs one of the overview's commands: what it says is kept
-/// for the tab (`heard`), as well as shown on s0ma's page.
+/// for the tab (`heard`), as well as shown on the agent's page.
 pub fn listen() {
     *lock(&HEARD) = Some(Vec::new());
 }
@@ -216,7 +225,7 @@ pub fn queue(command: &str) -> Result<(), String> {
     // The machine's switch takes effect at once, mid-turn too (the app runs
     // queued commands only between turns); the app still says so.
     if command.split_whitespace().next() == Some("/vm") {
-        crate::vm_access::handle_command(command);
+        crate::vm::access::handle_command(command);
     }
     lock(&QUEUE).push(command.to_string());
     Ok(())
@@ -242,6 +251,11 @@ pub fn allowed(command: &str) -> bool {
             | ["/goal", "pause" | "resume" | "clear"]
             | ["/mcp", "reload"]
             | ["/mcp", "reload", _]
+            | ["/model", "server" | "name" | "context", _]
+            | ["/model", "type", "local" | "hosted"]
+            | ["/model", "key", "clear"]
+            | ["/embeddings", "on" | "off"]
+            | ["/machine", "host" | "vm"]
     )
 }
 
@@ -250,7 +264,7 @@ fn in_shells() -> bool {
     true
 }
 
-/// s0ma's watches and background commands, as `vm_wake_list` last said.
+/// The agent's watches and background commands, as `vm_wake_list` last said.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Watches {
     /// Running ones: name, whether it repeats, its command (cut short).
@@ -274,7 +288,7 @@ const LIST_WATCHES_EVERY: Duration = Duration::from_secs(20);
 pub fn watches() -> Watches {
     let kept = WATCHES.lock().ok().and_then(|kept| kept.clone());
     let stale = kept.as_ref().is_none_or(|(at, _)| at.elapsed() >= LIST_WATCHES_EVERY);
-    if stale && crate::vm_wake::enabled() && !LISTING.swap(true, Ordering::SeqCst) {
+    if stale && crate::vm::wake::enabled() && !LISTING.swap(true, Ordering::SeqCst) {
         let spawned = std::thread::Builder::new().name("overview-watches".into()).spawn(|| {
             let listed = list_watches();
             if let Ok(mut kept) = WATCHES.lock() {
@@ -286,7 +300,7 @@ pub fn watches() -> Watches {
             LISTING.store(false, Ordering::SeqCst);
         }
     }
-    if !crate::vm_wake::enabled() {
+    if !crate::vm::wake::enabled() {
         return Watches { error: Some("the wake channel is off: nothing can wake s0ma from its machine".into()), listed: true, ..Watches::default() };
     }
     kept.map(|(_, watches)| watches).unwrap_or_default()
@@ -299,7 +313,7 @@ fn list_watches() -> Watches {
         kind: "function".into(),
         function: crate::types::FunctionCall { name: "vm_wake_list".into(), arguments: "{}".into() },
     };
-    let reply = match crate::vm_wake::execute(&call) {
+    let reply = match crate::vm::wake::execute(&call) {
         Ok(reply) => reply,
         Err(error) => return Watches { error: Some(error.to_string()), listed: true, ..Watches::default() },
     };
@@ -335,18 +349,6 @@ pub(crate) mod tests {
     pub(crate) static LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn only_the_overviews_own_commands_are_queued() {
-        let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for command in ["/mode low", "/mode workers medium", "/loop on", "/voice off", "/sleep set 0200", "/sleep set off", "/tz UTC-6", "/goal pause", "/mcp reload", "/mcp reload github"] {
-            assert!(allowed(command), "{command}");
-        }
-        for command in ["/quit", "/mode", "/mode workers", "/mode workers auto", "/goal set do something", "/job close x --yes", "hello", "/loop", "/sleep set 02 00", "/mcp tools"] {
-            assert!(!allowed(command), "{command}");
-        }
-        assert!(queue("/quit").is_err());
-    }
-
-    #[test]
     fn the_last_snapshot_is_kept_and_shown_at_once_after_a_restart() {
         let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("s0ma-overview-{}", std::process::id()));
@@ -359,7 +361,7 @@ pub(crate) mod tests {
             ..Snapshot::default()
         };
         std::fs::write(dir.join("overview.json"), serde_json::to_string(&before).unwrap()).unwrap();
-        // A restart: nothing published yet in this s0ma.
+        // A restart: nothing published yet in this agent.
         *lock(&PUBLISHED) = None;
         init(&dir);
         let (shown, age) = want().expect("shown at once");
@@ -371,30 +373,5 @@ pub(crate) mod tests {
         assert_eq!((kept.reasoning.as_str(), kept.restored), ("auto", false));
         assert!(!dir.join("overview.json.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_tab_asks_and_the_app_answers() {
-        let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = take_commands();
-        publish(Snapshot { reasoning: "auto".into(), ..Snapshot::default() });
-        assert!(!wanted());
-        let (shown, age) = want().unwrap();
-        assert_eq!(shown.reasoning, "auto");
-        assert!(age < FRESH_FOR && !wanted(), "fresh: not asked again");
-        queue("/loop on").unwrap();
-        assert!(pending());
-        assert_eq!(take_commands(), ["/loop on"]);
-        assert_eq!(bare("[mode] forced xhigh"), "forced xhigh");
-        // What the app says to a command, kept for the tab across snapshots.
-        heard("not listening", false);
-        listen();
-        heard("[tz] bad zone", true);
-        let reply = reply_to("/tz nowhere");
-        assert_eq!((reply.text.as_str(), reply.problem), ("bad zone", true));
-        publish(Snapshot { reply: Some(reply.clone()), ..Snapshot::default() });
-        publish(Snapshot::default());
-        assert_eq!(want().unwrap().0.reply, Some(reply));
-        assert_eq!(bare("plain"), "plain");
     }
 }

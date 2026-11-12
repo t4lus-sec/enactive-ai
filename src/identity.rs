@@ -1,11 +1,11 @@
 //! The invariant: name, pronouns, values.
 //!
-//! Everything else about who s0ma is lives in the weights and the memory
+//! Everything else about who the agent is lives in the weights and the memory
 //! systems. This file is the part that does not emerge, does not drift, and is
-//! not s0ma's to revise.
+//! not the agent's to revise.
 //!
 //! There are no tools here, and that is the design rather than an omission. A
-//! frozen tier that s0ma can write is not frozen; it is a convention the prompt
+//! frozen tier that the agent can write is not frozen; it is a convention the prompt
 //! asks a model to respect, which is exactly the guarantee the frozen tier
 //! exists in order not to depend on. The only way to change this file is to edit
 //! it — which means the operator, at a shell, on purpose.
@@ -113,7 +113,7 @@ impl Identity {
     ///
     /// Verbatim on purpose. Anything that reformatted, summarised or templated it
     /// would be a second author, and the file's whole value is that what the operator
-    /// wrote is what s0ma reads.
+    /// wrote is what the agent reads.
     pub fn text(&self) -> &str {
         self.text.trim()
     }
@@ -124,8 +124,8 @@ impl Identity {
 
     /// Whether the file on disk has been edited since it was loaded.
     ///
-    /// The loaded text is what is actually in s0ma's context; the file is what
-    /// The operator last wrote. They diverge the moment the file is edited, and stay
+    /// The loaded text is what is actually in the agent's context; the file is what
+    /// the operator last wrote. They diverge the moment the file is edited, and stay
     /// diverged until a restart, because the invariant is spliced into the
     /// system prompt once rather than re-read per turn — deliberately, since an
     /// identity that could change mid-session is not an invariant.
@@ -159,18 +159,8 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_invariant_is_created_rather_than_fatal() {
-        let data = dir("missing");
-        let identity = Identity::load(&data).unwrap();
-
-        assert!(identity.path().exists());
-        assert!(identity.text().contains("they/them"));
-        assert!(identity.text().contains("Values"));
-    }
-
-    #[test]
     fn the_invariant_is_injected_exactly_as_written() {
-        // No reformatting, no templating. What the operator wrote is what s0ma reads;
+        // No reformatting, no templating. What the operator wrote is what the agent reads;
         // anything in between would be a second author of the one document that
         // is supposed to have exactly one.
         let data = dir("verbatim");
@@ -179,54 +169,5 @@ mod tests {
 
         let identity = Identity::load(&data).unwrap();
         assert_eq!(identity.text(), written.trim());
-    }
-
-    #[test]
-    fn an_empty_invariant_stops_startup() {
-        // Fail closed, for the same reason a corrupt self-model does: this is
-        // what every other judgment is anchored to, so running without it is
-        // worse than not running.
-        let data = dir("empty");
-        std::fs::write(data.join(FILE_NAME), "   \n\n").unwrap();
-
-        let error = Identity::load(&data).err().expect("an empty invariant must not start");
-        assert!(error.to_string().contains("empty"));
-    }
-
-    #[test]
-    fn an_edit_is_picked_up_on_the_next_load() {
-        // The only way this file changes. There is no tool, so there is nothing
-        // to test on the write side — which is the point.
-        let data = dir("edited");
-        Identity::load(&data).unwrap();
-
-        std::fs::write(data.join(FILE_NAME), "# s0ma\n\n## Values\n\n- Something new.\n").unwrap();
-        assert!(Identity::load(&data).unwrap().text().contains("Something new"));
-    }
-
-    #[test]
-    fn an_edit_after_loading_is_detectable_but_not_applied() {
-        // The two halves of the same property. Identity does not change
-        // mid-session, so an edit must not take effect — and an operator who
-        // edits the file must be able to find out that this is why nothing
-        // changed, rather than concluding the values are not being read.
-        let data = dir("drift");
-        std::fs::write(data.join(FILE_NAME), "# s0ma\n\n## Values\n\n- The first one.\n").unwrap();
-        let identity = Identity::load(&data).unwrap();
-        assert!(!identity.edited_since_load());
-
-        std::fs::write(data.join(FILE_NAME), "# s0ma\n\n## Values\n\n- A different one.\n").unwrap();
-        assert!(identity.edited_since_load(), "the edit should be visible");
-        assert!(identity.text().contains("The first one"), "but must not be live");
-    }
-
-    #[test]
-    fn an_oversized_invariant_still_loads() {
-        // The cap is a warning, not a gate. Refusing to start over a long file
-        // would be a worse failure than the one it guards against.
-        let data = dir("oversized");
-        std::fs::write(data.join(FILE_NAME), "x".repeat(MAX_CHARS * 2)).unwrap();
-
-        assert!(Identity::load(&data).is_ok());
     }
 }

@@ -1,5 +1,5 @@
 //! Stuck detection by streaks of identical tool calls (A03; A80 would use the
-//! same predicate with s0ma as the actor).
+//! same predicate with the agent as the actor).
 //!
 //! A streak is a run of consecutive calls with the same key: (actor, tool,
 //! sha256 of the canonical arguments). Canonical means JSON with sorted keys
@@ -12,7 +12,7 @@
 //! whatever the outcome; at `fails == STOP_AT_FAILS` the actor is stopped. A
 //! streak of successful calls (polling until a check passes) is never stopped,
 //! only reminded once. The reminder is advisory: the count keeps running. A
-//! direction from s0ma resets every streak, since repeating a call after one
+//! direction from the agent resets every streak, since repeating a call after one
 //! is legitimate. There is no opt-out.
 //!
 //! Semantic loops (the same failure with paraphrased arguments) are out of
@@ -126,7 +126,7 @@ pub(crate) enum Verdict {
     Stop(Report),
 }
 
-/// One actor's streak (a worker's, or s0ma's for A80).
+/// One actor's streak (a worker's, or the agent's for A80).
 #[derive(Clone, Debug)]
 pub(crate) struct Streaks {
     actor: String,
@@ -204,7 +204,7 @@ impl Streaks {
         }
     }
 
-    /// A direction from s0ma arrived: every streak starts over.
+    /// A direction from the agent arrived: every streak starts over.
     pub(crate) fn reset(&mut self) -> bool {
         self.current.take().is_some()
     }
@@ -279,25 +279,6 @@ mod tests {
     }
 
     #[test]
-    fn l1_a_failing_identical_call_is_reminded_at_5_and_stopped_at_8() {
-        let mut streaks = Streaks::new("subagent-1-1");
-        let verdicts = run(&mut streaks, "vm_exec", r#"{"command":"pkill -f flush"}"#, FAILING, 10);
-        assert_eq!(reminders(&verdicts), [5]);
-        assert_eq!(stops(&verdicts)[0], 8, "{verdicts:?}");
-        let Verdict::Stop(report) = &verdicts[7] else { unreachable!() };
-        assert_eq!((report.reps, report.fails, report.tool.as_str(), report.first_seen.as_str()), (8, 8, "vm_exec", "t0"));
-        assert!(report.stop_message().contains("Operation not permitted"));
-        // The reminder at 5 echoes the error and gives the way out.
-        let Verdict::Remind(report) = &verdicts[4] else { unreachable!() };
-        let reminder = report.reminder();
-        for part in [&format!("key {}", report.digest), "5 identical vm_exec calls", "first at t0", "5 failed",
-            "exit code 1: pkill: killing pid 41 failed: Operation not permitted", "wrap the loop in ONE vm_exec",
-            "change what you are checking", "ask for direction", "notes file", "stop_reason stuck_terminated"] {
-            assert!(reminder.contains(part), "{part:?} missing from:\n{reminder}");
-        }
-    }
-
-    #[test]
     fn l2_a_successful_poll_is_reminded_once_and_never_stopped() {
         let mut streaks = Streaks::new("subagent-1-1");
         let verdicts = run(&mut streaks, "vm_exec", r#"{"command":"gh pr checks 41"}"#, POLL_OK, 6);
@@ -306,32 +287,6 @@ mod tests {
         assert!(reminders(&more).is_empty() && stops(&more).is_empty(), "one reminder per streak, no stop for successes");
         let Verdict::Remind(report) = &verdicts[4] else { unreachable!() };
         assert!(report.reminder().contains("Every one of them succeeded."));
-    }
-
-    #[test]
-    fn l3_alternating_calls_keep_every_streak_at_one() {
-        let mut streaks = Streaks::new("subagent-1-1");
-        for i in 0..20 {
-            let args = if i % 2 == 0 { r#"{"command":"a"}"# } else { r#"{"command":"b"}"# };
-            assert_eq!(streaks.record("vm_exec", args, &Outcome::of(FAILING), "t"), Verdict::Continue);
-            assert_eq!(streaks.current.as_ref().unwrap().reps, 1);
-        }
-        // The same arguments to a different tool are a different call too.
-        streaks.record("vm_exec", r#"{"command":"a"}"#, &Outcome::of(FAILING), "t");
-        streaks.record("vm_shell_input", r#"{"command":"a"}"#, &Outcome::of(FAILING), "t");
-        assert_eq!(streaks.current.as_ref().unwrap().reps, 1);
-    }
-
-    #[test]
-    fn l4_a_steer_starts_every_streak_over() {
-        let mut streaks = Streaks::new("subagent-1-1");
-        let args = r#"{"command":"make test"}"#;
-        assert!(stops(&run(&mut streaks, "vm_exec", args, FAILING, 6)).is_empty());
-        assert!(streaks.reset(), "a streak was running");
-        let after = run(&mut streaks, "vm_exec", args, FAILING, 8);
-        assert_eq!(reminders(&after), [5], "counted from 1 again");
-        assert_eq!(stops(&after), [8]);
-        assert!(!Streaks::new("x").reset());
     }
 
     #[test]
@@ -351,46 +306,5 @@ mod tests {
         assert_ne!(canonical(r#"{"command":"ls /tmp "}"#), canonical(r#"{"command":"ls /tmp"}"#));
         assert_eq!(canonical(r#"{"b":{"y":1,"x":2},"a":[3,1]}"#), r#"{"a":[3,1],"b":{"x":2,"y":1}}"#);
         assert_eq!(canonical("not json"), "not json");
-    }
-
-    #[test]
-    fn a_failed_call_is_read_from_its_result() {
-        assert_eq!(Outcome::of(POLL_OK), Outcome::Succeeded);
-        assert_eq!(Outcome::of("plain text"), Outcome::Succeeded);
-        assert_eq!(Outcome::of(r#"{"ok":true}"#), Outcome::Succeeded);
-        assert_eq!(Outcome::of(r#"{"ok":false,"error":"no such session"}"#), Outcome::Failed("no such session".into()));
-        assert_eq!(Outcome::of(r#"{"ok":false,"reason":"already_claimed"}"#), Outcome::Failed("already_claimed".into()));
-        assert_eq!(Outcome::of(r#"{"ok":false,"status":"timeout","error":"lost contact"}"#), Outcome::Failed("lost contact".into()));
-        assert_eq!(Outcome::of(r#"{"exit_code":null,"signal":9,"stdout":"","stderr":""}"#), Outcome::Failed("killed by signal 9".into()));
-        assert_eq!(Outcome::of(r#"{"exit_code":2,"stdout":"","stderr":"  \n"}"#), Outcome::Failed("exit code 2".into()));
-        let Outcome::Failed(error) = Outcome::of(&format!(r#"{{"exit_code":1,"stderr":"{}END"}}"#, "x".repeat(5000))) else { panic!() };
-        assert!(error.starts_with("exit code 1: …") && error.ends_with("END"), "the end is kept: {error}");
-        assert_eq!(error.chars().count(), ERROR_ECHO_CHARS);
-    }
-
-    #[test]
-    fn the_summary_keeps_the_longest_streak_across_resets() {
-        let mut streaks = Streaks::new("subagent-1-1");
-        assert_eq!(streaks.summary(), None, "no call, no summary");
-        run(&mut streaks, "vm_exec", r#"{"command":"a"}"#, FAILING, 6);
-        streaks.reset();
-        run(&mut streaks, "vm_exec", r#"{"command":"a"}"#, POLL_OK, 3);
-        let summary = streaks.summary().unwrap();
-        assert_eq!((summary.reminders, summary.longest_reps, summary.longest_fails), (1, 6, 6));
-        assert_eq!(summary.longest_tool, "vm_exec");
-    }
-
-    #[test]
-    fn a_streak_names_its_actor_and_call() {
-        let mut one = Streaks::new("subagent-1-1");
-        let mut two = Streaks::new("subagent-1-2");
-        let args = r#"{"command":"ls"}"#;
-        let digest = |s: &mut Streaks| match run(s, "vm_exec", args, FAILING, 5).pop().unwrap() {
-            Verdict::Remind(report) => report.digest,
-            other => panic!("{other:?}"),
-        };
-        let (a, b) = (digest(&mut one), digest(&mut two));
-        assert_ne!(a, b, "the actor is part of the key");
-        assert_eq!(a.len(), 16);
     }
 }

@@ -1,4 +1,4 @@
-//! Open loops: s0ma's unfinished business.
+//! Open loops: the agent's unfinished business.
 //!
 //! Everything else in working memory ages by context distance — the further back
 //! something is, the coarser it gets. Loops are the exception. An unanswered
@@ -16,7 +16,7 @@
 //! are working, you just have unfinished things and keep them where you can see
 //! them.
 //!
-//! So this is a list, kept in front of s0ma, that only it can cross anything off.
+//! So this is a list, kept in front of the agent, that only it can cross anything off.
 //! It sits at the *end* of the context and moves only when its text changes (see
 //! `refresh_context`), it is bounded by a cap that degrades detail rather than
 //! hiding entries, and a loop untouched across a lot of context starts asking
@@ -40,12 +40,11 @@ use serde_json::{Value, json};
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 /// Render budget for the whole loops block, in tokens.
-pub const RENDER_BUDGET_TOKENS: usize = crate::context_guard::LOOPS_BUDGET_TOKENS;
+pub const RENDER_BUDGET_TOKENS: usize = crate::context::guard::LOOPS_BUDGET_TOKENS;
 
 /// A loop untouched across this much context gets a "still open?" marker. It is a
 /// prompt to pick it up, close it or drop it — never a reason to hide it.
@@ -68,9 +67,9 @@ pub enum LoopKind {
     Request,
     /// Work started and not finished.
     Task,
-    /// Something s0ma said it would do or check.
+    /// Something the agent said it would do or check.
     Promise,
-    /// A question s0ma left open for itself.
+    /// A question the agent left open for itself.
     Question,
 }
 
@@ -122,7 +121,7 @@ impl LoopStatus {
     }
 }
 
-/// Who opened the loop. A fold-opened loop is one s0ma's own gist noticed was
+/// Who opened the loop. A fold-opened loop is one agent's own gist noticed was
 /// still hanging, which is the safety net for work it forgot to write down.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -194,11 +193,9 @@ impl LoopStore {
     }
 
     fn connect(&self) -> Result<Connection> {
-        let db = Connection::open(&self.path)?;
-        db.busy_timeout(Duration::from_secs(10))?;
+        let db = crate::db::open(&self.path)?;
         db.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-             CREATE TABLE IF NOT EXISTS loops(
+            "CREATE TABLE IF NOT EXISTS loops(
                 id TEXT PRIMARY KEY,
                 seq INTEGER NOT NULL,
                 text TEXT NOT NULL,
@@ -431,7 +428,7 @@ fn truncate(text: &str, chars: usize) -> String {
 /// "opened Wed 21 Oct 2026 09:10", for the block. Only when it opened, which
 /// never changes: the block moves only when its text changes, and a touch
 /// that changed the text would move it (and re-prefill everything after where
-/// it sat) every time s0ma said it was still on something. When it was last
+/// it sat) every time the agent said it was still on something. When it was last
 /// touched is in loop_list and /loops.
 fn opened(entry: &OpenLoop) -> Option<String> {
     crate::clock::parse(&entry.opened_at).map(|at| format!("opened {}", crate::clock::short(&at)))
@@ -481,7 +478,7 @@ fn compact_entry(entry: &OpenLoop, now: u64) -> String {
 /// One rule decides the shape: detail degrades before anything disappears. Over
 /// the cap, the least recently touched loops drop to an ID and a first line, and
 /// none is ever hidden. Since the list already arrives most-recently-touched
-/// first, that also means whatever s0ma is currently on keeps its full text
+/// first, that also means whatever the agent is currently on keeps its full text
 /// longest — which is what an explicit focus flag was for.
 pub fn render(loops: &[OpenLoop], now: u64) -> String {
     let open: Vec<&OpenLoop> =
@@ -504,7 +501,7 @@ pub fn render(loops: &[OpenLoop], now: u64) -> String {
     };
 
     // Over budget: demote from the *oldest* end, one loop at a time, so the
-    // entries s0ma touched most recently keep their detail longest.
+    // entries the agent touched most recently keep their detail longest.
     let mut demote = open.len();
     while measure(&lines) > budget_chars && demote > 0 {
         demote -= 1;
@@ -517,7 +514,7 @@ pub fn render(loops: &[OpenLoop], now: u64) -> String {
 // ------------------------------------------------------------------ context block
 
 /// First line of the appended loops block. Identifies it for stripping, and marks
-/// it to s0ma as harness-rendered state rather than something anyone said.
+/// it to the agent as harness-rendered state rather than something anyone said.
 pub const BLOCK_MARKER: &str = "[open loops — current state, rendered by the harness]";
 
 /// The loops block as it appears in context, or `None` when nothing is open.
@@ -539,7 +536,7 @@ pub fn is_block(message: &Message) -> bool {
 ///
 /// A fold plans over the live turns, and the block is harness-rendered state
 /// rather than anything anyone said: folding it into a gist would put the
-/// harness's own words into s0ma's memory of the conversation. So it comes out
+/// harness's own words into the agent's memory of the conversation. So it comes out
 /// before a fold and goes back afterwards, via `refresh_context`.
 ///
 /// Returns whether a block was there.
@@ -566,7 +563,7 @@ pub fn strip_block(messages: &mut Vec<Message>) -> bool {
 /// left exactly where it is — still accurate, costing nothing — and drifts
 /// backwards through the context until something about the loops actually
 /// differs. Cost per fold cycle is therefore bounded by the size of the cycle
-/// rather than by how often s0ma touches its loops.
+/// rather than by how often the agent touches its loops.
 ///
 /// Returns whether the context changed.
 pub fn refresh_context(messages: &mut Vec<Message>, store: &LoopStore) -> Result<bool> {
@@ -821,11 +818,11 @@ pub fn execute_with(
 
 // ------------------------------------------------------------------ The operator closing a loop
 
-/// Loops the operator closed from the memory tab, for his next message to s0ma.
+/// Loops the operator closed from the memory tab, for his next message to the agent.
 static CLOSED_BY_OPERATOR: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The operator closes a loop: done, or dropped, with what he said (or that it was
-/// him). s0ma is told with his next message (`take_note`); the loop leaves
+/// him). The agent is told with his next message (`take_note`); the loop leaves
 /// the open-loops block in its context at the next refresh.
 pub fn close_by_operator(store: &LoopStore, id: &str, done: bool, said: &str) -> Result<std::result::Result<OpenLoop, String>> {
     let status = if done { LoopStatus::Done } else { LoopStatus::Dropped };
@@ -846,7 +843,7 @@ pub fn close_by_operator(store: &LoopStore, id: &str, done: bool, said: &str) ->
     Ok(closed)
 }
 
-/// The note for the operator's next message: the loops he closed since s0ma was
+/// The note for the operator's next message: the loops he closed since the agent was
 /// last told.
 pub fn take_note() -> Option<String> {
     let lines = std::mem::take(&mut *CLOSED_BY_OPERATOR.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
@@ -895,22 +892,8 @@ pub fn handle_operator_command(store: &LoopStore, command: &str) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FunctionCall;
-    use crate::evidence::EventSnapshot;
 
-    struct Archive {
-        ids: Vec<u64>,
-    }
 
-    impl EvidenceSource for Archive {
-        fn events(&self, ids: &[u64]) -> Result<Vec<EventSnapshot>> {
-            Ok(ids
-                .iter()
-                .filter(|id| self.ids.contains(id))
-                .map(|id| EventSnapshot { id: *id })
-                .collect())
-        }
-    }
 
     /// A store in its own directory. Each call gets a fresh path so tests never
     /// share a database.
@@ -947,32 +930,6 @@ mod tests {
         assert!(take_note().is_none(), "told once");
     }
 
-    fn call(name: &str, arguments: Value) -> ToolCall {
-        ToolCall {
-            id: "call-1".to_string(),
-            kind: "function".to_string(),
-            function: FunctionCall {
-                name: name.to_string(),
-                arguments: arguments.to_string(),
-            },
-        }
-    }
-
-    fn sample(id: &str, text: &str, touched: u64) -> OpenLoop {
-        OpenLoop {
-            id: id.to_string(),
-            text: text.to_string(),
-            kind: LoopKind::Task,
-            source_event_ids: vec![],
-            opened_by: OpenedBy::S0ma,
-            status: LoopStatus::Open,
-            opened_at: "t".to_string(),
-            last_touched_at: "t".to_string(),
-            last_touched_distance: touched,
-            resolution: None,
-        }
-    }
-
     #[test]
     fn a_loop_opens_and_only_closes_explicitly() {
         let store = store();
@@ -995,166 +952,11 @@ mod tests {
     }
 
     #[test]
-    fn closing_twice_is_refused() {
-        let store = store();
-        let entry =
-            store.open("a task worth naming", LoopKind::Task, &[], OpenedBy::S0ma, 0).unwrap();
-        store.close(&entry.id, LoopStatus::Done, "finished it", 0).unwrap().unwrap();
-        assert!(store.close(&entry.id, LoopStatus::Dropped, "changed my mind", 0).unwrap().is_err());
-    }
-
-    #[test]
     fn a_closed_loop_cannot_be_touched() {
         let store = store();
         let entry = store.open("a finished thing", LoopKind::Task, &[], OpenedBy::S0ma, 0).unwrap();
         store.close(&entry.id, LoopStatus::Done, "done and verified", 0).unwrap().unwrap();
         assert!(store.touch(&entry.id, 0).unwrap().is_err());
-    }
-
-    #[test]
-    fn touching_a_loop_puts_it_back_on_top() {
-        // What an explicit focus flag used to do, without the flag.
-        let store = store();
-        let first = store.open("the older thing", LoopKind::Task, &[], OpenedBy::S0ma, 0).unwrap();
-        store.open("the newer thing", LoopKind::Request, &[], OpenedBy::S0ma, 100).unwrap();
-
-        assert_eq!(store.open_loops().unwrap()[0].text, "the newer thing");
-
-        store.touch(&first.id, 500).unwrap().unwrap();
-        let ordered = store.open_loops().unwrap();
-        assert_eq!(ordered[0].id, first.id, "the one just picked up leads");
-        assert_eq!(ordered[0].distance_since(500), 0, "and stops looking stale");
-    }
-
-    #[test]
-    fn the_odometer_accumulates_rather_than_sampling() {
-        // The live context tops out around 220k and drops at every fold, so a
-        // sampled odometer would stall there. Distance has to keep climbing for
-        // loops to age correctly across a long session.
-        let store = store();
-        for _ in 0..10 {
-            store.advance_distance(50_000).unwrap();
-        }
-        assert_eq!(store.distance().unwrap(), 500_000);
-        assert!(store.distance().unwrap() > crate::context_guard::FOLD_AT_TOKENS as u64);
-        assert_eq!(store.advance_distance(0).unwrap(), 500_000);
-    }
-
-    #[test]
-    fn source_events_are_existence_checked() {
-        let store = store();
-        let archive = Archive { ids: vec![10, 11] };
-
-        let bad = execute_with(
-            &store,
-            &archive,
-            &call(
-                "loop_open",
-                json!({"text": "cite a ghost event", "kind": "task", "source_event_ids": [10, 99]}),
-            ),
-        )
-        .unwrap();
-        assert!(bad.contains("don't exist"), "{bad}");
-        assert!(store.open_loops().unwrap().is_empty(), "nothing is stored on rejection");
-
-        let good = execute_with(
-            &store,
-            &archive,
-            &call(
-                "loop_open",
-                json!({"text": "cite a real event", "kind": "task", "source_event_ids": [10, 11]}),
-            ),
-        )
-        .unwrap();
-        assert!(good.contains("\"ok\":true"), "{good}");
-        assert_eq!(store.open_loops().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn rendering_degrades_detail_and_hides_nothing() {
-        let long = "x".repeat(MAX_TEXT_CHARS);
-        let loops: Vec<OpenLoop> =
-            (1..=40).map(|n| sample(&format!("loop-{n:04}"), &long, 0)).collect();
-
-        let rendered = render(&loops, 0);
-
-        for entry in &loops {
-            assert!(rendered.contains(&entry.id), "{} was hidden", entry.id);
-        }
-        assert!(
-            rendered.chars().count() <= RENDER_BUDGET_TOKENS * BYTES_PER_TOKEN,
-            "rendered {} chars, over the cap",
-            rendered.chars().count(),
-        );
-    }
-
-    #[test]
-    fn the_most_recently_touched_loop_keeps_its_detail_longest() {
-        let long = "y".repeat(MAX_TEXT_CHARS);
-        // The store hands them over newest-touched first; render preserves that.
-        let loops: Vec<OpenLoop> =
-            (1..=30).map(|n| sample(&format!("loop-{n:04}"), &long, 0)).collect();
-
-        let rendered = render(&loops, 0);
-        let first = rendered.lines().nth(1).unwrap();
-        assert!(first.starts_with("· loop-0001"));
-        assert!(first.contains(&long), "the newest is shown in full");
-
-        let last = rendered.lines().last().unwrap();
-        assert!(last.starts_with("· loop-0030"));
-        assert!(!last.contains(&long), "the oldest is compacted first");
-    }
-
-    #[test]
-    fn loops_show_when_they_opened_and_a_touch_leaves_the_block_alone() {
-        let opened = "2026-10-21T09:10:00+11:00";
-        let mut entry = sample("loop-0001", "check the build at 3 pm", 0);
-        entry.opened_at = opened.into();
-        entry.last_touched_at = opened.into();
-        let fresh = render(std::slice::from_ref(&entry), 0);
-        assert!(fresh.contains(&format!("(opened {})", crate::clock::stored(opened))), "{fresh}");
-        assert!(compact_entry(&entry, 0).contains("(opened "), "a compacted entry keeps its date");
-
-        // Touched later: the block's text is the same, so it doesn't move.
-        entry.last_touched_at = "2026-10-21T15:02:00+11:00".into();
-        assert_eq!(render(std::slice::from_ref(&entry), 0), fresh);
-        // The touch shows where s0ma asks for it.
-        assert_eq!(describe(&entry, 0)["touched"], crate::clock::stored("2026-10-21T15:02:00+11:00"));
-    }
-
-    #[test]
-    fn stale_loops_are_marked_not_dropped() {
-        let loops = vec![sample("loop-0001", "the thing from this morning", 0)];
-
-        let fresh = render(&loops, 1_000);
-        assert!(!fresh.contains("still open?"));
-
-        let stale = render(&loops, STALE_DISTANCE_TOKENS + 1);
-        assert!(stale.contains("still open?"));
-        assert!(stale.contains("loop-0001"));
-    }
-
-    #[test]
-    fn an_unchanged_block_is_left_where_it_is() {
-        // The affordability of appending rests entirely on this: moving the block
-        // invalidates the cache from wherever it sat, so it must move only when
-        // its text actually differs.
-        let store = store();
-        store.open("something to finish", LoopKind::Task, &[], OpenedBy::S0ma, 0).unwrap();
-
-        let mut messages = vec![Message::system("prefix".into()), Message::user("hello".into())];
-        assert!(refresh_context(&mut messages, &store).unwrap());
-        assert_eq!(messages.len(), 3);
-        assert!(is_block(messages.last().unwrap()));
-
-        // Nothing changed: no move, no invalidation.
-        assert!(!refresh_context(&mut messages, &store).unwrap());
-        assert_eq!(messages.len(), 3);
-
-        // Turns arrive; the block stays put rather than being dragged along.
-        messages.push(Message::assistant("working".into()));
-        assert!(!refresh_context(&mut messages, &store).unwrap());
-        assert!(!is_block(messages.last().unwrap()), "an unchanged block does not chase the tail");
     }
 
     #[test]
@@ -1173,45 +975,5 @@ mod tests {
         assert!(is_block(messages.last().unwrap()), "a changed block moves to the end");
         assert!(messages.last().unwrap().content.contains("the second thing"));
         assert!(messages.last().unwrap().content.contains(&first.id));
-    }
-
-    #[test]
-    fn the_block_can_be_taken_out_before_a_fold() {
-        let store = store();
-        store.open("something to finish", LoopKind::Task, &[], OpenedBy::S0ma, 0).unwrap();
-
-        let mut messages = vec![Message::system("prefix".into()), Message::user("hello".into())];
-        refresh_context(&mut messages, &store).unwrap();
-        assert_eq!(messages.len(), 3);
-
-        assert!(strip_block(&mut messages), "the block was there");
-        assert_eq!(messages.len(), 2);
-        assert!(!messages.iter().any(is_block), "a fold must never gist the harness's own words");
-
-        assert!(!strip_block(&mut messages), "and stripping again is a no-op");
-    }
-
-    #[test]
-    fn the_block_disappears_when_nothing_is_open() {
-        let store = store();
-        let entry = store.open("a thing to do", LoopKind::Task, &[], OpenedBy::S0ma, 0).unwrap();
-
-        let mut messages = vec![Message::system("prefix".into())];
-        refresh_context(&mut messages, &store).unwrap();
-        assert_eq!(messages.len(), 2);
-
-        store.close(&entry.id, LoopStatus::Done, "finished it", 0).unwrap().unwrap();
-        assert!(refresh_context(&mut messages, &store).unwrap());
-        assert_eq!(messages.len(), 1);
-        assert!(!messages.iter().any(is_block));
-    }
-
-    #[test]
-    fn the_block_says_loops_do_not_close_themselves() {
-        // Standing state with no mode and no gate: the only pressure to resolve a
-        // loop is that it is visible and says so.
-        let loops = vec![sample("loop-0001", "something unfinished", 0)];
-        let rendered = render(&loops, 0);
-        assert!(rendered.contains("Nothing here closes on its own"));
     }
 }

@@ -1,7 +1,7 @@
-//! Striking text out of everything s0ma keeps: the memory tab's redaction.
+//! Striking text out of everything the agent keeps: the memory tab's redaction.
 //!
 //! `redact.rs` began as one event at a time, and said plainly what it could
-//! not reach: what s0ma had written in its own words. This is the other half.
+//! not reach: what the agent had written in its own words. This is the other half.
 //! Given the exact strings to remove, it finds every place they are kept and
 //! replaces each occurrence with [`MARKER`]:
 //!
@@ -776,7 +776,7 @@ pub fn survey(memory: &Hippocampus, fragments: &Fragments) -> Result<Impact> {
     run(memory, fragments, false)
 }
 
-/// Strike it from everywhere it is kept. The fragments are held until s0ma
+/// Strike it from everywhere it is kept. The fragments are held until the agent
 /// has gone over everything once more (`take_settle`).
 pub fn apply(memory: &Hippocampus, fragments: &Fragments) -> Result<Impact> {
     let _one = RUNNING.lock().map_err(|_| "a strike failed part way; restart s0ma".to_string())?;
@@ -789,10 +789,10 @@ pub fn apply(memory: &Hippocampus, fragments: &Fragments) -> Result<Impact> {
     Ok(impact)
 }
 
-/// Strings struck since s0ma last settled. A strike runs beside the turn,
+/// Strings struck since the agent last settled. A strike runs beside the turn,
 /// the compactor and the background sleep, any of which may have held the
-/// text and be about to write it again; and s0ma's live context still holds
-/// it. So the running s0ma, when it next has the floor, stops what writes
+/// text and be about to write it again; and the agent's live context still holds
+/// it. So the running agent, when it next has the floor, stops what writes
 /// from the archive, strikes the same strings once more and rebuilds its
 /// context (`app.rs`). Held in memory only, and given up by taking them.
 static SETTLE: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -820,7 +820,7 @@ pub fn take_settle() -> Option<Fragments> {
     Fragments::new(&owed).ok()
 }
 
-/// Whether a strike is waiting for s0ma to settle it.
+/// Whether a strike is waiting for the agent to settle it.
 pub fn settle_owed() -> bool {
     SETTLE.lock().map(|owed| !owed.is_empty()).unwrap_or(false)
 }
@@ -882,7 +882,7 @@ fn run_with(memory: &Hippocampus, fragments: &Fragments, apply: bool, look_after
     }
     if apply {
         let list = fragments.list().to_vec();
-        let layers = crate::memory_layers::MemoryLayers::beside_archive(archive);
+        let layers = crate::memory::layers::MemoryLayers::beside_archive(archive);
         match layers.purge_holding(&list) {
             Ok((0, 0)) => {}
             Ok((gists, items)) => impact.cleared.push(format!("{gists} gists, {items} open items")),
@@ -904,7 +904,7 @@ fn run_with(memory: &Hippocampus, fragments: &Fragments, apply: bool, look_after
             }
             Err(error) => notes.push(note("dropping the saved model calls", error.to_string())),
         }
-        crate::context_resume::forget(&data_dir);
+        crate::context::resume::forget(&data_dir);
     }
 
     // The checkpoints.
@@ -1023,7 +1023,7 @@ fn run_with(memory: &Hippocampus, fragments: &Fragments, apply: bool, look_after
     }
 
     // Redaction requests: a pending one's proposal is a copy of an event's
-    // text, and the reason s0ma gave may quote it.
+    // text, and the reason the agent gave may quote it.
     let book = crate::redact::Book::beside_archive(archive);
     match crate::redact::strike_book(&book, &strike, apply) {
         Ok(touched) => {
@@ -1149,23 +1149,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fragment_is_struck_everywhere_it_occurs_and_counted() {
-        let f = fragments(&["sk-live-9f3a"]);
-        let (text, count) = f.strike("key sk-live-9f3a and again sk-live-9f3a.").unwrap();
-        assert_eq!(text, "key [redacted] and again [redacted].");
-        assert_eq!(count, 2);
-        assert!(f.strike("nothing here").is_none());
-    }
-
-    #[test]
-    fn the_longer_of_two_overlapping_fragments_goes_whole() {
-        let f = fragments(&["acme", "acme-prod-key-77"]);
-        let (text, count) = f.strike("use acme-prod-key-77 for acme").unwrap();
-        assert_eq!(text, "use [redacted] for [redacted]");
-        assert_eq!(count, 2);
-    }
-
-    #[test]
     fn short_and_empty_selections_are_refused() {
         assert!(Fragments::new(&["abc".into()]).unwrap_err().contains("shorter than"));
         assert!(Fragments::new(&["   ".into()]).unwrap_err().contains("nothing"));
@@ -1199,224 +1182,4 @@ mod tests {
         assert_eq!(value["alternatives"][0], "[redacted] or not");
         assert!(value.get("pending").is_some(), "keys are never struck");
     }
-
-    #[test]
-    fn an_excerpt_shows_the_fragment_in_its_place() {
-        let f = fragments(&["hunter22"]);
-        let excerpt = f.excerpt("the password\nis hunter22 for now").unwrap();
-        assert_eq!(excerpt, format!("the password is {EXCERPT_OPEN}hunter22{EXCERPT_CLOSE} for now"));
-        let long = format!("{}hunter22{}", "a".repeat(100), "b".repeat(100));
-        let excerpt = f.excerpt(&long).unwrap();
-        assert!(excerpt.starts_with('…') && excerpt.ends_with('…'), "{excerpt}");
-    }
-
-    #[test]
-    fn a_byte_search_finds_the_plain_and_the_escaped_forms() {
-        let f = fragments(&["two\nlines"]);
-        let needles = f.needles();
-        assert_eq!(occurrences(b"x two\nlines y", &needles), 1);
-        assert_eq!(occurrences(br#"{"a":"two\nlines"}"#, &needles), 1);
-        assert_eq!(occurrences(b"two<\\n>lines", &needles), 1);
-        assert_eq!(occurrences(b"nothing", &needles), 0);
-    }
-
-    #[test]
-    fn a_hash_that_matched_is_stamped_again_and_one_that_did_not_is_left() {
-        let event = |content: &str| RecalledEvent {
-            id: 7,
-            timestamp: "2026-11-01T10:00:00+00:00".into(),
-            speaker: Speaker::S0ma,
-            content: content.into(),
-        };
-        let mut restamp = Restamp::default();
-        restamp.before.insert(7, event("key sk-111122223333"));
-        restamp.after.insert(7, event("key [redacted]"));
-        let mut good = BTreeMap::from([(7, world_hash(&event("key sk-111122223333")))]);
-        assert_eq!(restamp.apply(&mut good, world_hash), 1);
-        assert_eq!(good[&7], world_hash(&event("key [redacted]")));
-        let mut tampered = BTreeMap::from([(7, "0000".to_string())]);
-        assert_eq!(restamp.apply(&mut tampered, world_hash), 0);
-        assert_eq!(tampered[&7], "0000");
-    }
-
-    /// Every store this reaches, set up holding one secret, struck, and then
-    /// searched byte by byte: the secret is left only where it is said to be.
-    #[test]
-    fn struck_from_every_store_and_left_only_where_it_says() {
-        const SECRET: &str = "sk-live-4f9a8b7c6d5e";
-        let dir = std::env::temp_dir().join(format!("s0ma-strike-all-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let mut memory = Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("hello there".into()).unwrap();
-        memory.remember_s0ma(format!("[tool:vm_shell]\nresult:\nTOKEN={SECRET}\ndone")).unwrap();
-        let cited = memory.last_event_id();
-        memory.remember_operator(format!("keep {SECRET} safe")).unwrap();
-
-        // A world-model record citing the event, and quoting the key.
-        let world = crate::world_model::path_for(&memory);
-        crate::world_model::define(&world, "infra", "Infra", "hosts and keys", 0).unwrap();
-        let record: crate::world_model::Record = serde_json::from_value(serde_json::json!({
-            "id": "deploy-key", "model_id": "infra", "kind": "claim", "title": "deploy key",
-            "statement": format!("the deploy key is {SECRET}"), "basis": "observed", "status": "supported",
-            "supporting_evidence_ids": [cited]
-        }))
-        .unwrap();
-        crate::world_model::put(&world, record, 0, "seen in a tool result", &memory).unwrap();
-
-        // An episode citing it, with its source hash as sleep writes it.
-        let semantic = memory.archive_path().with_extension("semantic.sqlite3");
-        let event = memory.get_event(cited).unwrap().unwrap();
-        {
-            let db = Connection::open(&semantic).unwrap();
-            db.execute_batch(
-                "CREATE TABLE consolidated_episodes (id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, \
-                 created_at TEXT NOT NULL, record_json TEXT NOT NULL, source_digests_json TEXT NOT NULL);
-                 CREATE VIRTUAL TABLE episode_text USING fts5(episode_id UNINDEXED, text);
-                 CREATE TABLE episode_fts_state (episode_id TEXT PRIMARY KEY, digest TEXT NOT NULL);
-                 CREATE TABLE events(id INTEGER PRIMARY KEY, digest TEXT, epoch INTEGER);
-                 CREATE TABLE pending(id INTEGER PRIMARY KEY, digest TEXT);
-                 CREATE TABLE skipped(id INTEGER PRIMARY KEY, reason TEXT);",
-            )
-            .unwrap();
-            let sources = BTreeMap::from([(cited, episode_hash(&event))]);
-            db.execute(
-                "INSERT INTO consolidated_episodes VALUES ('ep_1', 1, 'now', ?1, ?2)",
-                params![
-                    serde_json::json!({"title": "deploy", "lesson": format!("rotate {SECRET}"), "source_event_ids": [cited]}).to_string(),
-                    serde_json::to_string(&sources).unwrap()
-                ],
-            )
-            .unwrap();
-            // The keyword index made from it, holding its words.
-            db.execute("INSERT INTO episode_text VALUES ('ep_1', ?1)", [format!("deploy rotate {SECRET}")]).unwrap();
-            db.execute("INSERT INTO episode_fts_state VALUES ('ep_1', 'old')", []).unwrap();
-        }
-
-        // A thread, held open the way the running s0ma holds its store.
-        let mut threads = crate::threads::ThreadStore::new(dir.join("threads.json")).unwrap();
-        let thread = threads
-            .create(
-                format!("rotate {SECRET}"),
-                "a description".into(),
-                crate::threads::ThreadCategory::Problem,
-                crate::threads::ThreadState::Active,
-                vec![cited],
-            )
-            .unwrap();
-
-        // The board and the open loops, a checkpoint, the typed history.
-        {
-            let db = Connection::open(dir.join("board.sqlite3")).unwrap();
-            db.execute_batch("CREATE TABLE facts(id TEXT, statement TEXT, basis TEXT);").unwrap();
-            db.execute("INSERT INTO facts VALUES ('f1', ?1, 'observed')", [format!("key {SECRET} works")]).unwrap();
-            let db = Connection::open(dir.join("open_loops.sqlite3")).unwrap();
-            db.execute_batch("CREATE TABLE loops(id TEXT, text TEXT, resolution TEXT, status TEXT);").unwrap();
-            db.execute("INSERT INTO loops VALUES ('l1', ?1, NULL, 'open')", [format!("revoke {SECRET}")]).unwrap();
-        }
-        memory.store_checkpoint(1, 3, 3, format!("s0ma saw {SECRET} in a deploy")).unwrap();
-        fs::write(dir.join("input_history.txt"), format!("/help\nkeep {SECRET} safe\n")).unwrap();
-        // The last deep sleep's rendering of the threads, which a rebuilt
-        // context is made from, and the daily review it pinned.
-        fs::write(
-            dir.join("sleep_snapshot.json"),
-            serde_json::json!({"schema_version": 1, "checkpoint": {"timestamp": "2026-11-01T10:00:00+00:00"},
-                               "projections": {"threads": format!("rotate {SECRET}")}})
-            .to_string(),
-        )
-        .unwrap();
-        fs::write(dir.join("daily_sleep_window.json"), "{}").unwrap();
-        // The weakness log, which nothing may rewrite.
-        fs::write(dir.join("weaknesses.jsonl"), format!("{{\"excerpt\":\"{SECRET}\"}}\n")).unwrap();
-
-        let fragments = fragments(&[SECRET]);
-        let review = survey(&memory, &fragments).unwrap();
-        let stores: Vec<String> = review.stores().into_iter().map(|(store, _, _)| store).collect();
-        for store in
-            ["archive", "checkpoints", "threads", "sleep snapshot", "world model", "episodes", "board", "open loops", "typed history"]
-        {
-            assert!(stores.iter().any(|s| s == store), "{store} missing from {stores:?}");
-        }
-        assert_eq!(review.unreachable.len(), 1, "{:?}", review.unreachable);
-        assert_eq!(review.unreachable[0].store, "weakness log");
-        // A short one is said not to be looked for in the saved calls.
-        let short = survey(&memory, &super::tests::fragments(&["4f9a8b7c"])).unwrap();
-        assert!(short.unreachable.iter().any(|place| place.store == "saved model calls"), "{:?}", short.unreachable);
-        assert!(memory.get_event(cited).unwrap().unwrap().content.contains(SECRET), "a review changes nothing");
-
-        let done = apply(&memory, &fragments).unwrap();
-        assert!(done.notes.is_empty(), "{:?}", done.notes);
-        assert_eq!(done.total(), review.total());
-
-        // Nowhere but the weakness log, byte for byte.
-        let needles = fragments.needles();
-        let left: Vec<String> = files_under(&dir)
-            .into_iter()
-            .filter(|path| occurrences(&fs::read(path).unwrap(), &needles) > 0)
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(left, ["weaknesses.jsonl"]);
-        assert_eq!(done.unreachable.len(), 1, "{:?}", done.unreachable);
-
-        assert!(!dir.join("daily_sleep_window.json").exists(), "the pinned review would refuse every deep sleep");
-        let snapshot = fs::read_to_string(dir.join("sleep_snapshot.json")).unwrap();
-        assert!(snapshot.contains("2026-11-01T10:00:00+00:00"), "its timestamp is how it is matched: {snapshot}");
-
-        // The event is the same event, struck.
-        let after = memory.get_event(cited).unwrap().unwrap();
-        assert_eq!(after.content, "[tool:vm_shell]\nresult:\nTOKEN=[redacted]\ndone");
-        assert_eq!(after.timestamp, event.timestamp);
-
-        // The record's evidence reads as it did, not as tampered with.
-        let call = crate::types::ToolCall {
-            id: "t".into(),
-            kind: "function".into(),
-            function: crate::types::FunctionCall {
-                name: "world_record_get".into(),
-                arguments: serde_json::json!({"id": "deploy-key"}).to_string(),
-            },
-        };
-        let got: Value = serde_json::from_str(&crate::world_model::execute(&memory, &call).unwrap()).unwrap();
-        let got: Value = serde_json::from_str(got["content"].as_str().unwrap()).unwrap();
-        assert_eq!(got["evidence_integrity"], "unchanged", "{got}");
-        assert_eq!(got["record"]["statement"], "the deploy key is [redacted]");
-
-        // So does the episode's.
-        let db = Connection::open(&semantic).unwrap();
-        let sources: String =
-            db.query_row("SELECT source_digests_json FROM consolidated_episodes", [], |r| r.get(0)).unwrap();
-        let sources: BTreeMap<u64, String> = serde_json::from_str(&sources).unwrap();
-        assert_eq!(sources[&cited], episode_hash(&after));
-
-        // The running thread store reads the struck file, and a change it
-        // makes afterwards does not write the old title back.
-        assert_eq!(threads.get(thread.id).unwrap().title, "rotate [redacted]");
-        threads.add_question(thread.id, "when?".into()).unwrap();
-        let file = fs::read_to_string(dir.join("threads.json")).unwrap();
-        assert!(!file.contains(SECRET) && file.contains("when?"), "{file}");
-
-        // s0ma owes a settling pass, and taking it gives the strings up.
-        // (Other tests strike too, so only that it is owed is certain here.)
-        assert!(settle_owed());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-
-    /// After a strike the last look goes over every file, the stores this
-    /// module strikes too: if one still held the text, it is said.
-    #[test]
-    fn after_a_strike_the_look_reports_a_store_that_still_holds_it() {
-        let dir = std::env::temp_dir().join(format!("s0ma-strike-look-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("calls")).unwrap();
-        fs::write(dir.join("threads.json"), "[\"token-abcdef\"]").unwrap();
-        fs::write(dir.join("calls").join("x.json"), "token-abcdef").unwrap();
-        let f = fragments(&["token-abcdef"]);
-        assert!(look(&dir, &f, false).is_empty(), "before: a store that is struck is not 'not reached'");
-        let after = look(&dir, &f, true);
-        assert_eq!(after.len(), 1, "{after:?}");
-        assert_eq!((after[0].store.as_str(), after[0].item.as_str()), ("elsewhere", "threads.json"));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
 }

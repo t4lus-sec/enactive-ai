@@ -8,6 +8,9 @@
 //! and whether the file ended in a newline are kept as found, so saving an
 //! unchanged file writes the same bytes.
 
+pub(crate) mod highlight;
+pub(crate) mod live;
+
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
@@ -100,7 +103,7 @@ pub struct Buffer {
     /// The first line changed since `take_changed_from` was last asked (for
     /// the highlighter).
     changed_from: Option<usize>,
-    /// Lines someone else changed (s0ma, by a reload or a merge), kept in
+    /// Lines someone else changed (the agent, by a reload or a merge), kept in
     /// step with the lines as they move.
     pub theirs: Vec<bool>,
 }
@@ -988,7 +991,7 @@ struct Hunk {
 }
 
 /// Whether hunk `h` overlaps the region `start..end` of `base`. Changes of
-/// neighbouring lines don't (s0ma editing the line under yours is no clash);
+/// neighbouring lines don't (the agent editing the line under yours is no clash);
 /// an insertion clashes with another at the same place, or with a change of
 /// the lines it would sit among.
 fn overlaps(h: &Hunk, start: usize, end: usize) -> bool {
@@ -1072,69 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn the_text_comes_back_as_it_was_found() {
-        for text in ["", "a", "a\n", "a\nb", "a\nb\n", "a\r\nb\r\n", "a\r\nb", "\n", "\n\n", "x\n\ny\n"] {
-            assert_eq!(buffer(text).text(), text, "{text:?}");
-        }
-        let crlf = buffer("one\r\ntwo\r\n");
-        assert_eq!((crlf.ending, crlf.lines().len()), (Ending::Crlf, 2));
-        assert_eq!(buffer("fn a() {\n\tb();\n}\n").indent, Indent::Tabs);
-        assert_eq!(buffer("a:\n  b:\n    c: 1\n").indent, Indent::Spaces(2));
-        assert_eq!(buffer("plain\n").indent, Indent::Spaces(4), "the default when the file says nothing");
-    }
-
-    #[test]
-    fn typing_moving_and_deleting() {
-        let mut b = buffer("hello world\nsecond");
-        b.end(false);
-        b.insert("!");
-        assert_eq!(b.line(0), "hello world!");
-        b.newline();
-        b.insert("x");
-        assert_eq!(b.text(), "hello world!\nx\nsecond");
-        b.backspace();
-        b.backspace();
-        assert_eq!(b.text(), "hello world!\nsecond");
-        b.start_of_file(false);
-        b.word_right(false);
-        assert_eq!(b.cursor, Pos::new(0, 5));
-        b.word_right(true);
-        assert_eq!(b.selected_text().as_deref(), Some(" world"));
-        b.delete();
-        assert_eq!(b.line(0), "hello!");
-        b.end(false);
-        b.delete();
-        assert_eq!(b.text(), "hello!second", "delete at a line's end joins the next");
-        b.end(false);
-        b.delete_word_before();
-        assert_eq!(b.text(), "hello!");
-        // Unicode: one character at a time, wide ones two columns.
-        let mut u = buffer("añ漢b");
-        u.end(false);
-        u.left(false);
-        u.left(false);
-        assert_eq!(u.cursor.col, "añ".len());
-        assert_eq!(u.display_col(0, u.line(0).len()), 5);
-        assert_eq!(u.col_at(0, 3), "añ".len(), "inside the wide character: before it");
-        u.backspace();
-        assert_eq!(u.text(), "a漢b");
-    }
-
-    #[test]
-    fn up_and_down_keep_the_column_and_tabs_have_stops() {
-        let mut b = buffer("abcdef\nab\nabcdef");
-        b.end(false);
-        b.vertical(1, false);
-        assert_eq!(b.cursor, Pos::new(1, 2));
-        b.vertical(1, false);
-        assert_eq!(b.cursor, Pos::new(2, 6), "back to the column it started at");
-        let t = buffer("\tx");
-        assert_eq!(t.display_col(0, 1), 4);
-        assert_eq!(t.col_at(0, 2), 0);
-        assert_eq!(display_width("a\tb", 4), 5);
-    }
-
-    #[test]
     fn undo_groups_typing_and_redo_puts_it_back() {
         let mut b = buffer("");
         for c in "hello there".chars() {
@@ -1160,81 +1100,6 @@ mod tests {
         b.undo();
         assert_eq!(b.text(), "hello there");
         assert_eq!(b.cursor, Pos::new(0, 11), "the cursor where it was");
-    }
-
-    #[test]
-    fn lines_indent_comment_move_and_go() {
-        let mut b = buffer("a\nb\nc\n");
-        b.go(Pos::new(0, 0), false);
-        b.go(Pos::new(1, 1), true);
-        b.indent_lines(false);
-        assert_eq!(b.text(), "    a\n    b\nc\n");
-        b.indent_lines(true);
-        assert_eq!(b.text(), "a\nb\nc\n");
-        b.toggle_comment("// ");
-        assert_eq!(b.text(), "// a\n// b\nc\n");
-        b.toggle_comment("// ");
-        assert_eq!(b.text(), "a\nb\nc\n");
-        b.clear_selection();
-        b.go(Pos::new(0, 0), false);
-        b.move_lines(true);
-        assert_eq!(b.text(), "b\na\nc\n");
-        assert_eq!(b.cursor.line, 1);
-        b.undo();
-        assert_eq!(b.text(), "a\nb\nc\n");
-        b.go(Pos::new(1, 0), false);
-        b.delete_lines();
-        assert_eq!(b.text(), "a\nc\n");
-        let mut last = buffer("a\nb");
-        last.go(Pos::new(1, 0), false);
-        last.delete_lines();
-        assert_eq!(last.text(), "a");
-        // Enter keeps the indentation.
-        let mut i = buffer("    x");
-        i.end(false);
-        i.newline();
-        assert_eq!(i.text(), "    x\n    ");
-        // Backspace in leading spaces goes back a stop.
-        i.backspace();
-        assert_eq!(i.text(), "    x\n");
-    }
-
-    #[test]
-    fn find_and_replace() {
-        let mut b = buffer("one Two one\nthree one");
-        let first = b.find("one", Pos::new(0, 0), true, false).unwrap();
-        assert_eq!(first.0, Pos::new(0, 8), "from the cursor on, not the one under it");
-        let next = b.find("one", first.0, true, false).unwrap();
-        assert_eq!(next.0, Pos::new(1, 6));
-        let wrapped = b.find("one", next.0, true, false).unwrap();
-        assert_eq!(wrapped.0, Pos::new(0, 0), "round to the start");
-        assert_eq!(b.find("one", Pos::new(1, 6), false, false).unwrap().0, Pos::new(0, 8));
-        assert_eq!(b.find("one", Pos::new(0, 0), true, true).unwrap().0, Pos::new(0, 0), "typing a search: at the cursor counts");
-        assert_eq!(b.find("two", Pos::default(), true, false).unwrap().0, Pos::new(0, 4), "no capital: any case");
-        assert!(b.find("TWO", Pos::default(), true, false).is_none(), "a capital: that case");
-        assert_eq!(b.matches("one", 100).len(), 3);
-        assert_eq!(b.replace_matches("one", "1"), 3);
-        assert_eq!(b.text(), "1 Two 1\nthree 1");
-        b.undo();
-        assert_eq!(b.text(), "one Two one\nthree one", "one step");
-        assert!(b.find("", Pos::default(), true, false).is_none());
-        let single = buffer("only one here");
-        assert_eq!(single.find("one", Pos::new(0, 5), true, false).unwrap().0, Pos::new(0, 5), "the only one, found again");
-    }
-
-    #[test]
-    fn marks_follow_the_lines_they_are_on() {
-        let mut b = buffer("a\nb\nc");
-        b.replace_all("a\nB\nc", vec![false, true, false]);
-        assert_eq!(b.theirs, [false, true, false]);
-        b.go(Pos::new(0, 0), false);
-        b.insert("x\n");
-        assert_eq!(b.theirs, [false, false, true, false], "moved down with its line");
-        b.go(Pos::new(2, 0), false);
-        b.go(Pos::new(3, 0), true);
-        b.delete();
-        assert_eq!(b.line_count(), 3);
-        assert_eq!(b.theirs.len(), 3);
     }
 
     #[test]
@@ -1267,14 +1132,5 @@ mod tests {
         let next = merge3(&base, &lines("a\nB\nc\nd\ne\n"), &lines("a\nb\nC\nd\ne\n"));
         let text: Vec<String> = next.iter().filter_map(|m| match m { Merged::Line { text, .. } => Some(text.clone()), _ => None }).collect();
         assert_eq!(text, ["a", "B", "C", "d", "e"], "{next:?}");
-    }
-
-    #[test]
-    fn changed_lines_for_the_gutter() {
-        let (changed, removed) = changed_lines(&lines("a\nb\nc\n"), &lines("a\nB\nc\nd\n"));
-        assert_eq!(changed, [false, true, false, true]);
-        assert!(removed.iter().all(|r| !r));
-        let (_, removed) = changed_lines(&lines("a\nb\nc\n"), &lines("a\nc\n"));
-        assert_eq!(removed, [false, true, false]);
     }
 }

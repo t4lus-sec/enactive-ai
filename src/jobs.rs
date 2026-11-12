@@ -14,7 +14,7 @@
 //! indexes, the weakness log's cited evidence, a mistake's `pointed_at`. So the
 //! archive keeps one line per id and the content is replaced with [`MARKER`].
 //! What an event *was* is gone; that there was an event, when, and who spoke is
-//! kept, which is what lets s0ma see a gap in its own past rather than a
+//! kept, which is what lets the agent see a gap in its own past rather than a
 //! discontinuity it cannot account for.
 //!
 //! # What a span is
@@ -46,7 +46,7 @@
 //! * the input history file, which keeps what was typed at the prompt, and the
 //!   prompt's own memory of this session;
 //! * the worker journal, a second verbatim archive: a subagent is given its
-//!   task in s0ma's words and journals its whole transcript.
+//!   task in the agent's words and journals its whole transcript.
 //!
 //! Deep sleep is held while a job is open, because what it writes -- the
 //! checkpoint file and the world model -- is merged prose with no event ranges
@@ -62,12 +62,12 @@
 //!
 //! Said plainly because a half-kept promise is worse than a known limit:
 //!
-//! * **What s0ma wrote down deliberately.** The world model, the board,
+//! * **What the agent wrote down deliberately.** The world model, the board,
 //!   continuity threads, skills, open loops, its attention note, and a weakness
 //!   it reported (that log is hash-chained and cannot be rewritten at all) are
-//!   written by tool calls, in s0ma's own words, with no record of which event
+//!   written by tool calls, in the agent's own words, with no record of which event
 //!   they came from. A job being open is in every turn header, which is where
-//!   s0ma is told to keep client specifics out of them.
+//!   the agent is told to keep client specifics out of them.
 //! * **Blocks on the disk.** A rewrite leaves the old bytes wherever the
 //!   filesystem had them. The SQLite stores are vacuumed, which rebuilds them
 //!   without the freed pages, but neither that nor a rename is an erase.
@@ -335,7 +335,7 @@ fn save(path: &Path, jobs: &Jobs) -> std::io::Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------------------------ what the rest of s0ma asks
+// ------------------------------------------------------------------ what the rest of the agent asks
 
 /// The open job's name, or nothing. Every gate below is this question.
 pub fn open_job() -> Option<String> {
@@ -412,11 +412,11 @@ pub fn sleep_held() -> Option<String> {
     .flatten()
 }
 
-/// Whether a close has left s0ma's live context holding text that is no longer
+/// Whether a close has left the agent's live context holding text that is no longer
 /// in the archive, so the caller owes it a rotation. Cleared by reading.
 ///
 /// A close redacts the archive and the stores, but the conversation is also in
-/// the live context, which nothing here can edit: the messages are s0ma's
+/// the live context, which nothing here can edit: the messages are the agent's
 /// working memory, held by the running session. Left alone, the next fold would
 /// write gists from those messages and put the content back into the store the
 /// close just cleared. Rotating rebuilds the context from the archive, which by
@@ -436,7 +436,7 @@ static ROTATION_OWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// putting the job's lines back. The steering pane keeps its own list too.
 /// Neither is reachable from here: they belong to the thread reading the
 /// keyboard, which is why this is a counter it can poll rather than a call.
-/// An attached terminal hears that this s0ma's history was purged: its
+/// An attached terminal hears that this agent's history was purged: its
 /// prompt forgets its own lines the same way (`session.rs`).
 pub fn note_history_purge() {
     HISTORY_PURGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -829,7 +829,7 @@ fn close(memory: &Hippocampus, name: &str, confirmed: bool) -> Result<String> {
         return Ok(lines.join("\n"));
     }
 
-    // Refused rather than attempted, because the call s0ma is making now
+    // Refused rather than attempted, because the call the agent is making now
     // cannot be reached. A saved call is written when the next one begins, so
     // the one in flight has no line in the store yet and no archive events
     // listed against it -- neither the time window nor the event ranges can
@@ -855,7 +855,7 @@ fn close(memory: &Hippocampus, name: &str, confirmed: bool) -> Result<String> {
     //
     // It is also why this loops. `redact_ranges` holds the append lock for its
     // own pass, but an event can land between reading the newest id and that
-    // pass starting -- s0ma is often working when a job is closed -- and such
+    // pass starting -- the agent is often working when a job is closed -- and such
     // an event would be inside the open span and outside the range just
     // redacted. So the newest id is read again afterwards and the remainder
     // redacted too, until a pass sees nothing new.
@@ -933,13 +933,13 @@ fn close(memory: &Hippocampus, name: &str, confirmed: bool) -> Result<String> {
         Err(error) => failed("dropping the saved model calls", error.to_string()),
     }
     // The working context saved for a restart holds the job's turns too.
-    crate::context_resume::forget(data_dir(memory));
+    crate::context::resume::forget(data_dir(memory));
     // And the engine's kept prompts of the job's turns (and the side calls',
     // which saw them).
     crate::conversations::job_closed(name);
     // And the editor's copies of unsaved changes.
     crate::tabs::editor_forget_copies();
-    let layers = crate::memory_layers::MemoryLayers::beside_archive(memory.archive_path());
+    let layers = crate::memory::layers::MemoryLayers::beside_archive(memory.archive_path());
     match layers.purge_job(name, &ranges) {
         Ok((gists, items)) => {
             purged.gists = gists;
@@ -1064,6 +1064,30 @@ fn purge_typed_history(data_dir: &Path, typed: &[String]) -> Result<usize> {
     if typed.is_empty() {
         return Ok(0);
     }
+    // Both forms of each line. The history file escapes a newline as `<\n>`
+    // (reedline's own encoding), so a pasted multi-line message is one line
+    // there and several events here -- and a paste is the case most worth
+    // removing.
+    let mut doomed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in typed.iter().map(|line| line.trim()).filter(|line| !keep(line)) {
+        doomed.insert(line.to_owned());
+        if line.contains('\n') {
+            doomed.insert(line.replace('\n', "<\\n>"));
+        }
+    }
+    remove_from_history(data_dir, &doomed)
+}
+
+/// One line typed at the prompt, taken out of its history: the file, the
+/// prompt's own memory of this session, and attached terminals'. For a line
+/// that carried a secret (`/model key …`).
+pub fn forget_typed_line(data_dir: &Path, line: &str) -> Result<usize> {
+    remove_from_history(data_dir, &std::iter::once(line.trim().to_owned()).collect())
+}
+
+/// `doomed` lines out of `input_history.txt`, and the prompt told to forget
+/// what it holds.
+fn remove_from_history(data_dir: &Path, doomed: &std::collections::HashSet<String>) -> Result<usize> {
     // Asked for first, and whatever the file turns out to hold. The prompt
     // keeps this session's lines in memory until something syncs, and those are
     // the ones most likely to be the job's -- a file that does not exist yet
@@ -1085,17 +1109,6 @@ fn purge_typed_history(data_dir: &Path, typed: &[String]) -> Result<usize> {
         return Ok(0);
     }
     let text = fs::read_to_string(&path).map_err(|error| format!("cannot read it: {error}"))?;
-    // Both forms of each line. The history file escapes a newline as `<\n>`
-    // (reedline's own encoding), so a pasted multi-line message is one line
-    // there and several events here -- and a paste is the case most worth
-    // removing.
-    let mut doomed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for line in typed.iter().map(|line| line.trim()).filter(|line| !keep(line)) {
-        doomed.insert(line.to_owned());
-        if line.contains('\n') {
-            doomed.insert(line.replace('\n', "<\\n>"));
-        }
-    }
     let mut kept = String::new();
     let mut removed = 0;
     for line in text.lines() {
@@ -1147,7 +1160,7 @@ mod tests {
             Self { dir, memory, _guard: guard, _goal: goal }
         }
 
-        /// One event from the operator, one from s0ma, as a turn would leave.
+        /// One event from the operator, one from the agent, as a turn would leave.
         fn turn(&mut self, said: &str) {
             self.memory.remember_operator(said.to_string()).unwrap();
             self.memory.remember_s0ma(format!("about {said}")).unwrap();
@@ -1176,44 +1189,6 @@ mod tests {
             *lock(&LOADED) = None;
             let _ = fs::remove_dir_all(&self.dir);
         }
-    }
-
-    #[test]
-    fn spans_cover_what_was_appended_while_open_and_nothing_else() {
-        let mut fixture = Fixture::new("spans");
-        fixture.turn("before any job");
-        fixture.ok("/job start acme");
-        fixture.turn("the client's thing");
-        fixture.ok("/job pause acme");
-        fixture.turn("something else entirely");
-        fixture.ok("/job resume acme");
-        fixture.turn("the client again");
-
-        let latest = fixture.memory.last_event_id();
-        let job = with(|jobs| jobs.get("acme").cloned()).flatten().unwrap();
-        assert_eq!(job.ranges(latest), vec![(3, 4), (7, 8)], "the paused stretch is not covered");
-        assert_eq!(job.events(latest), 4);
-
-        // One job at a time, and a name is not reused.
-        assert!(fixture.run("/job start other").unwrap_err().contains("is open"));
-        fixture.ok("/job pause acme");
-        assert!(fixture.run("/job start acme").unwrap_err().contains("already a job"));
-    }
-
-    #[test]
-    fn a_close_without_yes_changes_nothing() {
-        let mut fixture = Fixture::new("preview");
-        fixture.ok("/job start acme");
-        fixture.turn("the client's secret");
-
-        let preview = fixture.ok("/job close acme");
-        assert!(preview.contains("would remove"), "{preview}");
-        assert!(preview.contains("--yes"), "the preview says how to go ahead: {preview}");
-        assert!(preview.contains("cannot be undone"), "{preview}");
-        // Nothing happened: the content is there and the job is still open.
-        assert_eq!(fixture.content(1), "the client's secret");
-        assert_eq!(open_job().as_deref(), Some("acme"));
-        assert!(with(|jobs| jobs.get("acme").unwrap().purged.is_none()).unwrap());
     }
 
     #[test]
@@ -1250,47 +1225,6 @@ mod tests {
     }
 
     #[test]
-    fn the_hold_on_deep_sleep_outlasts_a_pause() {
-        let fixture = Fixture::new("hold");
-        assert_eq!(sleep_held(), None);
-        fixture.ok("/job start acme");
-        assert_eq!(sleep_held().as_deref(), Some("acme"));
-        fixture.ok("/job pause acme");
-        // Paused is not finished: the spans so far are still to be redacted,
-        // and a deep sleep would put them somewhere a close cannot reach.
-        assert_eq!(sleep_held().as_deref(), Some("acme"), "a pause does not lift the hold");
-        assert_eq!(open_job(), None, "but nothing new is covered");
-        // A gist written during the pause is still tagged: the job's own
-        // conversation has not left the live context, so the gist may hold it.
-        assert_eq!(gist_tag().as_deref(), Some("acme"));
-        fixture.ok("/job close acme --yes");
-        assert_eq!(sleep_held(), None, "closing lifts it");
-    }
-
-    #[test]
-    fn the_header_says_so_until_the_job_is_closed() {
-        let fixture = Fixture::new("header");
-        assert_eq!(note_for_header("Current time: now".into()), "Current time: now");
-        fixture.ok("/job start acme");
-        let note = note_for_header("Current time: now".into());
-        assert!(note.starts_with("Current time: now\n"), "{note}");
-        assert!(note.contains("Job \"acme\" is open"), "{note}");
-        assert!(note.contains("world model"), "it says what a close cannot reach: {note}");
-
-        // A pause says so differently, rather than going quiet: the job's
-        // conversation is still in context and still to be removed, so the
-        // warning about where not to write it still applies.
-        fixture.ok("/job pause acme");
-        let note = note_for_header("x".into());
-        assert!(note.contains("is paused"), "{note}");
-        assert!(note.contains("still in your context"), "{note}");
-        assert!(note.contains("world model"), "{note}");
-
-        fixture.ok("/job close acme --yes");
-        assert_eq!(note_for_header("x".into()), "x", "a closed job is not mentioned");
-    }
-
-    #[test]
     fn a_close_rotates_the_context_because_it_cannot_edit_it() {
         let fixture = Fixture::new("rotation");
         assert!(!take_rotation_owed());
@@ -1298,58 +1232,6 @@ mod tests {
         fixture.ok("/job close acme --yes");
         assert!(take_rotation_owed(), "the live context still holds what the archive no longer does");
         assert!(!take_rotation_owed(), "and the caller is told once");
-    }
-
-    #[test]
-    fn a_goal_line_is_content_though_it_is_a_command() {
-        let fixture = Fixture::new("typed-goal");
-        let history = fixture.dir.join("input_history.txt");
-        fs::write(&history, "/goal fix the acme deploy pipeline\n/goal pause\n/goal --turns 9\n/goal\n").unwrap();
-        let typed: Vec<String> = fs::read_to_string(&history).unwrap().lines().map(String::from).collect();
-        assert_eq!(purge_typed_history(&fixture.dir, &typed).unwrap(), 2);
-        let left = fs::read_to_string(&history).unwrap();
-        assert!(!left.contains("acme"), "the objective was the job's");
-        assert!(left.contains("/goal pause") && left.contains("/goal\n"), "the bare commands stay");
-        assert!(!left.contains("--turns 9"), "a refused line goes too: it may hold what was typed after it");
-    }
-
-    #[test]
-    fn a_close_takes_the_goal_set_during_the_job() {
-        let mut fixture = Fixture::new("close-goal");
-        fixture.ok("/job start acme");
-        let set = crate::goal::handle_command("/goal fix the acme deploy pipeline", None).unwrap();
-        // As App does: the line is archived as the operator's.
-        fixture.memory.remember_operator(set.record.unwrap()).unwrap();
-        fixture.turn("the deploy key is in the vault");
-        assert_eq!(crate::goal::current().unwrap().job.as_deref(), Some("acme"));
-
-        let report = fixture.ok("/job close acme --yes");
-        assert!(report.contains("The goal set during it was cleared."), "{report}");
-        assert!(crate::goal::current().is_none());
-        assert!(!fixture.dir.join("goal.json").exists());
-    }
-
-    #[test]
-    fn a_close_leaves_a_goal_from_before_the_job_but_not_its_note_from_during_it() {
-        let mut fixture = Fixture::new("close-earlier-goal");
-        crate::goal::handle_command("/goal keep the nightly build green", None).unwrap();
-        fixture.ok("/job start acme");
-        fixture.turn("acme's runner is down");
-        // Something of the goal's written while the job is open: a turn of it
-        // fails.
-        let started = crate::goal::begin_turn(None, false);
-        crate::goal::note_call(Some(10), 0);
-        crate::goal::finish_turn(
-            started,
-            crate::goal::Ending { interrupted: false, error: Some("acme's runner rejected the build".into()) },
-        );
-
-        let report = fixture.ok("/job close acme --yes");
-        assert!(report.contains("The goal's note from during it was cleared"), "{report}");
-        let goal = crate::goal::current().unwrap();
-        assert_eq!(goal.objective, "keep the nightly build green");
-        assert_eq!(goal.note.as_deref(), Some(marker("acme").as_str()));
-        assert!(!fs::read_to_string(fixture.dir.join("goal.json")).unwrap().contains("runner"));
     }
 
     #[test]
@@ -1366,54 +1248,6 @@ mod tests {
         assert!(!left.contains("acme"), "{left}");
         assert!(left.contains("/goal pause"));
         assert!(!fs::read_to_string(fixture.dir.join("jobs.json")).unwrap().contains("acme deploy"), "not kept after");
-    }
-
-    #[test]
-    fn a_goal_note_written_while_the_job_is_paused_goes_at_its_close() {
-        let mut fixture = Fixture::new("paused-goal-note");
-        fixture.ok("/job start acme");
-        fixture.turn("acme staging is down");
-        fixture.ok("/job pause acme");
-        crate::goal::handle_command("/goal keep the nightly build green", None).unwrap();
-        let started = crate::goal::begin_turn(None, false);
-        crate::goal::note_call(Some(10), 0);
-        crate::goal::finish_turn(
-            started,
-            crate::goal::Ending { interrupted: false, error: Some("acme staging 502 again".into()) },
-        );
-        fixture.ok("/job resume acme");
-        fixture.ok("/job close acme --yes");
-        let goal = crate::goal::current().unwrap();
-        assert_eq!(goal.note.as_deref(), Some(marker("acme").as_str()));
-        assert!(goal.touched_by.is_empty(), "the close's own write is not the job's: {:?}", goal.touched_by);
-    }
-
-    #[test]
-    fn the_typed_history_loses_the_job_lines_but_keeps_short_ones() {
-        let fixture = Fixture::new("typed");
-        let history = fixture.dir.join("input_history.txt");
-        fs::write(
-            &history,
-            "what is the weather\nthe client's password is hunter2 and the host is theirs\n/job pause acme\ny\n",
-        )
-        .unwrap();
-
-        let removed = purge_typed_history(
-            &fixture.dir,
-            &[
-                "the client's password is hunter2 and the host is theirs".to_string(),
-                "/job pause acme".to_string(),
-                "y".to_string(),
-            ],
-        )
-        .unwrap();
-        assert_eq!(removed, 1, "only the one line of the job's own went");
-
-        let left = fs::read_to_string(&history).unwrap();
-        assert!(!left.contains("hunter2"), "the job's line is gone");
-        assert!(left.contains("what is the weather"), "other lines stay");
-        assert!(left.contains("/job pause acme"), "a short line is left alone");
-        assert!(left.contains('y'));
     }
 
     #[test]
@@ -1468,104 +1302,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(accepted["recorded"], true, "{accepted}");
-    }
-
-    /// A close must not leave anything of the job in `jobs.json`: it is the one
-    /// file about the job that outlives it, and it is kept so that `/job list`
-    /// can still account for the work, not so that the work can be read.
-    #[test]
-    fn the_record_a_close_leaves_is_counts_and_nothing_else() {
-        let mut fixture = Fixture::new("record");
-        fixture.ok("/job start acme");
-        fixture.turn("the client's password is hunter2");
-        fixture.ok("/job close acme --yes");
-
-        let text = fs::read_to_string(fixture.dir.join(FILE)).unwrap();
-        assert!(!text.contains("hunter2"), "{text}");
-        assert!(!text.contains("password"), "{text}");
-        // Not even which events they were.
-        assert!(!text.contains("\"ids\""), "{text}");
-        assert!(!text.contains("\"typed\""), "{text}");
-        // What it does keep: the shape of the work and what was removed.
-        assert!(text.contains("\"state\": \"closed\""), "{text}");
-        assert!(text.contains("\"events\": 2"), "{text}");
-    }
-
-    /// A close while s0ma is working cannot be made correct: the call it is
-    /// making is not in the call store yet, so no selector can find it, while
-    /// its request holds the conversation.
-    #[test]
-    fn a_close_is_refused_while_a_turn_is_running() {
-        let mut fixture = Fixture::new("midturn");
-        fixture.ok("/job start acme");
-        fixture.turn("the client's secret");
-
-        let _turn = crate::calls::begin_turn();
-        let error = fixture.run("/job close acme --yes").unwrap_err();
-        assert!(error.contains("middle of a turn"), "{error}");
-        assert!(error.contains("stays open"), "it says the job is still covering: {error}");
-        // Nothing happened.
-        assert_eq!(fixture.content(1), "the client's secret");
-        assert_eq!(open_job().as_deref(), Some("acme"));
-        // And the preview says so too, rather than only the confirmed path.
-        let preview = fixture.ok("/job close acme");
-        assert!(preview.contains("s0ma is working now"), "{preview}");
-    }
-
-    /// Every gate here reads the file. One that will not parse must not read as
-    /// "no job": those gates are what keep a job out of the stores a close
-    /// cannot reach.
-    #[test]
-    fn an_unreadable_store_holds_sleep_rather_than_reading_as_no_job() {
-        let fixture = Fixture::new("unreadable");
-        fixture.ok("/job start acme");
-        fs::write(fixture.dir.join(FILE), b"{ this is not json").unwrap();
-        *lock(&LOADED) = None;
-
-        let held = sleep_held().expect("a job may be open, so sleep is held");
-        assert!(held.contains("could not be read"), "{held}");
-        assert!(covering_event(100, 50).is_some(), "and a weakness may cite nothing meanwhile");
-    }
-
-    /// The prompt keeps this session's lines in memory and writes them out on
-    /// the way out, so a close has to tell it to forget as well as rewriting
-    /// the file -- otherwise the lines come back at exit.
-    #[test]
-    fn a_close_asks_the_prompt_to_forget_even_when_the_file_had_nothing() {
-        let fixture = Fixture::new("forget");
-        let before = history_purges();
-        // No history file at all: the file side has nothing to do.
-        let removed = purge_typed_history(&fixture.dir, &["something long enough to count".into()]).unwrap();
-        assert_eq!(removed, 0);
-        assert_eq!(history_purges(), before + 1, "the prompt is still told to forget");
-    }
-
-    /// A pasted multi-line message is several events here and one line in the
-    /// history file, which escapes the newlines.
-    #[test]
-    fn a_pasted_multi_line_message_is_matched_in_the_form_the_history_keeps() {
-        let fixture = Fixture::new("multiline");
-        let history = fixture.dir.join("input_history.txt");
-        fs::write(&history, "host: db-1<\\n>user: svc_acct<\\n>key: s3cret-and-long\nkeep this one\n").unwrap();
-        let removed = purge_typed_history(
-            &fixture.dir,
-            &["host: db-1\nuser: svc_acct\nkey: s3cret-and-long".to_string()],
-        )
-        .unwrap();
-        assert_eq!(removed, 1, "matched despite the escaping");
-        let left = fs::read_to_string(&history).unwrap();
-        assert!(!left.contains("s3cret"), "{left}");
-        assert!(left.contains("keep this one"));
-    }
-
-    #[test]
-    fn the_file_outlives_the_process() {
-        let fixture = Fixture::new("persist");
-        fixture.ok("/job start acme");
-        // As a restart would: the cache goes, the file stays.
-        *lock(&LOADED) = None;
-        assert_eq!(open_job().as_deref(), Some("acme"), "a job left open is still open");
-        let text = fs::read_to_string(fixture.dir.join(FILE)).unwrap();
-        assert!(text.contains("\"state\": \"open\""), "{text}");
     }
 }

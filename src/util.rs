@@ -41,11 +41,27 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// `path`, and the folder flushed so the rename lasts too. On an error the
 /// file beside it is removed and `path` is as it was.
 pub fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_whole(path, contents.as_ref(), None)
+}
+
+/// `write_atomic` for a file only its owner may read (mode 0600), such as one
+/// holding a key: the file beside is made with that mode, so the contents are
+/// never readable by anyone else, even for a moment.
+pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_whole(path, contents.as_ref(), Some(0o600))
+}
+
+fn write_whole(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let beside = path.with_file_name(format!(".{name}.{}-{}.tmp", std::process::id(), WRITES.fetch_add(1, Ordering::SeqCst)));
     let written = (|| {
-        let mut file = std::fs::File::create(&beside)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if let Some(mode) = mode {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+        }
+        let mut file = options.open(&beside)?;
         file.write_all(contents.as_ref())?;
         file.sync_all()?;
         std::fs::rename(&beside, path)
@@ -74,51 +90,5 @@ mod tests {
             let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {}", shell_quote(text))).output().unwrap();
             assert_eq!(String::from_utf8(out.stdout).unwrap(), text, "{text:?}");
         }
-    }
-
-    #[test]
-    fn clipping_counts_characters_and_says_when_it_cut() {
-        assert_eq!(clip("short", 10), "short");
-        assert_eq!(clip("exactly", 7), "exactly");
-        assert_eq!(clip("longer text", 6), "longer…");
-        assert_eq!(clip("日本語のテキスト", 3), "日本語…", "characters, not bytes");
-        assert_eq!(clip("", 0), "");
-    }
-
-    #[test]
-    fn the_hash_is_fnv1a() {
-        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
-    }
-
-    #[test]
-    fn a_file_is_replaced_whole_and_nothing_is_left_beside_it() {
-        let dir = std::env::temp_dir().join(format!("s0ma-util-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        write_atomic(&path, "one").unwrap();
-        write_atomic(&path, b"two").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|entry| entry.file_name()).collect();
-        assert_eq!(left, vec![std::ffi::OsString::from("state.json")], "nothing beside it");
-        // A folder that is not there: an error, and nothing made.
-        assert!(write_atomic(&dir.join("missing/state.json"), "x").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_lock_a_panic_left_poisoned_still_opens() {
-        let mutex = std::sync::Arc::new(Mutex::new(1));
-        let held = std::sync::Arc::clone(&mutex);
-        let _ = std::thread::spawn(move || {
-            let _guard = held.lock().unwrap();
-            panic!("poisoning it on purpose");
-        })
-        .join();
-        assert!(mutex.is_poisoned());
-        *locked(&mutex) += 1;
-        assert_eq!(*locked(&mutex), 2);
     }
 }

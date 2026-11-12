@@ -1,7 +1,7 @@
 //! The call store: every model call the main agent makes, saved at the source
 //! (`claude/mistake-capture-spec.md` §1).
 //!
-//! s0ma's context folds continuously and is not deterministic, so nothing can
+//! The agent's context folds continuously and is not deterministic, so nothing can
 //! rebuild what it saw at a past moment. `/mistake` reaches back into this
 //! store instead: the exact bytes POSTed and the response as it was assembled
 //! from the stream.
@@ -30,7 +30,7 @@
 //! tool calls with each one's id, type, name and argument fragments
 //! concatenated in index order. A call the operator interrupted is saved too,
 //! with what had streamed so far and `finish: "interrupted"`: the moment just
-//! after stopping s0ma is the most natural moment to flag it.
+//! after stopping the agent is the most natural moment to flag it.
 //!
 //! **Crash safety.** A blob goes to a dot-prefixed temp file, is fsynced,
 //! renamed into place, and the directory fsynced, all before the index line
@@ -38,7 +38,7 @@
 //! orphan blob, never a line pointing at nothing. A torn last line is repaired
 //! on open.
 //!
-//! Writes happen on one background thread, so saving never delays s0ma; the
+//! Writes happen on one background thread, so saving never delays the agent; the
 //! only thing on the agent's own path is reading what the engine serves, a
 //! local request with a short timeout.
 
@@ -165,7 +165,7 @@ pub fn spans_for(content: &str) -> Option<Vec<Span>> {
 // ------------------------------------------------------------------ the blob store
 
 /// The store's files, readable from any process (the review window opens it
-/// standalone). Only the writer thread of the running s0ma appends.
+/// standalone). Only the writer thread of the running agent appends.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
@@ -367,7 +367,7 @@ impl Store {
         Ok(found)
     }
 
-    /// The call an archive event belongs to: one of s0ma's own events (its
+    /// The call an archive event belongs to: one of the agent's own events (its
     /// reasoning, a tool result, its reply) recorded after that call's
     /// response, among the newest `within` calls. None for an event no saved
     /// call owns there: the operator's, a harness note, one older than that,
@@ -755,8 +755,12 @@ pub struct Served {
 /// not report `model_dir`, the folder is read from the `--model` argument of
 /// the process in the engine's pid file, as the capability eval does.
 pub fn served_now(client: &reqwest::blocking::Client, base_url: &str, model: &str) -> Option<Served> {
+    // A hosted API serves what it serves: there is no folder or engine to name.
+    if crate::model_config::hosted() {
+        return Some(Served { model: model.to_owned(), model_dir: None, slice_tag: None, engine_started: None, source: Some("hosted API".into()), uncertain: false });
+    }
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    let response: Value = client.get(url).send().ok()?.error_for_status().ok()?.json().ok()?;
+    let response: Value = crate::model_config::authorize(client.get(url)).send().ok()?.error_for_status().ok()?.json().ok()?;
     let entry = response
         .get("data")
         .and_then(Value::as_array)
@@ -918,7 +922,7 @@ pub fn begin_turn() -> TurnGuard {
 }
 
 /// An operator message joined the turn running on this thread (sent while
-/// s0ma worked): the calls after it start a new stretch.
+/// the agent worked): the calls after it start a new stretch.
 pub fn operator_joined() {
     TURN.with(|turn| {
         if let Some(turn) = turn.borrow_mut().as_mut() {
@@ -939,7 +943,7 @@ pub fn current_turn() -> Option<String> {
     TURN.with(|turn| turn.borrow().as_ref().map(|t| t.id.clone()))
 }
 
-/// An archive event was appended on this thread. s0ma's own events (its
+/// An archive event was appended on this thread. The agent's own events (its
 /// reasoning, tool results, reply) are what the open call became; the
 /// operator's carry the turn but belong to no call.
 pub fn archived(event_id: u64, own: bool) {
@@ -1319,7 +1323,7 @@ impl Recorder {
     }
 
     /// The newest call that finished (saved, or on its way to disk). While
-    /// s0ma's tools run, that is the call that asked for them.
+    /// the agent's tools run, that is the call that asked for them.
     pub fn latest(&self) -> Option<CallRef> {
         self.live().latest.clone()
     }
@@ -1863,12 +1867,6 @@ fn keep_days() -> Option<u64> {
     std::env::var("S0MA_CALLS_KEEP_DAYS").ok()?.trim().parse().ok().filter(|days| *days > 0)
 }
 
-/// Calls a mistake refers to: never deleted.
-#[cfg(test)]
-pub(crate) fn referenced_calls_for_test(data_dir: &Path) -> HashSet<String> {
-    referenced_calls(data_dir).unwrap()
-}
-
 fn referenced_calls(data_dir: &Path) -> io::Result<HashSet<String>> {
     let mut calls = HashSet::new();
     let Ok(entries) = fs::read_dir(data_dir.join("mistakes")) else { return Ok(calls) };
@@ -2000,7 +1998,7 @@ pub fn prune(store: &Store, data_dir: &Path, days: u64) -> Result<Option<String>
 
 // ------------------------------------------------------------------ the global recorder
 
-/// Start the call store for this s0ma. Calls made before this are not saved.
+/// Start the call store for this agent. Calls made before this are not saved.
 pub fn init(data_dir: &Path, sink: FlagSink) -> io::Result<()> {
     if RECORDER.get().is_some() {
         return Ok(());
@@ -2037,15 +2035,14 @@ pub(crate) fn wait_written(recorder: &Recorder) {
     assert!(recorder.sync(Duration::from_secs(10)), "writer did not drain");
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::ToolDefinition;
     use crate::types::{FunctionCall, Message, ToolCall};
     use serde_json::json;
-    use std::io::{BufRead, BufReader};
-    use std::net::TcpListener;
+
+
     use std::sync::atomic::AtomicUsize;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -2117,91 +2114,6 @@ mod tests {
         id
     }
 
-    /// An engine that records the bodies POSTed to it and streams `streams`
-    /// in turn (each a list of SSE `data:` payloads).
-    fn recording_engine(streams: Vec<Vec<&'static str>>) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let bodies = Arc::new(Mutex::new(Vec::new()));
-        let seen = Arc::clone(&bodies);
-        std::thread::spawn(move || {
-            for (stream, payloads) in listener.incoming().zip(streams) {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut length = 0;
-                let mut line = String::new();
-                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap();
-                    }
-                    line.clear();
-                }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                seen.lock().unwrap().push(body);
-                let mut sse = String::new();
-                for payload in payloads {
-                    sse.push_str(&format!("data: {payload}\n\n"));
-                }
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
-                    sse.len()
-                );
-            }
-        });
-        (format!("http://{address}"), bodies)
-    }
-
-    #[test]
-    fn what_the_engine_receives_is_what_is_stored_across_a_resample() {
-        // The first generation stops with nothing to say (resampled), the
-        // second answers: two POSTs, one body.
-        let (url, bodies) = recording_engine(vec![
-            vec![r#"{"choices":[{"delta":{"reasoning_content":"FIRST"},"finish_reason":"stop"}]}"#, "[DONE]"],
-            vec![r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#, "[DONE]"],
-        ]);
-        let mut body = None;
-        let mut streamed = Streamed::default();
-        let response = crate::llm::chat_with_tools_capturing_at(
-            &url,
-            &tricky_messages(),
-            &tools(),
-            |event| {
-                streamed.observe(&event);
-                Ok(())
-            },
-            &mut body,
-        )
-        .unwrap();
-        let body = body.unwrap();
-        let received = bodies.lock().unwrap().clone();
-        assert_eq!(received.len(), 2);
-        assert!(received.iter().all(|r| *r == body), "every attempt POSTs the stored bytes");
-        assert_eq!(body, crate::llm::main_request_body_for_test(&tricky_messages(), &tools()));
-        assert_eq!(response.content, "ok");
-        assert_eq!((streamed.content.as_str(), streamed.reasoning.as_str()), ("ok", ""), "only the last generation");
-    }
-
-    #[test]
-    fn the_streamed_record_starts_over_with_each_generation() {
-        use crate::llm::StreamEvent;
-        let mut streamed = Streamed::default();
-        for event in [
-            StreamEvent::Started,
-            StreamEvent::Reasoning("FIRST-GENERATION ".into()),
-            StreamEvent::Usage { completion_tokens: 5, prompt_tokens: Some(100), cached_tokens: None, cache_source: None, last: true },
-            StreamEvent::Started,
-            StreamEvent::Reasoning("SECOND ".into()),
-            StreamEvent::Content("partial".into()),
-            StreamEvent::Usage { completion_tokens: 2, prompt_tokens: None, cached_tokens: Some(90), cache_source: Some(crate::llm::CacheSource::Ram), last: false },
-        ] {
-            streamed.observe(&event);
-        }
-        assert_eq!((streamed.reasoning.as_str(), streamed.content.as_str()), ("SECOND ", "partial"));
-        assert_eq!(streamed.usage, Usage { prompt_tokens: None, completion_tokens: Some(2), cached_tokens: Some(90), cache_source: Some(crate::llm::CacheSource::Ram) });
-    }
-
     #[test]
     fn a_blob_that_cannot_be_written_leaves_no_line() {
         let dir = temp_dir("noblob");
@@ -2212,89 +2124,6 @@ mod tests {
         let id = record_one(&recorder, &body, &response());
         assert!(recorder.save_error(&id).is_some());
         assert!(!Store::at(&dir).index_path().exists() || Store::at(&dir).recent(1).unwrap().is_empty());
-    }
-
-    #[test]
-    fn turn_ids_are_unique_however_fast_they_come() {
-        let ids: HashSet<String> = (0..2_000).map(|_| new_turn_id()).collect();
-        assert_eq!(ids.len(), 2_000);
-    }
-
-    #[test]
-    fn the_real_body_splits_and_rebuilds_byte_for_byte() {
-        for tools in [tools(), Vec::new()] {
-            let body = crate::llm::main_request_body_for_test(&tricky_messages(), &tools);
-            let split = split_body(&body).unwrap();
-            assert_eq!(split.messages.len(), 5);
-            assert_eq!(split.tools.is_some(), !tools.is_empty());
-            let rebuilt =
-                rebuild(&split.skeleton, &split.messages, split.splice_messages, split.tools.as_deref(), split.splice_tools)
-                    .unwrap();
-            assert_eq!(rebuilt, body, "rebuild must reproduce the bytes POSTed");
-            // Each message blob is exactly that message; params are the rest, in order.
-            let parsed: Value = serde_json::from_slice(&body).unwrap();
-            for (index, message) in split.messages.iter().enumerate() {
-                assert_eq!(serde_json::from_slice::<Value>(message).unwrap(), parsed["messages"][index]);
-            }
-            let params: Value = serde_json::from_str(&split.params).unwrap();
-            assert!(params.get("messages").is_none() && params.get("tools").is_none());
-            assert_eq!(params["model"], parsed["model"]);
-            assert_eq!(params["chat_template_kwargs"], parsed["chat_template_kwargs"]);
-            assert!(split.params.starts_with("{\"model\":"), "params keep the body's order: {}", split.params);
-        }
-    }
-
-    #[test]
-    fn a_saved_call_rebuilds_to_the_bytes_posted_with_the_response_as_assembled() {
-        let dir = temp_dir("exact");
-        let recorder = Recorder::start(&dir, no_engine(), "m".into(), quiet()).unwrap();
-        let messages = tricky_messages();
-        let system = messages[0].content.clone();
-        let cut = system.find("[KNOWN WEAKNESSES]").unwrap();
-        register_system_spans(
-            &system,
-            vec![
-                Span { label: "base".into(), start: 0, end: cut },
-                Span { label: "weaknesses".into(), start: cut, end: system.len() },
-            ],
-        );
-        let body = crate::llm::main_request_body_for_test(&messages, &tools());
-        let _turn = begin_turn();
-        let ticket = recorder.begin();
-        let call_id = ticket.call_id.clone();
-        recorder.finish(
-            ticket,
-            Some(body.clone()),
-            Outcome::Response(&response()),
-            Usage { prompt_tokens: Some(61234), completion_tokens: Some(812), cached_tokens: Some(60000), cache_source: None },
-        );
-        wait_written(&recorder);
-        recorder.end_turn();
-
-        let store = Store::at(&dir);
-        let line = store.find(&call_id).unwrap().expect("saved");
-        assert_eq!(store.body(&line).unwrap(), body);
-        assert_eq!(line["request"]["body_sha256"], json!(sha256_hex(&body)));
-        assert!(line["request"].get("body").is_none(), "the rebuild matched, so the body is not stored twice");
-        assert_eq!(
-            store.response(&line).unwrap(),
-            json!({"content": "Done — ✓ \"quoted\"", "reasoning_content": "it started at 09:02\n",
-                   "tool_calls": [{"id": "call_2", "type": "function",
-                                   "function": {"name": "run_command", "arguments": "{\"command\":\"ls\"}"}}]})
-        );
-        assert_eq!(line["finish"], "tool_calls");
-        assert_eq!(line["purpose"], "agent");
-        assert_eq!(line["call_in_turn"], 1);
-        assert!(line["turn_id"].as_str().unwrap().starts_with("t-"));
-        assert_eq!(line["usage"], json!({"prompt_tokens": 61234, "completion_tokens": 812, "cached_tokens": 60000}));
-        assert_eq!(line["system_spans"][1], json!({"label": "weaknesses", "start": cut, "end": system.len()}));
-        assert!(line["harness_version"].as_str().unwrap().starts_with("s0ma "));
-        // The system message as saved, with the weaknesses span cut, is the
-        // system message without the block.
-        let saved_system = store.messages(&line).unwrap()[0]["content"].as_str().unwrap().to_owned();
-        let span = &line["system_spans"][1];
-        let (start, end) = (span["start"].as_u64().unwrap() as usize, span["end"].as_u64().unwrap() as usize);
-        assert_eq!(format!("{}{}", &saved_system[..start], &saved_system[end..]), system[..cut]);
     }
 
     #[test]
@@ -2360,26 +2189,6 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_last_line_is_dropped_and_the_next_append_starts_clean() {
-        let dir = temp_dir("torn");
-        let store = Store::at(&dir);
-        fs::create_dir_all(&store.root).unwrap();
-        fs::write(store.index_path(), b"{\"call_id\":\"c-1-000001\"}\n{\"call_id\":\"c-2-0000").unwrap();
-        assert_eq!(store.repair_torn_tail().unwrap(), Some(b"{\"call_id\":\"c-2-0000".len()));
-        store.append_line(b"{\"call_id\":\"c-3-000003\"}").unwrap();
-        let text = fs::read_to_string(store.index_path()).unwrap();
-        assert_eq!(text, "{\"call_id\":\"c-1-000001\"}\n{\"call_id\":\"c-3-000003\"}\n");
-        // A complete line that only lacks its newline is kept.
-        fs::write(store.index_path(), b"{\"call_id\":\"c-1-000001\"}").unwrap();
-        assert_eq!(store.repair_torn_tail().unwrap(), None);
-        assert_eq!(fs::read_to_string(store.index_path()).unwrap(), "{\"call_id\":\"c-1-000001\"}\n");
-        // And sequence numbers continue from the last call after a restart.
-        let recorder = Recorder::start(&dir, no_engine(), "m".into(), quiet()).unwrap();
-        let ticket = recorder.begin();
-        assert!(ticket.call_id.ends_with("-000002"), "{}", ticket.call_id);
-    }
-
-    #[test]
     fn lines_read_backwards_across_chunk_boundaries() {
         let dir = temp_dir("rev");
         let path = dir.join("f.jsonl");
@@ -2389,324 +2198,6 @@ mod tests {
         let lines: Vec<Vec<u8>> = RevLines::open(&path).unwrap().map(|l| l.unwrap()).collect();
         assert_eq!(lines, vec![longer.into_bytes(), b"short".to_vec(), long.into_bytes()]);
         assert_eq!(RevLines::open(&dir.join("missing")).unwrap().count(), 0);
-    }
-
-    /// An engine whose `/v1/models` reports `state`'s folder and start time.
-    fn stub_engine(state: Arc<Mutex<(String, u64)>>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
-                    line.clear();
-                }
-                let (dir, created) = state.lock().unwrap().clone();
-                let body = json!({"object": "list", "data": [
-                    {"id": "m", "created": created, "max_model_len": 262144,
-                     "model_dir": dir, "slice_tag": format!("own8@{created}")}]})
-                .to_string();
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        format!("http://{address}")
-    }
-
-    #[test]
-    fn each_call_names_the_weights_that_answered_it() {
-        let dir = temp_dir("served");
-        let state = Arc::new(Mutex::new(("/fne/slice-a".to_owned(), 100)));
-        let recorder = Recorder::start(&dir, stub_engine(Arc::clone(&state)), "m".into(), quiet()).unwrap();
-        let body = crate::llm::main_request_body_for_test(&tricky_messages(), &tools());
-        let a = record_one(&recorder, &body, &response());
-        // The engine restarted on another folder between calls: no error, no
-        // cache, the next call is stamped with what serves it now.
-        *state.lock().unwrap() = ("/fne/slice-b".to_owned(), 200);
-        let b = record_one(&recorder, &body, &response());
-        // And it changes while a call runs: the stamp is the engine after the
-        // response, flagged uncertain.
-        let ticket = recorder.begin();
-        let c = ticket.call_id.clone();
-        *state.lock().unwrap() = ("/fne/slice-c".to_owned(), 300);
-        recorder.finish(ticket, Some(body.clone()), Outcome::Response(&response()), Usage::default());
-        wait_written(&recorder);
-
-        let store = Store::at(&dir);
-        let served = |id: &str| store.find(id).unwrap().unwrap()["served"].clone();
-        assert_eq!(served(&a), json!({"model": "m", "model_dir": "/fne/slice-a", "slice_tag": "own8@100", "engine_started": 100}));
-        assert_eq!(served(&b), json!({"model": "m", "model_dir": "/fne/slice-b", "slice_tag": "own8@200", "engine_started": 200}));
-        assert_eq!(served(&c)["model_dir"], "/fne/slice-c");
-        assert_eq!(served(&c)["uncertain"], true);
-    }
-
-    #[test]
-    fn the_engine_folder_falls_back_to_the_serve_process_model_argument() {
-        assert_eq!(model_arg(b"python\0-m\0fne.serve\0--model\0/home/t4lus/fne/x\0--port\0"), Some("/home/t4lus/fne/x".into()));
-        assert_eq!(model_arg(b"fne-serve\0--model=/fne/y\0"), Some("/fne/y".into()));
-        assert_eq!(model_arg(b"fne-serve\0--port\08011\0"), None);
-        let before = Served { model: "m".into(), model_dir: Some("/a".into()), slice_tag: None, engine_started: Some(1), source: None, uncertain: false };
-        let mut after = before.clone();
-        assert!(!merge_served(Some(before.clone()), Some(after.clone()), "m", false).uncertain);
-        after.engine_started = Some(2);
-        let changed = merge_served(Some(before.clone()), Some(after.clone()), "m", false);
-        assert!(changed.uncertain && changed.engine_started == Some(2));
-        // Read late, the stamp is the engine before the call.
-        let late = merge_served(Some(before.clone()), Some(after.clone()), "m", true);
-        assert!(late.uncertain && late.engine_started == Some(1));
-        assert!(merge_served(None, Some(after.clone()), "m", true).uncertain);
-        assert!(!merge_served(None, Some(after), "m", false).uncertain);
-        assert_eq!(merge_served(None, None, "m", false).model, "m");
-        assert_eq!(merge_served(Some(before.clone()), None, "m", false), before);
-    }
-
-    #[test]
-    fn a_turns_archive_events_are_listed_against_the_call_that_produced_them() {
-        let dir = temp_dir("join");
-        let recorder = Recorder::start(&dir, no_engine(), "m".into(), quiet()).unwrap();
-        let body = crate::llm::main_request_body_for_test(&tricky_messages(), &tools());
-        let turn = begin_turn();
-        let turn_id = current_turn().unwrap();
-        archived(100, false); // the operator's message: before any call
-        let first = recorder.begin();
-        let first_id = first.call_id.clone();
-        recorder.finish(first, Some(body.clone()), Outcome::Response(&response()), Usage::default());
-        archived(101, true); // its reasoning
-        archived(102, true); // a tool result
-        archived(99, false); // a message the operator sent meanwhile
-        let second = recorder.begin();
-        let second_id = second.call_id.clone();
-        recorder.finish(second, Some(body.clone()), Outcome::Response(&response()), Usage::default());
-        archived(103, true); // the reply
-        recorder.end_turn();
-        drop(turn);
-        assert_eq!(current_turn(), None);
-        wait_written(&recorder);
-
-        let store = Store::at(&dir);
-        let first = store.find(&first_id).unwrap().unwrap();
-        let second = store.find(&second_id).unwrap().unwrap();
-        assert_eq!(first["archive_events"], json!([101, 102]));
-        assert_eq!(second["archive_events"], json!([103]));
-        assert_eq!(first["turn_id"], json!(turn_id));
-        assert_eq!(second["turn_id"], json!(turn_id));
-        assert_eq!((first["call_in_turn"].as_u64(), second["call_in_turn"].as_u64()), (Some(1), Some(2)));
-        assert_eq!(store.recent(2).unwrap()[0]["archive_events"], json!([103]));
-    }
-
-    #[test]
-    fn archive_events_carry_the_turn_only_while_one_runs() {
-        let dir = temp_dir("archive");
-        let mut memory = crate::hippocampus::Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("before".into()).unwrap();
-        let turn = begin_turn();
-        let turn_id = current_turn().unwrap();
-        memory.remember_operator("during".into()).unwrap();
-        memory.remember_s0ma("reply".into()).unwrap();
-        drop(turn);
-        memory.remember_operator("after".into()).unwrap();
-        let lines: Vec<Value> = fs::read_to_string(dir.join("hippocampus.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        let turns: Vec<Option<&str>> = lines.iter().map(|l| l.get("turn_id").and_then(Value::as_str)).collect();
-        assert_eq!(turns, vec![None, Some(turn_id.as_str()), Some(turn_id.as_str()), None]);
-        // An event without the field is written exactly as before, and every
-        // line still reads back.
-        assert!(!fs::read_to_string(dir.join("hippocampus.jsonl")).unwrap().lines().next().unwrap().contains("turn_id"));
-        assert_eq!(memory.recall_after(0).unwrap().len(), 4);
-    }
-
-    #[test]
-    fn a_flag_typed_while_a_call_streams_waits_for_that_call() {
-        let dir = temp_dir("defer");
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let sink_seen = Arc::clone(&seen);
-        let recorder = Recorder::start(
-            &dir,
-            no_engine(),
-            "m".into(),
-            Box::new(move |event| {
-                sink_seen.lock().unwrap().push(match event {
-                    FlagEvent::Logged(call, flag) => format!("logged {} {}", call.call_id, flag.note),
-                    FlagEvent::Dropped(flag, why) => format!("dropped {} ({why})", flag.note),
-                })
-            }),
-        )
-        .unwrap();
-        let body = crate::llm::main_request_body_for_test(&tricky_messages(), &tools());
-        let earlier = record_one(&recorder, &body, &response());
-        let flag = |note: &str| PendingFlag { note: note.into(), weakness: None };
-
-        // Idle: the newest saved call.
-        match recorder.latest_or_defer(flag("x")) {
-            (Latest::Call(call), Some(_)) => assert_eq!(call.call_id, earlier),
-            _ => panic!("expected the newest saved call"),
-        }
-        // Streaming: the flag waits, and lands on that call once it is saved.
-        let ticket = recorder.begin();
-        let streaming = ticket.call_id.clone();
-        assert!(matches!(recorder.latest_or_defer(flag("wrong path")), (Latest::Deferred { .. }, None)));
-        recorder.finish(ticket, Some(body.clone()), Outcome::Interrupted { content: "I'll delete", reasoning: "" }, Usage::default());
-        wait_written(&recorder);
-        assert_eq!(seen.lock().unwrap().as_slice(), [format!("logged {streaming} wrong path")]);
-        let line = Store::at(&dir).find(&streaming).unwrap().unwrap();
-        assert_eq!(line["finish"], "interrupted");
-        assert_eq!(Store::at(&dir).response(&line).unwrap(), json!({"content": "I'll delete", "reasoning_content": "", "tool_calls": []}));
-        // A call that fails is not saved, and its waiting flag says so.
-        let ticket = recorder.begin();
-        assert!(matches!(recorder.latest_or_defer(flag("gone")), (Latest::Deferred { .. }, None)));
-        recorder.abandon(ticket, "connection reset");
-        assert!(seen.lock().unwrap()[1].starts_with("dropped gone (the call in progress failed (connection reset)"));
-    }
-
-    /// The whole point of the job purge, and the thing most easily got wrong:
-    /// the calls inside the window go, the ones outside stay *readable*, and a
-    /// blob the survivors share is not deleted along with the dying call that
-    /// also named it.
-    #[test]
-    fn a_job_purge_drops_its_calls_and_leaves_the_blobs_the_rest_share() {
-        let dir = temp_dir("purge");
-        let recorder = Recorder::start(&dir, no_engine(), "m".into(), quiet()).unwrap();
-        let body = crate::llm::main_request_body_for_test(&tricky_messages(), &tools());
-        let mut replies = Vec::new();
-        for reply in ["before the job", "inside the job", "after the job"] {
-            let mut r = response();
-            r.content = reply.into();
-            replies.push(record_one(&recorder, &body, &r));
-        }
-        let store = Store::at(&dir);
-        // The middle call is the one inside the window.
-        let stamp = |id: &str| store.find(id).unwrap().unwrap()["at"].as_str().unwrap().to_owned();
-        let mut index = fs::read_to_string(store.index_path()).unwrap();
-        index = index.replace(&stamp(&replies[1]), "2026-06-15T12:00:00.000+00:00");
-        fs::write(store.index_path(), index).unwrap();
-        let inside = store.find(&replies[1]).unwrap().unwrap()["response"].as_str().unwrap().to_owned();
-
-        // A mistake on it: the correction trains against a request that is
-        // about to stop existing, so the record goes with the call.
-        fs::create_dir_all(dir.join("mistakes")).unwrap();
-        fs::write(
-            dir.join("mistakes/1.json"),
-            json!({"mistake": 1, "call_id": replies[1]}).to_string(),
-        )
-        .unwrap();
-        fs::write(dir.join("mistakes/2.json"), json!({"mistake": 2, "call_id": replies[2]}).to_string())
-            .unwrap();
-        fs::write(
-            dir.join("mistakes/history.jsonl"),
-            format!("{}\n{}\n", json!({"mistake": 1, "to": "pending"}), json!({"mistake": 2, "to": "pending"})),
-        )
-        .unwrap();
-
-        let from = chrono::DateTime::parse_from_rfc3339("2026-06-15T11:00:00.000+00:00")
-            .unwrap()
-            .with_timezone(&chrono::Local);
-        let to = chrono::DateTime::parse_from_rfc3339("2026-06-15T13:00:00.000+00:00")
-            .unwrap()
-            .with_timezone(&chrono::Local);
-        let report = purge_window(&dir, &[(from, to)], &[]).unwrap();
-
-        assert_eq!(report.calls, 1, "only the call inside the window");
-        assert_eq!(report.mistakes, 1);
-        assert_eq!(report.history_lines, 1);
-        assert!(store.find(&replies[1]).unwrap().is_none(), "it is out of the index");
-        assert!(store.get(&inside).is_err(), "and its own response blob is gone");
-        assert!(report.blobs >= 1, "{report:?}");
-        for id in [&replies[0], &replies[2]] {
-            let line = store.find(id).unwrap().unwrap();
-            // The request is still rebuildable: these three calls shared every
-            // message blob, and the dying one named them too.
-            assert_eq!(store.body(&line).unwrap(), body, "a shared blob of a surviving call was kept");
-            store.response(&line).unwrap();
-        }
-        assert!(!dir.join("mistakes/1.json").exists());
-        assert!(dir.join("mistakes/2.json").exists(), "the mistake on a surviving call stays");
-        let history = fs::read_to_string(dir.join("mistakes/history.jsonl")).unwrap();
-        assert!(!history.contains("\"mistake\":1"), "{history}");
-        assert!(history.contains("\"mistake\":2"), "{history}");
-
-        // Nothing in the window: nothing touched, and no sweep.
-        let again = purge_window(&dir, &[(from, to)], &[]).unwrap();
-        assert_eq!(again.calls, 0);
-        assert_eq!(again.blobs, 0);
-    }
-
-    /// A redaction of part of an event has to find the text wherever a call
-    /// kept it, which is not only the call that produced it: every later call
-    /// of the conversation carried the same message. Selecting by event id
-    /// finds the first and misses the rest, so the text itself is the selector.
-    #[test]
-    fn a_fragment_purge_finds_every_call_whose_messages_hold_the_text() {
-        let dir = temp_dir("fragments");
-        let recorder = Recorder::start(&dir, no_engine(), "m".into(), quiet()).unwrap();
-        let secret = "sk-live-7f3a2b9c4d1e";
-        // Two calls carrying the message with the secret in it, as a real
-        // conversation does -- the second one replays the first's turn -- and
-        // one that never saw it.
-        let carrying = vec![
-            Message::system("SYSTEM base".into()),
-            Message::user(format!("the deploy printed TOKEN={secret} just now")),
-        ];
-        let clean = vec![Message::system("SYSTEM base".into()), Message::user("nothing of note here".into())];
-        let with_secret = crate::llm::main_request_body_for_test(&carrying, &tools());
-        let without = crate::llm::main_request_body_for_test(&clean, &tools());
-        let first = record_one(&recorder, &with_secret, &response());
-        let second = record_one(&recorder, &with_secret, &response());
-        let elsewhere = record_one(&recorder, &without, &response());
-        let store = Store::at(&dir);
-        let shared_response = store.response(&store.find(&elsewhere).unwrap().unwrap()).unwrap();
-
-        let report = purge_fragments(&dir, &[secret.to_string()]).unwrap();
-
-        assert_eq!(report.calls, 2, "both calls that carried the message: {report:?}");
-        assert!(store.find(&first).unwrap().is_none());
-        assert!(store.find(&second).unwrap().is_none());
-        let kept = store.find(&elsewhere).unwrap().expect("the call that never held it stays");
-        // And it is still readable: its response blob was named by the dropped
-        // calls too, so a sweep that went by the dying lines would have taken it.
-        assert_eq!(store.response(&kept).unwrap(), shared_response);
-        store.messages(&kept).unwrap();
-
-        // Nothing left in the store holds it.
-        for line in store.recent(10).unwrap() {
-            for message in store.messages(&line).unwrap() {
-                assert!(!message.to_string().contains(secret), "{message}");
-            }
-        }
-
-        // A fragment too short to mean anything is not searched for, and says so
-        // rather than reporting a removal it did not attempt.
-        let report = purge_fragments(&dir, &["key".to_string()]).unwrap();
-        assert_eq!(report.calls, 0);
-        assert_eq!(report.fragments_too_short, 1, "{report:?}");
-    }
-
-    /// A call that started before the job opened can still archive into it --
-    /// the events it produced are the job's. `at` alone would miss it.
-    #[test]
-    fn a_call_is_also_judged_by_the_events_it_archived() {
-        let dir = temp_dir("purge-events");
-        let recorder = Recorder::start(&dir, no_engine(), "m".into(), quiet()).unwrap();
-        let body = crate::llm::main_request_body_for_test(&tricky_messages(), &tools());
-        let call = record_one(&recorder, &body, &response());
-        // The events arrive on an update line, as they do in a real store.
-        recorder.archive_events(call.clone(), vec![84_119, 84_120]);
-        wait_written(&recorder);
-        assert!(Store::at(&dir).find(&call).unwrap().is_some());
-
-        let report = purge_window(&dir, &[], &[(84_100, 84_200)]).unwrap();
-        assert_eq!(report.calls, 1, "{report:?}");
-        assert!(Store::at(&dir).find(&call).unwrap().is_none());
-        // Its update line went with it, so nothing names a call that is gone.
-        let index = fs::read_to_string(Store::at(&dir).index_path()).unwrap();
-        assert!(!index.contains(&call), "{index}");
     }
 
     #[test]

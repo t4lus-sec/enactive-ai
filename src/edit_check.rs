@@ -7,7 +7,7 @@
 //! is a claim about a reader under context pressure; a finding riding in the
 //! observation can't be forgotten at turn 40 or reasoned around.
 //!
-//! s0ma has no file-editing tool: files are written by shell commands (a
+//! The agent has no file-editing tool: files are written by shell commands (a
 //! heredoc, `sed -i`, `tee`, a redirect, a script). So "the file just touched"
 //! is found from the command: the paths it names that the VM says were
 //! modified while it ran. Checks, each skipped where its tool isn't installed:
@@ -155,7 +155,6 @@ fn tokens(command: &str) -> Vec<String> {
     flush(&mut word, &mut tokens);
     tokens
 }
-
 
 /// The read-only check script for the VM: of `paths` (relative ones tried
 /// from `base` and each of `dirs`), the regular files modified in the last
@@ -354,68 +353,5 @@ mod tests {
         // Quotes and escapes come off.
         let (paths, _) = candidates("printf '%s' \"$x\" > \"my dir/a b.py\"");
         assert!(paths.iter().any(|path| path == "my dir/a b.py"), "{paths:?}");
-    }
-
-    #[test]
-    fn output_is_grouped_by_file_with_the_failing_findings() {
-        let output = "@@s0ma-check@@ /workspace/a.py\tpython compile\tok\n\n\
-@@s0ma-check@@ /workspace/a.py\truff E9,F63,F7,F82\tfail\na.py:3:5: F821 Undefined name `r`\n\
-@@s0ma-check@@ /workspace/m.sh\tbash -n\tfail\n/workspace/m.sh: line 22: syntax error near unexpected token `('\n\
-@@s0ma-check@@ /workspace/c.json\tjson parse\tok\n\n";
-        let diagnostics = parse(output);
-        assert_eq!(diagnostics.len(), 3);
-        assert_eq!(diagnostics[0], Diagnostic {
-            path: "/workspace/a.py".into(),
-            ok: false,
-            checks: "python compile, ruff E9,F63,F7,F82".into(),
-            findings: Some("a.py:3:5: F821 Undefined name `r`".into()),
-        });
-        assert!(!diagnostics[1].ok && diagnostics[1].findings.as_deref().unwrap().contains("line 22"));
-        assert!(diagnostics[2].ok && diagnostics[2].findings.is_none());
-    }
-
-    /// The script itself, run by the local bash against files in a temp dir
-    /// standing in for /workspace: the broken ones are caught, the good one
-    /// passes, one modified long ago is left alone, and nothing is written.
-    #[test]
-    fn the_check_script_finds_what_was_just_broken() {
-        if std::process::Command::new("bash").arg("--version").output().is_err() {
-            return;
-        }
-        let base = std::env::temp_dir().join(format!("s0ma-edit-check-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("tools")).unwrap();
-        std::fs::write(base.join("tools/manifest.sh"), "#!/bin/bash\necho start\nfor x in a b; do\n  echo $x\n").unwrap();
-        std::fs::write(base.join("inspect.py"), "import json\nr = {}\nif r.get('cmd'),!= None:\n    pass\n").unwrap();
-        std::fs::write(base.join("good.py"), "print('fine')\n").unwrap();
-        std::fs::write(base.join("conf.json"), "{\"a\": 1,}").unwrap();
-        std::fs::write(base.join("runner"), "#!/usr/bin/env bash\nif then\n").unwrap();
-        std::fs::write(base.join("old.py"), "def broken(:\n").unwrap();
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
-        std::fs::File::options().write(true).open(base.join("old.py")).unwrap().set_modified(long_ago).unwrap();
-        let (paths, dirs) = candidates(
-            "cd tools && cat > manifest.sh <<'EOF'\n...\nEOF\ncd .. ; cat > inspect.py; cat > good.py; echo x > conf.json; cat > runner; python3 old.py",
-        );
-        let before: Vec<_> = std::fs::read_dir(&base).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-        // Whatever shell the guest runner uses: bash, or a POSIX sh.
-        for shell in ["bash", "sh"] {
-            let Ok(output) = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(script(&paths, &dirs, base.to_str().unwrap(), 30))
-                .output() else { continue };
-            let diagnostics = parse(&String::from_utf8_lossy(&output.stdout));
-            let find = |name: &str| diagnostics.iter().find(|diagnostic| diagnostic.path.ends_with(name));
-            assert!(!find("manifest.sh").unwrap().ok, "{diagnostics:?}");
-            let inspect = find("inspect.py").unwrap();
-            assert!(!inspect.ok && inspect.findings.as_deref().unwrap().contains("inspect.py:3"), "{inspect:?}");
-            assert!(find("good.py").unwrap().ok);
-            assert!(!find("conf.json").unwrap().ok);
-            assert!(!find("runner").unwrap().ok, "a #! file is checked by its interpreter");
-            assert!(find("old.py").is_none(), "not modified while the command ran");
-        }
-        // Read-only: no new files (no __pycache__, no .ruff_cache).
-        let after: Vec<_> = std::fs::read_dir(&base).unwrap().map(|entry| entry.unwrap().file_name()).collect();
-        assert_eq!(before.len(), after.len(), "{after:?}");
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

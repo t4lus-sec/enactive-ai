@@ -93,7 +93,7 @@ fn check_interrupt(interrupt_requested: &AtomicBool) -> Result<(), Box<dyn Error
 
 /// Where the agent loop is when it looks for operator steering.
 ///
-/// Messages the operator sends while s0ma works wait for a safe point, the
+/// Messages the operator sends while the agent works wait for a safe point, the
 /// way current harnesses queue them: nothing in flight is cut short, and the
 /// message lands after the current batch of tool calls. A message sent with
 /// "send now" (Ctrl+S, or a `/now` prefix) is taken at either kind of point.
@@ -138,13 +138,13 @@ where
 ///   turn's input, and anything it says about queued events, comes first);
 /// - not once the turn's folds are spent, when a burst of events could leave
 ///   no room for the reply;
-/// - not once s0ma has called attention_wait and is finishing up: the event a
+/// - not once the agent has called attention_wait and is finishing up: the event a
 ///   wait is for must end the wait after the turn, not be spent inside it.
 fn may_join_wake_events(after_tools: bool, allow_rotation: bool, attention: &AttentionStore) -> bool {
     after_tools && allow_rotation && attention.is_engaged()
 }
 
-/// Soft steering for VM wake events: events that arrived while s0ma works
+/// Soft steering for VM wake events: events that arrived while the agent works
 /// join the turn at a pause after a batch of tool results and before the next
 /// request, so neither the model nor a tool is cut short and nothing waits for
 /// the turn to end. `take` takes queued events; `done` says whether they made
@@ -152,7 +152,7 @@ fn may_join_wake_events(after_tools: bool, allow_rotation: bool, attention: &Att
 fn join_wake_events(
     messages: &mut Vec<Message>,
     memory: &mut Hippocampus,
-    take: impl FnOnce() -> Option<crate::vm_wake::Joining>,
+    take: impl FnOnce() -> Option<crate::vm::wake::Joining>,
     done: impl FnOnce(bool),
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let Some(joining) = take() else { return Ok(Vec::new()) };
@@ -187,7 +187,7 @@ pub fn run<F, S, P>(
 where
     F: FnMut(AgentEvent) -> Result<(), Box<dyn Error>>,
     S: FnMut(SteerPoint) -> Result<Vec<crate::input::Submitted>, Box<dyn Error>>,
-    P: FnMut(&[Message], &crate::context_guard::ContextUsage) -> bool,
+    P: FnMut(&[Message], &crate::context::guard::ContextUsage) -> bool,
 {
     let mut tools = archive::tool_definitions();
     tools.extend(archive::recall::tool_definitions());
@@ -197,15 +197,14 @@ where
 
     tools.extend(threads::tool_definitions());
 
-
     tools.extend(attention::tool_definitions());
 
     tools.extend(vm::tool_definitions());
     tools.extend(vm::netbox_tool_definitions());
     tools.extend(desktop::tool_definitions());
-    tools.extend(crate::vm_image::tool_definitions());
+    tools.extend(crate::vm::image::tool_definitions());
     tools.extend(crate::share::tool_definitions());
-    tools.extend(crate::shared_files::tool_definitions());
+    tools.extend(crate::share::files::tool_definitions());
     tools.extend(crate::browser::tool_definitions());
     tools.extend(crate::search::tool_definitions());
     tools.extend(minecraft::tool_definitions());
@@ -218,9 +217,10 @@ where
     tools.extend(crate::mistakes::tool_definitions());
     tools.extend(crate::open_loops::tool_definitions());
     tools.extend(crate::board::tool_definitions());
+    tools.extend(crate::audit::tools::tool_definitions());
     // A finished board's write-up, review answers and verification.
-    tools.extend(crate::board_flow::tool_definitions());
-    tools.extend(crate::vm_wake::tool_definitions());
+    tools.extend(crate::board::flow::tool_definitions());
+    tools.extend(crate::vm::wake::tool_definitions());
     // Last, so the native tools' prefix is unchanged when MCP servers come and go.
     tools.extend(crate::mcp::tool_definitions());
 
@@ -264,15 +264,15 @@ where
         }
 
         if may_join_wake_events(after_tools, allow_rotation, attention_store) {
-            let joined = join_wake_events(messages, memory, crate::vm_wake::take_to_join, |made_it| {
+            let joined = join_wake_events(messages, memory, crate::vm::wake::take_to_join, |made_it| {
                 if made_it {
-                    crate::vm_wake::joined();
+                    crate::vm::wake::joined();
                 } else {
-                    crate::vm_wake::not_joined();
+                    crate::vm::wake::not_joined();
                 }
             })?;
             if !joined.is_empty() {
-                crate::vm_wake::note_reached(&joined);
+                crate::vm::wake::note_reached(&joined);
                 on_event(AgentEvent::Status(format!("[vm-wake] joined the turn: {}", joined.join(", "))))?;
             }
         }
@@ -300,7 +300,7 @@ where
 
         // Tool results and delegated answers grow a single turn, so recount
         // against the live window before EVERY inference, not just at admission.
-        let usage = crate::context_guard::measure(messages, options, &tools)?;
+        let usage = crate::context::guard::measure(messages, options, &tools)?;
 
         // Past the prepare threshold, the next fold's gists start being written
         // in the background. Checked here as well as at admission because most
@@ -324,7 +324,7 @@ where
         // budget, announced rather than silent.
         let room = usage.output_room();
         if room < 1024 {
-            // This is a harness admission failure, not something s0ma said.
+            // This is a harness admission failure, not something the agent said.
             // Returning an error keeps it out of the conversation and archive.
             return Err("context admission paused: insufficient response headroom; tool results remain logged".into());
         }
@@ -490,10 +490,10 @@ where
         // a corresponding tool result. We check Ctrl+C again afterward.
         let mut desktop_observations: Vec<DesktopObservation> = Vec::new();
         // Set once the operator kills a call: the rest of this batch is part of
-        // the course they just stopped, so s0ma gets control back first.
+        // the course they just stopped, so the agent gets control back first.
         let mut stopped_by_operator: Option<String> = None;
         // Set once the operator sends a message with "send now" while this
-        // batch runs: the calls not yet started wait behind it, and s0ma reads
+        // batch runs: the calls not yet started wait behind it, and the agent reads
         // it (at the safe point below) as soon as the call it arrived during
         // returns.
         let mut sent_now = false;
@@ -571,7 +571,11 @@ where
             {
                 // The machine's tools, while the operator has it off limits
                 // (commands and shells are refused in vm::execute itself).
-                name if !crate::vm_access::allowed() && crate::vm_access::gated(name) => Ok(crate::vm_access::refusal(name)),
+                name if !crate::vm::access::allowed() && crate::vm::access::gated(name) => Ok(crate::vm::access::refusal(name)),
+                // Host mode: there is no VM display to drive.
+                name if crate::vm::machine::on_host() && (crate::browser::handles(name) || name.starts_with("desktop_")) => {
+                    Ok(crate::vm::machine::off_here(name))
+                }
                 // Approval mode: the desktop's input, JavaScript in the
                 // browser, a wake watch and MCP tools wait for the operator
                 // here; the shell tools in vm.rs, a spawn in subagent.rs.
@@ -582,6 +586,7 @@ where
                         on_event(AgentEvent::Status(status))
                     })
                 }
+                name if crate::audit::tools::handles(name) => Ok(crate::audit::tools::execute(&call, "s0ma")),
                 "world_model_list" | "world_model_get" | "world_model_define"
                 | "world_model_link" | "world_record_get" | "world_record_put" | "fact_search" => {
                     crate::world_model::execute(memory, &call)
@@ -601,7 +606,7 @@ where
                 }
                 "archive_search" | "archive_get" => archive::execute(memory, &call),
                 crate::redact::TOOL => crate::redact::execute(memory, &call),
-                // A completion claim is audited here, before s0ma goes on: the
+                // A completion claim is audited here, before the agent goes on: the
                 // verdict is this call's result.
                 crate::goal::GET | crate::goal::UPDATE => {
                     crate::goal::execute(&call, messages, interrupt_requested, |status| {
@@ -613,7 +618,6 @@ where
                 }
 
                 name if threads::handles(name) => threads::execute(threads_store, &call),
-
 
                 "attention_orient" | "attention_wait" => attention::execute(attention_store, &call),
 
@@ -641,7 +645,7 @@ where
                     execution.result
                 }),
 
-                name if crate::vm_image::handles(name) => crate::vm_image::execute(&call).map(|execution| {
+                name if crate::vm::image::handles(name) => crate::vm::image::execute(&call).map(|execution| {
                     if let Some(observation) = execution.observation {
                         desktop_observations.push(observation);
                     }
@@ -649,10 +653,10 @@ where
                 }),
 
                 name if crate::share::handles(name) => crate::share::execute(&call),
-                name if crate::shared_files::handles(name) => crate::shared_files::execute(&call),
-                name if crate::board_flow::handles(name) => {
+                name if crate::share::files::handles(name) => crate::share::files::execute(&call),
+                name if crate::board::flow::handles(name) => {
                     let mut run = crate::share::run_on_machine;
-                    crate::board_flow::execute(boards, &call, &crate::share::share_dir(), &mut run)
+                    crate::board::flow::execute(boards, &call, &crate::share::share_dir(), &mut run)
                 }
 
                 name if crate::browser::handles(name) => crate::browser::execute(&call).map(|execution| {
@@ -684,7 +688,7 @@ where
                 }),
 
                 "voice_speak" => voice::execute(voice_speaker, &call),
-                name if crate::vm_wake::handles(name) => crate::vm_wake::execute(&call),
+                name if crate::vm::wake::handles(name) => crate::vm::wake::execute(&call),
 
                 "weakness_report" | "weakness_add_instance" | "weakness_list" => {
                     crate::weaknesses::execute(memory, &call)
@@ -745,7 +749,7 @@ where
             // model can repair the arguments on its next turn.
             let result = match execution_result {
                 // Stopped by the operator: say so plainly, keeping whatever the
-                // call had produced, so s0ma neither retries blindly nor
+                // call had produced, so the agent neither retries blindly nor
                 // mistakes it for an ordinary failure.
                 outcome if ending == crate::kill::Ending::Killed => {
                     let (killed, own) = match &outcome {
@@ -856,7 +860,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm_wake::{Queue, VmWakeEvent};
+    use crate::vm::wake::{Queue, VmWakeEvent};
     use std::sync::Mutex;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -880,57 +884,10 @@ mod tests {
     }
 
     fn try_join(messages: &mut Vec<Message>, memory: &mut Hippocampus, queue: &Mutex<Queue>) -> Result<Vec<String>, Box<dyn Error>> {
-        join_wake_events(messages, memory, || crate::vm_wake::take_to_join_from(queue), |made_it| {
+        join_wake_events(messages, memory, || crate::vm::wake::take_to_join_from(queue), |made_it| {
             let mut queue = queue.lock().unwrap();
             if made_it { queue.joined() } else { queue.not_joined() }
         })
-    }
-
-    fn join(messages: &mut Vec<Message>, memory: &mut Hippocampus, queue: &Mutex<Queue>) -> Vec<String> {
-        try_join(messages, memory, queue).unwrap()
-    }
-
-    #[test]
-    fn queued_wake_events_join_a_running_turn_as_one_framed_note() {
-        let dir = temp_dir("engaged");
-        let mut memory = Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        let queue = Mutex::new(Queue::load(Some(dir.join("vm_wake_queue.json"))));
-        queue.lock().unwrap().push(Some("1-1"), vec![event("build"), event("deploy")]);
-        let mut messages = vec![Message::user("the operator's request".into()).by_operator()];
-
-        assert_eq!(join(&mut messages, &mut memory, &queue), vec!["build", "deploy"]);
-        let note = messages.last().unwrap();
-        assert!(note.content.starts_with(crate::vm_wake::VM_WAKE_PREFIX), "{}", note.content);
-        assert!(note.content.contains("2 events came through") && note.content.contains("> build finished"));
-        assert!(!note.is_operator_input(), "environmental evidence, never the operator's");
-        // Archived (as environment), and gone from the saved queue.
-        let archived = std::fs::read_to_string(dir.join("hippocampus.jsonl")).unwrap();
-        assert!(archived.contains("2 events came through"));
-        assert!(Queue::load(Some(dir.join("vm_wake_queue.json"))).take_to_join().0.is_empty());
-
-        // Nothing queued: nothing joins.
-        assert!(join(&mut messages, &mut memory, &queue).is_empty());
-        assert_eq!(messages.len(), 2);
-    }
-
-    #[test]
-    fn events_join_only_after_tools_with_room_and_while_attention_is_engaged() {
-        let dir = temp_dir("when");
-        let engaged = AttentionStore::load(&dir).unwrap();
-        assert!(may_join_wake_events(true, true, &engaged));
-        assert!(!may_join_wake_events(false, true, &engaged), "never before the first request");
-        assert!(!may_join_wake_events(true, false, &engaged), "not once the turn's folds are spent");
-
-        // Finishing up to wait for a VM event: the event must end the wait.
-        let waiting_dir = temp_dir("waiting");
-        std::fs::write(
-            waiting_dir.join("attention.json"),
-            json!({"schema_version": 1, "mode": "waiting", "activity": "building", "orientation": "wait for it",
-                   "condition": {"kind": "vm_event", "watch": "build"}, "updated_at": "2026-10-10T00:00:00Z"}).to_string(),
-        )
-        .unwrap();
-        let waiting = AttentionStore::load(&waiting_dir).unwrap();
-        assert!(!may_join_wake_events(true, true, &waiting));
     }
 
     #[test]

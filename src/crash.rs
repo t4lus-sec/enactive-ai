@@ -1,6 +1,6 @@
 //! What happens when a thread panics (`install`).
 //!
-//! - The main thread: s0ma ends. The terminal is put back first, whatever was
+//! - The main thread: the agent ends. The terminal is put back first, whatever was
 //!   held when it happened, so the message is printed where it can be read
 //!   and the shell gets a working terminal.
 //! - The keyboard's thread during a turn: caught there and reported in the
@@ -8,7 +8,7 @@
 //! - Any other thread (a connection, a sync, a subagent's worker): its
 //!   message and where it happened are appended to `panics.log` beside the
 //!   archive, and a line on the page says so. It is not printed: the screen
-//!   is s0ma's, and a message written over it would be lost in the next
+//!   is the agent's, and a message written over it would be lost in the next
 //!   frame and garble this one. The hook takes no lock that a panicking
 //!   thread might hold; the line is said by a watcher thread of its own.
 

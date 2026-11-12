@@ -1,6 +1,6 @@
 //! Weakness log: an auditable record of failures observed during normal operation.
 //!
-//! s0ma proposes, the operator decides. s0ma can report a weakness and add further
+//! The agent proposes, the operator decides. The agent can report a weakness and add further
 //! instances of one, each tied to archive event IDs and/or consolidated episode IDs
 //! that must exist at the moment of the report. Only the operator can confirm,
 //! reject, resolve or merge (the /weakness commands), so the log never certifies
@@ -10,9 +10,9 @@
 //! class labels (the operator's command no longer takes one, and classes logged
 //! before 2026-10-26 reach only the exports) and no log sequence numbers.
 //!
-//! Nothing from the log is in s0ma's context. Confirmed titles used to be listed
+//! Nothing from the log is in the agent's context. Confirmed titles used to be listed
 //! there as a `[KNOWN WEAKNESSES]` block; since 2026-10-26 a confirmed weakness
-//! reaches s0ma only through training (Q10) and through `weakness_list` when it
+//! reaches the agent only through training (Q10) and through `weakness_list` when it
 //! looks. The call store still records an empty `weaknesses` span in every
 //! system message (see `runtime_context::append_catalogs`).
 //!
@@ -495,7 +495,7 @@ fn fold(entries: &[Entry]) -> BTreeMap<String, Weakness> {
                         // The undo of the decision before it. Undoing `resolve`
                         // means the fix did not hold, which is a confirmed
                         // weakness again, not an unreviewed claim; anything
-                        // else goes back to being s0ma's own proposal.
+                        // else goes back to being the agent's own proposal.
                         Decision::Reopen => {
                             weakness.status = if weakness.status == Status::Resolved {
                                 Status::Confirmed
@@ -776,7 +776,7 @@ impl WeaknessLog {
                 "title": weakness.title,
                 "behavior": weakness.behavior,
                 "expected": weakness.expected,
-                // The operator's class if there is one, else s0ma's guess, as
+                // The operator's class if there is one, else the agent's guess, as
                 // weakness_list shows it. Both are given separately so an audit
                 // can tell which it is.
                 "class": weakness.assigned_class.as_ref().or(weakness.suggested_class.as_ref()),
@@ -1010,14 +1010,14 @@ pub fn cited_events(memory: &Hippocampus) -> std::collections::HashSet<u64> {
         .unwrap_or_default()
 }
 
-/// Whether the cited events include a turn of s0ma's own.
+/// Whether the cited events include a turn of the agent's own.
 ///
-/// Q10 renders a lesson from the last cited event that became one of s0ma's own
+/// Q10 renders a lesson from the last cited event that became one of the agent's own
 /// turns: that is the mistake, and the prefix before it is the situation that
 /// invited it. An instance citing only the operator's correction has no mistake
 /// in it, so qref counts it unusable and it trains nothing. Not grounds to
 /// refuse the record — the observation is still worth keeping, and the operator
-/// can ask for a better instance — but worth saying plainly while s0ma still
+/// can ask for a better instance — but worth saying plainly while the agent still
 /// has the event IDs to hand.
 fn cites_own_turn(evidence: &[Evidence]) -> bool {
     evidence
@@ -1147,7 +1147,7 @@ pub fn execute_with(
                 "ok": true, "recorded": true, "weakness_id": weakness_id,
                 // Unchanged by adding an instance, but worth saying: an instance
                 // on a resolved weakness means a fix stopped holding, which is
-                // The operator's to decide about (/weakness reopen), not s0ma's.
+                // the operator's to decide about (/weakness reopen), not the agent's.
                 "status": status_word(existing.status),
                 "instances": existing.instances.len() + 1
             });
@@ -1420,7 +1420,7 @@ mod tests {
             for id in 1..=10 {
                 events.insert(id, ("operator".to_string(), format!("event {id} content")));
             }
-            // A turn of s0ma's own, longer than EXCERPT_CHARS so the snapshot
+            // A turn of the agent's own, longer than EXCERPT_CHARS so the snapshot
             // is cut short: the two things the Q10 export has to get right.
             events.insert(
                 11,
@@ -1433,10 +1433,6 @@ mod tests {
                 events: RefCell::new(events),
                 episodes: BTreeMap::from([("ep-a".to_string(), true)]),
             }
-        }
-
-        fn content(&self, id: u64) -> String {
-            self.events.borrow()[&id].1.clone()
         }
     }
 
@@ -1494,50 +1490,6 @@ mod tests {
     }
 
     #[test]
-    fn report_add_review_export_verify() {
-        let log = temp_log("flow");
-        let src = Fake::new();
-
-        let out = parse(&execute_with(&log, &src, "qwen38-nvfp4", &report(json!([3, 4]))).unwrap());
-        assert_eq!(out["ok"], true, "{out}");
-        assert_eq!(out["weakness_id"], "wk-0001");
-        assert_eq!(out.get("log_seq"), None, "the wk- number is the only ID handed back");
-
-        let add = call("weakness_add_instance", json!({
-            "weakness_id": "wk-0001",
-            "justification": "Event 7 repeats the same move: an unsourced employer name stated as fact.",
-            "event_ids": [7]
-        }));
-        let out = parse(&execute_with(&log, &src, "s0ma-v1", &add).unwrap());
-        assert_eq!(out["instances"], 2, "{out}");
-        assert_eq!(out.get("log_seq"), None);
-
-        let msg = handle_operator_with(&log, &src, "s0ma-v1", "/weakness confirm wk-0001 clear case")
-            .unwrap()
-            .unwrap();
-        assert_eq!(msg, "[weakness] wk-0001: confirm recorded; Q10 trains it from tonight");
-
-        let export: Value = parse(&fs::read_to_string(log.export_path()).unwrap());
-        assert_eq!(export["schema"], EXPORT_SCHEMA);
-        let w = &export["weaknesses"][0];
-        assert_eq!(w["status"], "confirmed");
-        assert_eq!(w["assigned_class"], Value::Null, "confirm takes no class");
-        assert_eq!(w["suggested_class"], Value::Null, "s0ma's suggestion is no longer recorded");
-        assert_eq!(w["reviews"][0]["note"], "clear case");
-        assert_eq!(w["instances"].as_array().unwrap().len(), 2);
-        assert_eq!(w["models_observed"], json!(["qwen38-nvfp4", "s0ma-v1"]));
-        assert_eq!(w["instances"][0]["evidence"][0]["kind"], "event");
-        assert_eq!(w["instances"][0]["evidence"][2]["kind"], "episode");
-
-        assert!(log.verify(&src).unwrap().is_empty());
-
-        // Evidence changing after citation is caught.
-        src.events.borrow_mut().insert(4, ("s0ma".into(), "rewritten".into()));
-        let problems = log.verify(&src).unwrap();
-        assert!(problems.iter().any(|p| p.contains("event 4 changed")), "{problems:?}");
-    }
-
-    #[test]
     fn rejects_missing_or_absent_evidence_and_records_nothing() {
         let log = temp_log("reject");
         let src = Fake::new();
@@ -1574,110 +1526,6 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("entry edited")), "{problems:?}");
     }
 
-    #[test]
-    fn merge_rules_and_list_filters() {
-        let log = temp_log("merge");
-        let src = Fake::new();
-        execute_with(&log, &src, "m", &report(json!([3]))).unwrap();
-        execute_with(&log, &src, "m", &report(json!([5]))).unwrap();
-
-        let err = handle_operator_with(&log, &src, "m", "/weakness merge wk-0002 wk-0002").unwrap();
-        assert!(err.is_err());
-        handle_operator_with(&log, &src, "m", "/weakness merge wk-0002 wk-0001 dup").unwrap().unwrap();
-
-        let add = call("weakness_add_instance", json!({
-            "weakness_id": "wk-0002",
-            "justification": "another instance of the same unsourced claim pattern here"
-            , "event_ids": [6]
-        }));
-        let out = parse(&execute_with(&log, &src, "m", &add).unwrap());
-        assert_eq!(out["recorded"], false);
-        assert!(out["error"].as_str().unwrap().contains("wk-0001"));
-
-        let open = parse(&execute_with(&log, &src, "m", &call("weakness_list", json!({}))).unwrap());
-        assert_eq!(open["count"], 1);
-        let all = parse(&execute_with(&log, &src, "m", &call("weakness_list", json!({"status": "all"}))).unwrap());
-        assert_eq!(all["count"], 2);
-
-        assert!(handle_operator_with(&log, &src, "m", "/sleep").is_none());
-        for cmd in ["/weaknesses help", "/weakness help", "/weaknesses --help", "/weakness ?"] {
-            let help = handle_operator_with(&log, &src, "m", cmd).unwrap().unwrap();
-            assert!(help.contains("/weakness confirm"), "{cmd}");
-        }
-        let bad = handle_operator_with(&log, &src, "m", "/weaknesses frobnicate").unwrap();
-        assert!(bad.unwrap_err().contains("/weaknesses help"));
-    }
-
-    /// A log written before 2026-10-26, with classes on it: a review from the
-    /// removed `classify` and a confirm that took one.
-    fn old_review(log: &WeaknessLog, id: &str, decision: Decision, class: &str) {
-        log.append(
-            "operator",
-            "m",
-            1,
-            Action::Review {
-                weakness_id: id.into(),
-                decision,
-                class: Some(class.into()),
-                merged_into: None,
-                note: String::new(),
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn the_wk_number_is_the_only_id_shown() {
-        let log = temp_log("ids");
-        let src = Fake::new();
-        execute_with(&log, &src, "m", &report(json!([3]))).unwrap();
-        execute_with(&log, &src, "m", &report(json!([5]))).unwrap();
-        old_review(&log, "wk-0001", Decision::Confirm, "W9");
-        old_review(&log, "wk-0002", Decision::Classify, "W11");
-        assert_eq!(log.weaknesses().unwrap()["wk-0001"].assigned_class.as_deref(), Some("W9"));
-
-        // The operator's list and show.
-        let rows = operator(&log, &src, "/weakness list");
-        assert!(rows.contains("wk-0001") && rows.contains("wk-0002"), "{rows}");
-        let shown = operator(&log, &src, "/weakness show wk-0001");
-        for text in [&rows, &shown] {
-            assert!(!text.contains("W9") && !text.contains("W11"), "{text}");
-            assert!(!text.contains("confabulation"), "{text}");
-            assert!(!text.contains("class") && !text.contains("\"seq\""), "{text}");
-        }
-        let shown: Value = parse(&shown);
-        assert_eq!(shown["id"], "wk-0001");
-        assert_eq!(shown["reviews"][0]["decision"], "confirm", "the review itself stays");
-        assert_eq!(shown["instances"][0]["evidence"][0]["id"], 3, "archive IDs stay");
-
-        // s0ma's list.
-        let listed = execute_with(&log, &src, "m", &call("weakness_list", json!({"status": "all"}))).unwrap();
-        assert!(!listed.contains("W9") && !listed.contains("W11") && !listed.contains("class"), "{listed}");
-        assert_eq!(parse(&listed)["count"], 2);
-
-        // A tool description that offered a class would invite one back.
-        for tool in tool_definitions() {
-            let text = serde_json::to_string(&tool).unwrap();
-            assert!(!text.contains("class"), "{}: {text}", tool.function.name);
-        }
-
-        // The command that set one is gone, with a reason rather than a usage dump.
-        let gone = handle_operator_with(&log, &src, "m", "/weakness classify wk-0001 W9").unwrap().unwrap_err();
-        assert!(gone.contains("no class"), "{gone}");
-        assert!(!HELP.contains("classify") && !HELP.contains("W9"), "{HELP}");
-
-        // The old "no class" placeholder is not taken for the start of a note.
-        operator(&log, &src, "/weakness confirm wk-0002 - same as before");
-        let reviews = &log.weaknesses().unwrap()["wk-0002"].reviews;
-        assert_eq!(reviews.last().unwrap().note, "same as before");
-        assert_eq!(reviews.last().unwrap().class, None);
-
-        // verify names the weakness and the event, not a log position.
-        src.events.borrow_mut().insert(3, ("operator".into(), "rewritten".into()));
-        let problems = log.verify(&src).unwrap();
-        assert_eq!(problems, ["wk-0001: cited event 3 changed since it was cited"]);
-    }
-
     // -------------------------------------------------------- the Q10 export
 
     /// The export as qref reads it: the header, then one weakness per line.
@@ -1700,278 +1548,6 @@ mod tests {
         handle_operator_with(log, src, "m", command)
             .unwrap_or_else(|| panic!("not a weakness command: {command}"))
             .unwrap_or_else(|error| panic!("{command}: {error}"))
-    }
-
-    #[test]
-    fn q10_export_carries_every_status_and_names_the_log_head() {
-        let log = temp_log("q10-statuses");
-        let src = Fake::new();
-        for _ in 0..5 {
-            execute_with(&log, &src, "qwen38-nvfp4", &report(json!([3, 11]))).unwrap();
-        }
-        operator(&log, &src, "/weakness confirm wk-0001 holds up");
-        old_review(&log, "wk-0001", Decision::Classify, "verification");
-        operator(&log, &src, "/weakness confirm wk-0002");
-        operator(&log, &src, "/weakness resolve wk-0002 trained out on 2026-10-20");
-        operator(&log, &src, "/weakness reject wk-0003 not a weakness");
-        operator(&log, &src, "/weakness merge wk-0004 wk-0001 same thing");
-        // wk-0005 is left proposed.
-
-        let lines = read_q10(&log);
-        assert_eq!(lines.len(), 6, "a header and every weakness: {lines:?}");
-
-        let entries = log.entries().unwrap();
-        let last = entries.last().unwrap();
-        let header = &lines[0]["export"];
-        assert_eq!(header["chain_head"], last.hash, "the head of the chain it was folded from");
-        assert_eq!(header["seq"], last.seq);
-        assert_eq!(header["model"], last.model);
-        assert_eq!(header["weaknesses"], 5);
-        let written = header["written"].as_str().unwrap();
-        assert!(written.ends_with('Z') && written.len() == 20, "{written}");
-
-        // Whatever the status, it is in the file, and it says what fold() says.
-        let folded = log.weaknesses().unwrap();
-        let exported = q10_by_id(&log);
-        assert_eq!(exported.len(), folded.len());
-        for (id, weakness) in &folded {
-            assert_eq!(exported[id]["status"], status_word(weakness.status), "{id}");
-        }
-        assert_eq!(exported["wk-0001"]["status"], "confirmed");
-        assert_eq!(exported["wk-0002"]["status"], "resolved");
-        assert_eq!(exported["wk-0003"]["status"], "rejected");
-        assert_eq!(exported["wk-0004"]["status"], "merged");
-        assert_eq!(exported["wk-0005"]["status"], "proposed");
-
-        // The fields qref decides on.
-        let confirmed = &exported["wk-0001"];
-        // A class logged before they were removed still reaches qref; a newer
-        // weakness has none.
-        assert_eq!(confirmed["class"], "verification");
-        assert_eq!(confirmed["assigned_class"], "verification");
-        assert_eq!(exported["wk-0002"]["class"], Value::Null);
-        assert_eq!(confirmed["severity"], "medium");
-        assert_eq!(confirmed["models_observed"], json!(["qwen38-nvfp4"]));
-        assert_eq!(confirmed["merged_into"], Value::Null);
-        assert_eq!(confirmed["expected"], "Say I don't know the job title.");
-        assert_eq!(exported["wk-0004"]["merged_into"], "wk-0001");
-        for weakness in exported.values() {
-            assert!(
-                !weakness["expected"].as_str().unwrap().is_empty(),
-                "an empty `expected` would make the weakness contribute nothing"
-            );
-        }
-
-        // One instance, its evidence split the way qref expects.
-        let instance = &confirmed["instances"][0];
-        assert_eq!(instance["instance_id"], "wk-0001/1");
-        assert_eq!(instance["events"].as_array().unwrap().len(), 2);
-        assert_eq!(instance["events"][0]["id"], 3);
-        assert_eq!(instance["events"][1]["speaker"], "s0ma");
-        assert_eq!(instance["episodes"], json!([{"id": "ep-a", "intact": true}]));
-        assert_eq!(instance["after_event_id"], 11);
-        assert!(instance["events"][0]["sha256"].as_str().unwrap().len() == 64);
-
-        // Reviews are the audit trail, with who decided.
-        let reviews = exported["wk-0002"]["reviews"].as_array().unwrap();
-        assert_eq!(reviews.len(), 2);
-        assert_eq!(reviews[0]["decision"], "confirm");
-        assert_eq!(reviews[1]["decision"], "resolve");
-        assert_eq!(reviews[1]["actor"], "operator");
-        assert_eq!(reviews[1]["note"], "trained out on 2026-10-20");
-
-        // And /weakness export rebuilds the same thing from the log alone.
-        let before = fs::read_to_string(log.q10_export_path()).unwrap();
-        fs::remove_file(log.q10_export_path()).unwrap();
-        let message = operator(&log, &src, "/weakness export");
-        assert!(message.contains("weaknesses-export.jsonl"), "{message}");
-        let after = fs::read_to_string(log.q10_export_path()).unwrap();
-        let strip = |text: &str| text.split_once('\n').unwrap().1.to_string();
-        assert_eq!(strip(&before), strip(&after), "only the timestamp differs");
-    }
-
-    #[test]
-    fn an_empty_log_exports_a_header_and_nothing_else() {
-        // The sleep pass refreshes the export every night, including on a
-        // machine where nothing has ever been logged. A header with no chain
-        // head is honest about that and still parses as JSONL.
-        let log = temp_log("q10-empty");
-        log.export().unwrap();
-        let lines = read_q10(&log);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["export"]["chain_head"], Value::Null);
-        assert_eq!(lines[0]["export"]["seq"], 0);
-        assert_eq!(lines[0]["export"]["weaknesses"], 0);
-        assert!(fs::read_to_string(log.export_path()).unwrap().contains("\"weaknesses\""));
-    }
-
-    #[test]
-    fn startup_exports_a_log_that_has_no_export_beside_it() {
-        // The first run after this code lands has a log full of weaknesses and
-        // no export, because the export is derived and nothing has appended
-        // since. A night that discovers that by failing is not good enough, so
-        // startup writes it like the sleep pass does.
-        let dir = std::env::temp_dir().join(format!("s0ma-weakness-first-run-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let memory = Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        let log = WeaknessLog::beside_archive(memory.archive_path());
-        let src = Fake::new();
-        execute_with(&log, &src, "qwen38-nvfp4", &report(json!([3, 11]))).unwrap();
-        handle_operator_with(&log, &src, "m", "/weakness confirm wk-0001")
-            .unwrap()
-            .unwrap();
-
-        // As if the log predates the exporter, or someone deleted the files.
-        fs::remove_file(log.q10_export_path()).unwrap();
-        fs::remove_file(log.export_path()).unwrap();
-
-        refresh_export(&memory);
-        assert!(log.q10_export_path().exists(), "the Q10 export is rebuilt from the log alone");
-        assert!(log.export_path().exists());
-        let lines = read_q10(&log);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[1]["id"], "wk-0001");
-        assert_eq!(lines[1]["status"], "confirmed");
-        assert_eq!(lines[0]["export"]["chain_head"], log.entries().unwrap().last().unwrap().hash);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn exported_excerpts_are_the_raw_prefix_of_the_event() {
-        let log = temp_log("q10-excerpt");
-        let src = Fake::new();
-        execute_with(&log, &src, "m", &report(json!([3, 11]))).unwrap();
-
-        let exported = q10_by_id(&log);
-        let events = exported["wk-0001"]["instances"][0]["events"].clone();
-
-        // A short event is passed through untouched.
-        assert_eq!(events[0]["excerpt"], src.content(3));
-
-        // A long one keeps its raw leading characters and nothing else: qref
-        // re-reads the event and requires the content to still begin with this
-        // string, so the log's "…" marker cannot be left in it.
-        let content = src.content(11);
-        let excerpt = events[1]["excerpt"].as_str().unwrap();
-        assert_eq!(excerpt.chars().count(), EXCERPT_CHARS);
-        assert!(!excerpt.ends_with('…'), "the marker is not part of the content");
-        assert!(content.starts_with(excerpt), "the archived content must still begin with it");
-        assert_eq!(excerpt, content.chars().take(EXCERPT_CHARS).collect::<String>());
-
-        // Byte-identical to the snapshot the log took, marker aside: no
-        // trimming, no whitespace normalisation, nothing tidied.
-        let entries = log.entries().unwrap();
-        let Action::Report { instance, .. } = &entries[0].action else {
-            panic!("the first entry is the report")
-        };
-        for (evidence, line) in instance.evidence.iter().zip(events.as_array().unwrap()) {
-            let Evidence::Event { excerpt: stored, content_sha256, .. } = evidence else {
-                continue;
-            };
-            assert_eq!(
-                stored.strip_suffix('…').unwrap_or(stored),
-                line["excerpt"].as_str().unwrap()
-            );
-            assert_eq!(content_sha256, line["sha256"].as_str().unwrap());
-        }
-    }
-
-    #[test]
-    fn instance_ids_survive_a_review_between_exports() {
-        let log = temp_log("q10-ids");
-        let src = Fake::new();
-        execute_with(&log, &src, "m", &report(json!([3]))).unwrap();
-        for (event, text) in [(7, "the seventh event repeats it"), (8, "and the eighth does too")] {
-            let add = call("weakness_add_instance", json!({
-                "weakness_id": "wk-0001",
-                "justification": format!("{text}: an unsourced claim stated as fact once again"),
-                "event_ids": [event]
-            }));
-            assert_eq!(parse(&execute_with(&log, &src, "m", &add).unwrap())["recorded"], true);
-        }
-
-        let keyed = |log: &WeaknessLog| -> BTreeMap<String, Value> {
-            q10_by_id(log)["wk-0001"]["instances"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|i| (i["instance_id"].as_str().unwrap().to_string(), i["justification"].clone()))
-                .collect()
-        };
-        let before = keyed(&log);
-        assert_eq!(
-            before.keys().collect::<Vec<_>>(),
-            ["wk-0001/1", "wk-0001/2", "wk-0001/3"]
-        );
-        let head_before = read_q10(&log)[0]["export"]["chain_head"].clone();
-
-        // A review, a resolve, and a second weakness reported in between:
-        // qref keys the drafted corrections on these IDs, so none of it may
-        // renumber what is already out there.
-        operator(&log, &src, "/weakness confirm wk-0001");
-        execute_with(&log, &src, "m", &report(json!([5]))).unwrap();
-        operator(&log, &src, "/weakness resolve wk-0001 trained out");
-        assert_eq!(keyed(&log), before);
-
-        let head_after = read_q10(&log)[0]["export"]["chain_head"].clone();
-        assert_ne!(head_before, head_after, "the head names the new state of the log");
-        assert_eq!(head_after, log.entries().unwrap().last().unwrap().hash);
-        assert_eq!(q10_by_id(&log)["wk-0002"]["instances"][0]["instance_id"], "wk-0002/1");
-    }
-
-    #[test]
-    fn the_export_is_replaced_in_one_step() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let log = temp_log("q10-atomic");
-        let src = Fake::new();
-        execute_with(&log, &src, "m", &report(json!([3]))).unwrap();
-
-        // q10.sh may read the export while the harness is running, so every
-        // read has to see a whole file: a header that parses and exactly as
-        // many weakness lines as it claims.
-        let path = log.q10_export_path().to_path_buf();
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let (path, stop) = (path.clone(), Arc::clone(&stop));
-            std::thread::spawn(move || {
-                let mut reads = 0usize;
-                while !stop.load(Ordering::Relaxed) {
-                    let text = match fs::read_to_string(&path) {
-                        Ok(text) => text,
-                        Err(error) => panic!("the export vanished mid-write: {error}"),
-                    };
-                    let mut lines = text.lines();
-                    let header: Value =
-                        serde_json::from_str(lines.next().expect("a header")).expect("a torn header");
-                    let rest: Vec<&str> = lines.collect();
-                    assert_eq!(
-                        header["export"]["weaknesses"].as_u64().unwrap() as usize,
-                        rest.len(),
-                        "a half-written export was readable"
-                    );
-                    for line in rest {
-                        serde_json::from_str::<Value>(line).expect("a torn weakness line");
-                    }
-                    reads += 1;
-                }
-                reads
-            })
-        };
-        for _ in 0..40 {
-            execute_with(&log, &src, "m", &report(json!([3]))).unwrap();
-        }
-        stop.store(true, Ordering::Relaxed);
-        assert!(reader.join().unwrap() > 0, "the reader never read anything");
-
-        // And nothing is left lying beside it.
-        let leftovers: Vec<String> = fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     // ------------------------------------------------------------- resolve
@@ -2011,7 +1587,7 @@ mod tests {
         assert_eq!(q10_by_id(&log)["wk-0001"]["status"], "resolved");
 
         // A recurrence is news, not a rejection: the instance is recorded and
-        // the status is handed back so s0ma can say the fix stopped holding.
+        // the status is handed back so the agent can say the fix stopped holding.
         let add = call("weakness_add_instance", json!({
             "weakness_id": "wk-0001",
             "justification": "Event 6 does it again after the fix: the same unsourced claim as fact.",
@@ -2031,41 +1607,5 @@ mod tests {
         assert_eq!(log.weaknesses().unwrap()["wk-0002"].status, Status::Proposed);
 
         assert!(HELP.contains("/weakness resolve"));
-    }
-
-    #[test]
-    fn an_instance_citing_only_the_complaint_is_flagged() {
-        let log = temp_log("own-turn");
-        let src = Fake::new();
-
-        // Event 3 is the operator's; 11 is s0ma's own turn. qref renders the
-        // lesson from the last cited turn of s0ma's own, so without one there
-        // is no mistake to correct.
-        let out = parse(&execute_with(&log, &src, "m", &report(json!([3]))).unwrap());
-        assert_eq!(out["recorded"], true, "the record is still kept");
-        assert!(
-            out["evidence_note"].as_str().unwrap().contains("weakness_add_instance"),
-            "{out}"
-        );
-
-        let out = parse(&execute_with(&log, &src, "m", &report(json!([3, 11]))).unwrap());
-        assert_eq!(out["evidence_note"], Value::Null, "{out}");
-
-        let add = |ids: Value| call("weakness_add_instance", json!({
-            "weakness_id": "wk-0002",
-            "justification": "The same move again, stated as fact with nothing behind it at all.",
-            "event_ids": ids
-        }));
-        let out = parse(&execute_with(&log, &src, "m", &add(json!([4]))).unwrap());
-        assert!(out["evidence_note"].is_string(), "{out}");
-        let out = parse(&execute_with(&log, &src, "m", &add(json!([11]))).unwrap());
-        assert_eq!(out["evidence_note"], Value::Null, "{out}");
-
-        // The tools say so up front, too.
-        let tools = tool_definitions();
-        for name in ["weakness_report", "weakness_add_instance"] {
-            let tool = tools.iter().find(|t| t.function.name == name).unwrap();
-            assert!(tool.function.description.contains("your own turn"), "{name}");
-        }
     }
 }

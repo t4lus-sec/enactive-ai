@@ -48,7 +48,7 @@ const TOGGLE_DETAIL: &str = "toggle-detail";
 /// `term:<key>`: Alt+Shift+<key>, a terminal (see `tabs.rs`).
 const TAB_COMMAND: &str = "tab:";
 const TERMINAL_COMMAND: &str = "term:";
-/// The keys that lead to a tab, with Alt (Alt+1 is s0ma, Alt+2…9 and Alt+0
+/// The keys that lead to a tab, with Alt (Alt+1 is the agent, Alt+2…9 and Alt+0
 /// its subagents) or with Alt+Shift (the shells).
 const TAB_KEYS: [char; 10] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
 /// A resize followed by another within this is one resize: the last.
@@ -123,7 +123,7 @@ impl Completer for SomaCompleter {
 }
 
 /// `$VISUAL`, then `$EDITOR`, then nano / vim / vi from `PATH`.
-/// The idle prompt's keys (Emacs's, with s0ma's bindings), and what the page
+/// The idle prompt's keys (Emacs's, with the agent's bindings), and what the page
 /// needs instead of reedline's own handling: the wheel scrolls back through
 /// the conversation, and a resize draws the whole page again (reedline would
 /// draw only its prompt).
@@ -209,14 +209,14 @@ struct QueuedSubmission {
     /// the next steering point instead of waiting for a safe one, and takes
     /// everything queued before it along.
     forced: bool,
-    /// The message itself is in the transcript (sent now, or taken by s0ma).
+    /// The message itself is in the transcript (sent now, or taken by the agent).
     shown: bool,
     /// A status line already said it is queued; it goes into the transcript
-    /// when s0ma takes it.
+    /// when the agent takes it.
     announced: bool,
 }
 
-/// `/now <message>`: send it at once rather than after s0ma's current step.
+/// `/now <message>`: send it at once rather than after the agent's current step.
 /// Returns what follows the prefix (possibly empty: send what's queued).
 pub fn strip_send_now(text: &str) -> Option<&str> {
     let rest = text.trim_start().strip_prefix("/now")?;
@@ -245,7 +245,7 @@ fn sent_now_waiting(queued: &VecDeque<QueuedSubmission>) -> bool {
     queued.iter().any(|s| s.forced)
 }
 
-/// An operator message handed to s0ma, with when it was sent: one that
+/// An operator message handed to the agent, with when it was sent: one that
 /// waited in the queue says so in its header (`clock::Arrival`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Submitted {
@@ -253,7 +253,7 @@ pub struct Submitted {
     pub sent_at: DateTime<Local>,
 }
 
-/// The messages a release hands to s0ma, in order: a bare "send now" carries
+/// The messages a release hands to the agent, in order: a bare "send now" carries
 /// no text of its own.
 fn release_contents(released: Vec<QueuedSubmission>) -> (Vec<Submitted>, usize) {
     let contents: Vec<Submitted> = released
@@ -276,7 +276,7 @@ pub struct ExternalSubmitter {
 }
 
 impl ExternalSubmitter {
-    /// While s0ma works, the message waits for a safe point like a typed one;
+    /// While the agent works, the message waits for a safe point like a typed one;
     /// a `/now` prefix sends it at once.
     pub fn submit(&self, content: String, visible_text: String) -> Result<(), String> {
         let (content, visible_text, forced) =
@@ -322,25 +322,14 @@ type RemoteSteer = Box<dyn Fn(String, bool) -> io::Result<Steered> + Send + Sync
 /// as typed, and whether it was sent now), instead of this process's queue.
 static REMOTE_STEER: OnceLock<RemoteSteer> = OnceLock::new();
 
-/// Make this terminal a window onto another s0ma (`session.rs`): what is
-/// typed goes to `send`, and is shown when that s0ma takes it.
+/// Make this terminal a window onto another agent (`session.rs`): what is
+/// typed goes to `send`, and is shown when that the agent takes it.
 pub fn steer_remotely(send: RemoteSteer) {
     let _ = REMOTE_STEER.set(send);
 }
 
 #[cfg(test)]
 impl ExternalSubmitter {
-    /// A submitter wired to no terminal, and a way to see what reached its queue.
-    pub(crate) fn detached() -> (Self, impl Fn() -> Vec<String>) {
-        let (submits, received) = mpsc::channel::<QueuedSubmission>();
-        let received = Mutex::new(received);
-        let submitter = Self {
-            submits,
-            external_break_signal: Arc::new(AtomicBool::new(false)),
-            display: ActiveDisplay::new(),
-        };
-        (submitter, move || crate::util::locked(&received).try_iter().map(|s| s.content).collect())
-    }
 }
 
 /// The tab bar atop the page, for the terminal's width now.
@@ -349,7 +338,7 @@ fn idle_bar() -> (String, usize) {
     crate::tabs::main_bar(columns.saturating_sub(1) as usize)
 }
 
-/// s0ma's normal idle operator prompt.
+/// The agent's normal idle operator prompt.
 ///
 /// Reedline owns the terminal only while the application is waiting
 /// for an ordinary operator turn.
@@ -490,7 +479,7 @@ impl InputReader {
         }
 
         // Ctrl+G: edit the prompt in $VISUAL/$EDITOR (replaces Emacs redo).
-        // s0ma's own, not reedline's: the editor gets the shell's screen, and
+        // The agent's own, not reedline's: the editor gets the shell's screen, and
         // the page is drawn again after (`edit_idle_draft`).
         keybindings.add_binding(
             KeyModifiers::CONTROL,
@@ -596,6 +585,13 @@ impl InputReader {
                     ReedlineEvent::ExecuteHostCommand(format!("{TAB_COMMAND}e")),
                 );
             }
+            for key in ['u', 'U'] {
+                keybindings.add_binding(
+                    modifiers,
+                    KeyCode::Char(key),
+                    ReedlineEvent::ExecuteHostCommand(format!("{TAB_COMMAND}u")),
+                );
+            }
         }
 
         // Tab: complete commands, subcommands and @file paths.
@@ -613,7 +609,6 @@ impl InputReader {
         let active_display = ActiveDisplay::new();
         // Harness output from anywhere goes through it from now on.
         crate::terminal::share(&active_display);
-
 
         let callback_break_signal = Arc::clone(&break_signal);
         let callback_external_break_signal = Arc::clone(&external_break_signal);
@@ -753,11 +748,9 @@ impl InputReader {
 
         self.break_signal.store(false, Ordering::Relaxed);
 
-
         let result = self.read_idle_event();
 
         self.break_signal.store(false, Ordering::Relaxed);
-
 
         result
     }
@@ -823,7 +816,7 @@ impl InputReader {
 
             // Printed through the display, so Ctrl+O's redraw keeps them.
             // Not shown yet (queued, or from outside the keyboard): here,
-            // where s0ma takes it. Made safe: from an attached terminal or
+            // where the agent takes it. Made safe: from an attached terminal or
             // voice it must not be able to move the cursor or restyle the screen.
             if !submission.shown
                 && let Some(visible_text) = submission.visible_text.as_deref().filter(|text| !text.trim().is_empty()) {
@@ -881,7 +874,7 @@ impl InputReader {
 
     fn read_idle_event(&mut self) -> io::Result<InputEvent> {
         loop {
-            // A tab left open while a turn ran, or while s0ma looked at a
+            // A tab left open while a turn ran, or while the agent looked at a
             // wake: it has the keyboard again until it is closed.
             if crate::tabs::is_open()
                 && let Some(event) = self.run_idle_tab()?
@@ -931,7 +924,7 @@ impl InputReader {
 
             let event = match signal {
                 Signal::Success(buffer) if REMOTE_STEER.get().is_some() => {
-                    // An attached terminal: what was typed goes to the s0ma it
+                    // An attached terminal: what was typed goes to the agent it
                     // is attached to as it is, and is shown when it takes it.
                     let _ = self.active_display.erase_submitted(&buffer);
                     let _ = self.active_display.flush_idle();
@@ -1127,7 +1120,6 @@ impl InputReader {
                 }
             };
 
-
             return Ok(event);
         }
     }
@@ -1173,7 +1165,7 @@ impl InputReader {
         Ok(())
     }
 
-    /// What was typed in a pane of s0ma's page, between turns: as the prompt
+    /// What was typed in a pane of the agent's page, between turns: as the prompt
     /// takes a line (kept in the record, recalled with Up, attachments read).
     fn submitted_from_pane(&mut self, text: String) -> Option<InputEvent> {
         let _ = self.active_display.show_submitted(&text);
@@ -1193,9 +1185,9 @@ impl InputReader {
     }
 
     /// A tab has the screen between turns: its keys, until it is closed
-    /// (`None`; the prompt comes back) or something needs s0ma's loop. A wake
+    /// (`None`; the prompt comes back) or something needs the agent's loop. A wake
     /// (a subagent finishing, a VM event, a submission from outside) returns
-    /// `Timeout` with the tab still open, so s0ma is never held up by one: a
+    /// `Timeout` with the tab still open, so the agent is never held up by one: a
     /// turn may start and run behind it, and its keyboard worker carries the
     /// tab on (`handle_active_event`). Ctrl+C and Ctrl+D are what they are
     /// at the prompt.
@@ -1233,7 +1225,7 @@ impl InputReader {
             if let Some(event) = event {
                 match crate::tabs::event(&event, &self.active_display) {
                     Ok(crate::tabs::Outcome::Stay) => {}
-                    // Typed in a pane of s0ma's page: a turn, the panes kept up.
+                    // Typed in a pane of the agent's page: a turn, the panes kept up.
                     Ok(crate::tabs::Outcome::Submit { text, .. }) => {
                         if let Some(submitted) = self.submitted_from_pane(text) {
                             break Ok(Some(submitted));
@@ -1267,8 +1259,8 @@ impl InputReader {
         crate::terminal::set_mouse(false);
         let raw = disable_raw_mode();
         match outcome {
-            // A tab that cannot read or draw is closed, and s0ma's prompt
-            // comes back: never a reason to stop s0ma.
+            // A tab that cannot read or draw is closed, and the agent's prompt
+            // comes back: never a reason to stop the agent.
             Err(error) => {
                 crate::terminal::warn_status(&format!("[input] the tab was closed: {error}"));
                 Ok(None)
@@ -1285,7 +1277,7 @@ impl InputReader {
     // ACTIVE INPUT
     // ========================================================
 
-    /// Enter the lightweight input mode used while s0ma is
+    /// Enter the lightweight input mode used while the agent is
     /// actively reasoning, speaking, or using tools.
     ///
     /// Reedline is not running in this mode. Crossterm gives us
@@ -1418,7 +1410,7 @@ impl InputReader {
         self.active_display.clone()
     }
 
-    /// Hand s0ma the operator's messages, if this steering point takes them.
+    /// Hand the agent the operator's messages, if this steering point takes them.
     ///
     /// Messages wait in a queue for a safe point (see `agent::SteerPoint`):
     /// after a batch of tool calls, never in the middle of the model's output
@@ -1441,7 +1433,7 @@ impl InputReader {
 
         // Messages from outside the keyboard (attached terminals, voice):
         // one sent now goes into the transcript at once; one that waits gets
-        // a status line, and is shown when s0ma takes it (below).
+        // a status line, and is shown when the agent takes it (below).
         if !releasing {
             for submission in self.queued.iter_mut().skip(first_new).filter(|s| !s.shown && !s.announced) {
                 let Some(visible_text) = submission.visible_text.as_deref().filter(|t| !t.trim().is_empty()) else {
@@ -1467,7 +1459,7 @@ impl InputReader {
             return Ok(Vec::new());
         }
         // Handed over now: each message not in the transcript yet goes in
-        // here, in the order s0ma reads them, after the work it waited for.
+        // here, in the order the agent reads them, after the work it waited for.
         let released: Vec<QueuedSubmission> = self.queued.drain(..).collect();
         for submission in released.iter().filter(|s| !s.shown) {
             if let Some(visible_text) = submission.visible_text.as_deref().filter(|t| !t.trim().is_empty()) {
@@ -1482,7 +1474,6 @@ impl InputReader {
     // ========================================================
     // INTERNAL STATE
     // ========================================================
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1654,7 +1645,7 @@ fn handle_active_event(
         // A tab has the screen: its keys are its own (`tabs.rs`).
         _ if crate::tabs::is_open() => match crate::tabs::event(&event, display) {
             Ok(crate::tabs::Outcome::Stay) => Ok(()),
-            // Typed in a pane of s0ma's page: steering, as the pane's own.
+            // Typed in a pane of the agent's page: steering, as the pane's own.
             Ok(crate::tabs::Outcome::Submit { text, now }) => {
                 if let Ok(mut editor) = lock_editor(editor) {
                     editor.history.push(&text, true);
@@ -1865,10 +1856,10 @@ fn handle_active_key(
     }
 }
 
-/// Enter (queue it for s0ma's next safe point) or send now (`force`, or a
+/// Enter (queue it for the agent's next safe point) or send now (`force`, or a
 /// `/now` prefix), into the queue `InputReader::poll_active` drains. Sent now,
 /// the draft goes into the transcript at once; queued, a status line says so
-/// and the message goes in where s0ma takes it.
+/// and the message goes in where the agent takes it.
 fn submit_draft(
     editor: &SharedEditor,
     display: &ActiveDisplay,
@@ -1884,8 +1875,8 @@ fn submit_draft(
     send_steered(display, submits, submitted, force)
 }
 
-/// What was typed during a turn, to s0ma (the steering pane's, or a pane of
-/// s0ma's page beside a tab).
+/// What was typed during a turn, to the agent (the steering pane's, or a pane of
+/// the agent's page beside a tab).
 fn send_steered(display: &ActiveDisplay, submits: &Sender<QueuedSubmission>, submitted: String, force: bool) -> io::Result<()> {
     let steered = match REMOTE_STEER.get() {
         Some(send) => {
@@ -1931,7 +1922,7 @@ pub enum Steered {
     MemoryTab(Option<u64>),
 }
 
-/// A message from a steering pane: queued for s0ma's next safe point, or
+/// A message from a steering pane: queued for the agent's next safe point, or
 /// sent now; `/kill` and `/mistake` act at once. `local`: typed in this
 /// terminal's pane, whose draft it was (one from an attached terminal
 /// leaves this pane's draft as it is).
@@ -1972,7 +1963,7 @@ fn steer_text(
 
     // /vm on|off acts here too: the machine is off limits from the next tool
     // call, not after the turn.
-    if let Some(result) = crate::vm_access::handle_command(&text) {
+    if let Some(result) = crate::vm::access::handle_command(&text) {
         commit(&text, OperatorNote::Plain)?;
         let line = result.unwrap_or_else(|error| error);
         display.write_stream(&format!("{STATUS_STYLE}{line}{RESET}\r\n"))?;
@@ -1986,7 +1977,7 @@ fn steer_text(
 
     // So does /mistake: flagging a call never steers or delays the turn,
     // and a flag typed while a call streams waits for that call. The review
-    // window opens over the paused transcript, while s0ma works on.
+    // window opens over the paused transcript, while the agent works on.
     if let Some(reply) = crate::mistakes::handle_command(&text, crate::mistakes::Place::Steering) {
         commit(&text, OperatorNote::Plain)?;
         let (report, problem) = match reply {
@@ -1994,7 +1985,7 @@ fn steer_text(
             crate::mistakes::Reply::Error(text) => (text, true),
             crate::mistakes::Reply::View(start) => return Ok(Steered::MistakeView(start)),
         };
-        // A notice of its own, never inside a line s0ma is still writing.
+        // A notice of its own, never inside a line the agent is still writing.
         let brief = report.lines().next().unwrap_or_default().to_owned();
         display.notice(&brief, &report, problem)?;
         return Ok(Steered::Done);
@@ -2023,7 +2014,7 @@ fn steer_text(
 }
 
 /// `visible`: the message as typed, shown already if `forced` (sent now),
-/// or announced as queued and shown when s0ma takes it.
+/// or announced as queued and shown when the agent takes it.
 fn send_submission(
     submits: &Sender<QueuedSubmission>,
     content: String,
@@ -2220,7 +2211,7 @@ fn list_hint(values: &[String], selected: Option<usize>) -> String {
 }
 
 /// `/mistake view` during a turn: the review window, with the screen and the
-/// keyboard to itself, as Ctrl+G's editor has them. s0ma keeps working; its
+/// keyboard to itself, as Ctrl+G's editor has them. The agent keeps working; its
 /// output is held and laid out when the window closes. A turn that ends
 /// meanwhile waits for the window: this thread is still handling a key, so
 /// `end_active` waits for it.
@@ -2233,7 +2224,7 @@ fn open_mistake_view(display: &ActiveDisplay, start: Option<u64>) -> io::Result<
     let _ = execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
     crate::terminal::set_mouse(false);
 
-    let closed = crate::mistake_view::run(book, start);
+    let closed = crate::mistakes::view::run(book, start);
 
     // The window's screen guard leaves raw mode off on its way out; the
     // steering pane needs it back.
@@ -2308,52 +2299,22 @@ impl Drop for InputReader {
     }
 }
 
+/// Alt+A or Alt+X on the page: approval mode's answer, and what came of it
+/// on the page.
+fn answer_approval(approve: bool) {
+    match crate::approval::key(approve) {
+        Ok(said) if said.is_empty() => {}
+        Ok(said) => crate::terminal::say_status(&said),
+        Err(said) => crate::terminal::warn_status(&said),
+    }
+}
+
 #[cfg(test)]
 mod steer_queue_tests {
     use super::*;
 
     fn queued(content: &str, forced: bool) -> QueuedSubmission {
         QueuedSubmission { content: content.into(), visible_text: None, sent_at: Local::now(), forced, shown: true, announced: false }
-    }
-
-    #[test]
-    fn forgetting_after_a_job_keeps_the_history_file_it_purged() {
-        let dir = std::env::temp_dir().join(format!("s0ma-forget-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("input_history.txt");
-        std::fs::write(&file, "from last week\nfrom yesterday\n").unwrap();
-        let mut reader = InputReader::spawn(Arc::new(AtomicBool::new(false)), file.clone()).unwrap();
-        crate::jobs::note_history_purge();
-        reader.forget_history_if_asked();
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        assert!(text.contains("from last week") && text.contains("from yesterday"), "{text:?}");
-        drop(reader);
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        assert!(text.contains("from last week"), "and after the prompt saves on the way out: {text:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_attached_terminals_steer_is_handled_as_this_panes_and_leaves_its_draft_alone() {
-        let (submitter, queued) = ExternalSubmitter::detached();
-        submitter.display.set_input("my own draft", 12).unwrap();
-        assert!(matches!(submitter.steer("only /b".into(), false).unwrap(), Steered::Done));
-        assert!(matches!(submitter.steer("go".into(), true).unwrap(), Steered::Done));
-        assert!(matches!(submitter.steer("/now and this".into(), false).unwrap(), Steered::Done));
-        assert_eq!(queued(), ["only /b", "go", "and this"]);
-        assert_eq!(submitter.display.input_for_test(), "my own draft", "the primary's half-typed line stays");
-        assert!(submitter.external_break_signal.load(Ordering::Relaxed), "an idle prompt wakes for it");
-    }
-
-    #[test]
-    fn now_prefix_is_a_word_of_its_own() {
-        assert_eq!(strip_send_now("/now stop and look at the logs"), Some("stop and look at the logs"));
-        assert_eq!(strip_send_now("  /now\nmultiline"), Some("multiline"));
-        assert_eq!(strip_send_now("/now"), Some(""));
-        assert_eq!(strip_send_now("/now   "), Some(""));
-        assert_eq!(strip_send_now("/nowhere"), None);
-        assert_eq!(strip_send_now("now please"), None);
-        assert_eq!(strip_send_now("look at /now"), None);
     }
 
     #[test]
@@ -2375,45 +2336,5 @@ mod steer_queue_tests {
         let contents: Vec<&str> = contents.iter().map(|s| s.content.as_str()).collect();
         assert_eq!(contents, vec!["check the logs too", "stop, wrong host"]);
         assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn a_released_message_keeps_when_it_was_sent() {
-        use chrono::TimeZone;
-        let sent_at = Local.with_ymd_and_hms(2026, 10, 22, 12, 4, 0).unwrap();
-        let queue = VecDeque::from([QueuedSubmission { sent_at, ..queued("written at 12:04", false) }]);
-        let (released, _) = release_contents(queue.into_iter().collect());
-        assert_eq!(released, vec![Submitted { content: "written at 12:04".into(), sent_at }]);
-    }
-
-    #[test]
-    fn a_bare_send_now_releases_the_queue_but_adds_no_message() {
-        let mut queue = VecDeque::from([queued("one", false), queued("two", false), queued("", true)]);
-        assert!(releases(SteerPoint::Streaming, &queue));
-        let (contents, count) = release_contents(queue.drain(..).collect());
-        let contents: Vec<&str> = contents.iter().map(|s| s.content.as_str()).collect();
-        assert_eq!(contents, vec!["one", "two"]);
-        assert_eq!(count, 2, "the queued count drops by the messages, not the marker");
-    }
-
-    #[test]
-    fn attached_clients_and_voice_send_now_with_the_prefix() {
-        let (submitter, received) = ExternalSubmitter::detached();
-        submitter.submit("/now stop".into(), "/now stop".into()).unwrap();
-        submitter.submit("later".into(), "later".into()).unwrap();
-        // Voice tags its content, so a spoken "/now" is just words.
-        submitter.submit("[voice] /now hi".into(), "/now hi".into()).unwrap();
-        assert_eq!(received(), vec!["stop", "later", "[voice] /now hi"]);
-        assert_eq!(submitter.display.queued_steers(), 3);
-    }
-}
-
-/// Alt+A or Alt+X on the page: approval mode's answer, and what came of it
-/// on the page.
-fn answer_approval(approve: bool) {
-    match crate::approval::key(approve) {
-        Ok(said) if said.is_empty() => {}
-        Ok(said) => crate::terminal::say_status(&said),
-        Err(said) => crate::terminal::warn_status(&said),
     }
 }

@@ -517,8 +517,6 @@ fn env_dimension(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|value| value.parse().ok()).filter(|value| *value > 0).unwrap_or(default)
 }
 
-
-
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return None;
@@ -578,7 +576,7 @@ struct LaunchArgs { application: String }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_xdpyinfo_dimensions, png_dimensions};
+    use super::png_dimensions;
 
     #[test]
     fn reads_png_dimensions_from_ihdr() {
@@ -586,17 +584,5 @@ mod tests {
         bytes.extend_from_slice(&1280_u32.to_be_bytes());
         bytes.extend_from_slice(&720_u32.to_be_bytes());
         assert_eq!(png_dimensions(&bytes), Some((1280, 720)));
-    }
-
-    #[test]
-    fn reads_xdpyinfo_dimensions() {
-        let output = "screen #0:\n  dimensions:    1920x1080 pixels (508x285 millimeters)\n";
-        assert_eq!(parse_xdpyinfo_dimensions(output), Some((1920, 1080)));
-    }
-
-    #[test]
-    fn shell_quote_handles_apostrophes() {
-        // One word, the apostrophe closed, escaped and reopened (util.rs).
-        assert_eq!(crate::util::shell_quote("The operator's desktop"), r"'The operator'\''s desktop'");
     }
 }

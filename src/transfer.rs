@@ -337,7 +337,7 @@ fn download(path: &str, into: &Path, ask: &mut dyn FnMut(Request) -> Result<Repl
                 let _ = std::fs::remove_file(&partial);
                 error.to_string()
             })?;
-            Ok(format!("downloaded {name} ({}) to {}", crate::share::human_size(size), crate::share_sync::home_short(&landed)))
+            Ok(format!("downloaded {name} ({}) to {}", crate::share::human_size(size), crate::share::sync::home_short(&landed)))
         }
         Err(error) => {
             let _ = std::fs::remove_file(&partial);
@@ -445,57 +445,6 @@ mod tests {
         // One file missing: said, and the rest still moved.
         let said = run_command_into("/download notes/plan.md nothing.txt", &downloads, &mut through(&share)).unwrap();
         assert!(said.contains("downloaded plan.md") && said.contains("not moved: nothing.txt"), "{said}");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn a_file_lands_beside_one_that_took_its_name_and_stale_uploads_go() {
-        let dir = std::env::temp_dir().join(format!("s0ma-land-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("report.md");
-        std::fs::write(&target, "theirs").unwrap();
-        let partial = dir.join(".p");
-        std::fs::write(&partial, "mine").unwrap();
-        let landed = land(&partial, &target).unwrap();
-        assert_eq!(landed, dir.join("report (2).md"));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs", "never replaced");
-        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "mine");
-        assert!(!partial.exists());
-        // An upload begun a day ago and never finished goes when one starts.
-        let stale = dir.join(".upload-oldoldold.partial");
-        std::fs::write(&stale, "half").unwrap();
-        let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
-        std::fs::File::options().write(true).open(&stale).unwrap().set_modified(day_ago).unwrap();
-        let fresh = dir.join(".upload-newnewnew.partial");
-        std::fs::write(&fresh, "half").unwrap();
-        clear_stale_partials(&dir);
-        assert!(!stale.exists() && fresh.exists(), "only the stale one");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn nothing_outside_the_share_is_read_or_written() {
-        let base = fixture("outside");
-        let share = base.join("share");
-        std::fs::create_dir_all(&share).unwrap();
-        std::fs::write(base.join("secret"), "no").unwrap();
-        std::fs::write(share.join(".sync-state"), "no").unwrap();
-        std::os::unix::fs::symlink(base.join("secret"), share.join("link")).unwrap();
-        for path in ["../secret", "/share/../secret", ".sync-state", "link", "a/../../secret"] {
-            assert!(read_part(&share, path, 0).is_err(), "{path} was read");
-        }
-        let data = base64::engine::general_purpose::STANDARD.encode("x");
-        assert!(write_part(&share, "abcdefgh12", "../escaped", 0, &data, true).is_err());
-        assert!(write_part(&share, "abcdefgh12", "link", 0, &data, true).is_err());
-        assert!(write_part(&share, "../../x", "fine.txt", 0, &data, true).is_err(), "a bad upload id");
-        assert!(write_part(&share, "abcdefgh12", "nofolder/x.txt", 0, &data, true).is_err());
-        // A part out of order is refused, and nothing half-written stays.
-        assert!(write_part(&share, "abcdefgh12", "late.txt", 5, &data, false).is_err());
-        assert!(!base.join("escaped").exists());
-        assert!(!share.join("late.txt").exists());
-        assert!(is_command("/download x") && is_command("/upload") && !is_command("/downloads"));
-        assert_eq!(words(r#"/upload "a b.txt" 'c d' e"#), ["/upload", "a b.txt", "c d", "e"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

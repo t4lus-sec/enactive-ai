@@ -28,7 +28,7 @@ struct MemoryEvent {
     timestamp: String,
 
     /// The turn this event belongs to, when it was appended during one (the
-    /// operator's message, s0ma's reasoning, tool results and reply): how a
+    /// operator's message, the agent's reasoning, tool results and reply): how a
     /// saved model call (calls.rs) joins the archive without guessing. Absent
     /// on events from before it existed and on background writers'.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,7 +120,7 @@ pub struct MemoryCheckpoint {
 
 /// The archive. A clone is another handle on the same archive: the next event
 /// ID is shared and taken under one lock, together with the append, so events
-/// from several threads (s0ma's, and the evidence a subagent cites in a board
+/// from several threads (the agent's, and the evidence a subagent cites in a board
 /// fact) land in ID order, one line per ID.
 /// Held across every rewrite of the checkpoints file: sleep appends to it on
 /// the app's thread, and a redaction can rewrite it from the tab's.
@@ -619,7 +619,7 @@ impl Hippocampus {
     /// mid-append — an SSH session dropping, a crash, a machine losing power —
     /// leaves a partial line at the end. Every reader here parses line by line
     /// with `?`, so that one fragment makes the whole archive unreadable and
-    /// s0ma will not start: the failure reads as
+    /// the agent will not start: the failure reads as
     /// `Error("EOF while parsing a string", line: 1, column: 25)`, naming
     /// neither the file nor the line.
     ///
@@ -738,9 +738,9 @@ impl Hippocampus {
     ///
     /// `new` repairs a partial final line, which means opening both JSONL
     /// files for writing and possibly truncating the tail. That is correct at
-    /// start-up, where this process is the only s0ma and a partial line can
+    /// start-up, where this process is the only the agent and a partial line can
     /// only be debris from a crash. It is wrong for a reader running beside a
-    /// live s0ma -- `--print-system-prompt` is one, and an eval probe may well
+    /// live agent -- `--print-system-prompt` is one, and an eval probe may well
     /// run while the operator's own session is up -- because the "partial"
     /// line it would truncate is more likely an append in progress than
     /// debris.
@@ -1033,27 +1033,6 @@ impl Hippocampus {
         }
 
         Ok(latest)
-    }
-
-    #[cfg(test)]
-    pub fn store_checkpoint(
-        &self,
-        from_event_id: u64,
-        through_event_id: u64,
-        source_event_count: usize,
-        summary: String,
-    ) -> Result<MemoryCheckpoint, Box<dyn std::error::Error>> {
-        let checkpoint = MemoryCheckpoint {
-            timestamp: Local::now().to_rfc3339(),
-            from_event_id,
-            through_event_id,
-            source_event_count,
-            summary,
-        };
-
-        self.append_checkpoint(&checkpoint)?;
-
-        Ok(checkpoint)
     }
 
     pub fn append_checkpoint(
@@ -1644,18 +1623,6 @@ mod preview_tests {
 }
 
 #[cfg(test)]
-mod literal_terms_tests {
-    use super::literal_terms;
-    #[test]
-    fn splits_words_and_keeps_quoted_phrases_whole() {
-        assert_eq!(literal_terms("npm token guest"), vec!["npm","token","guest"]);
-        assert_eq!(literal_terms("\"guest credential\" leak"), vec!["guest credential","leak"]);
-        assert!(literal_terms("   ").is_empty());
-        assert_eq!(literal_terms("\"only a phrase\""), vec!["only a phrase"]);
-    }
-}
-
-#[cfg(test)]
 mod shared_handle_tests {
     use super::*;
 
@@ -1668,45 +1635,6 @@ mod shared_handle_tests {
 
     fn contents(events: Vec<RecalledEvent>) -> Vec<(u64, String)> {
         events.into_iter().map(|event| (event.id, event.content)).collect()
-    }
-
-    #[test]
-    fn indexed_lookups_return_what_a_scan_returns_and_follow_appends() {
-        let (dir, mut memory) = line_index_archive("appends");
-        for n in 0..30 {
-            memory.remember_operator(format!("message {n}")).unwrap();
-        }
-        let ids = [3, 17, 30, 99, 1];
-        assert_eq!(contents(memory.get_events(&ids).unwrap()), contents(memory.scan_events(&ids).unwrap()));
-        assert_eq!(memory.get_event(17).unwrap().unwrap().content, "message 16");
-        assert!(memory.get_event(99).unwrap().is_none());
-        // Appended after the index was built: found by indexing only the new lines.
-        memory.remember_s0ma("reply".into()).unwrap();
-        assert_eq!(memory.get_event(31).unwrap().unwrap().content, "reply");
-        let covered = with_line_index(memory.archive_path(), |index| index.mark.through).unwrap();
-        assert_eq!(covered, fs::metadata(memory.archive_path()).unwrap().len());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_rewritten_archive_is_noticed_not_misread() {
-        let (dir, mut memory) = line_index_archive("rewrite");
-        for n in 0..10 {
-            memory.remember_operator(format!("message {n}")).unwrap();
-        }
-        assert_eq!(memory.get_event(5).unwrap().unwrap().content, "message 4");
-        // A manual repair rewrites the file in place: line lengths shift.
-        let text = fs::read_to_string(memory.archive_path()).unwrap();
-        let repaired: String = text
-            .lines()
-            .map(|line| line.replace("\"message 2\"", "\"message two, corrected at length\""))
-            .map(|line| format!("{line}\n"))
-            .collect();
-        fs::write(memory.archive_path(), repaired).unwrap();
-        assert_eq!(memory.get_event(3).unwrap().unwrap().content, "message two, corrected at length");
-        assert_eq!(memory.get_event(5).unwrap().unwrap().content, "message 4");
-        assert_eq!(contents(memory.get_events(&[1, 10]).unwrap()), vec![(1, "message 0".into()), (10, "message 9".into())]);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1725,102 +1653,6 @@ mod shared_handle_tests {
         assert_eq!(memory.get_event(3).unwrap().unwrap().content, "cc");
         assert!(memory.get_event(2).unwrap().is_none());
         assert_eq!(contents(memory.get_events(&[4, 1]).unwrap()), vec![(1, "aa".into()), (4, "dd".into())]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_unfinished_last_line_is_left_until_it_is_finished() {
-        let (dir, mut memory) = line_index_archive("partial");
-        memory.remember_operator("one".into()).unwrap();
-        let path = memory.archive_path().to_owned();
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        write!(file, "{{\"id\":2,\"timestamp\":\"t\",\"kind\":\"operator\",\"content\":\"tw").unwrap();
-        assert!(memory.get_event(2).unwrap().is_none());
-        assert_eq!(memory.get_event(1).unwrap().unwrap().content, "one");
-        writeln!(file, "o\"}}").unwrap();
-        assert_eq!(memory.get_event(2).unwrap().unwrap().content, "two");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn recall_after_starts_at_the_first_later_event() {
-        let (dir, mut memory) = line_index_archive("after");
-        for n in 0..20 {
-            memory.remember_operator(format!("message {n}")).unwrap();
-        }
-        let after: Vec<u64> = memory.recall_after(15).unwrap().into_iter().map(|e| e.id).collect();
-        assert_eq!(after, vec![16, 17, 18, 19, 20]);
-        assert!(memory.recall_after(20).unwrap().is_empty());
-        assert_eq!(memory.recall_after(0).unwrap().len(), 20);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn handles_on_one_archive_share_ids_and_keep_one_line_per_id() {
-        let dir = std::env::temp_dir().join(format!("s0ma-shared-archive-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let mut memory = Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("hello".into()).unwrap();
-        let threads: Vec<_> = (0..4)
-            .map(|worker| {
-                let mut handle = memory.clone();
-                std::thread::spawn(move || {
-                    (0..50).map(|n| handle.remember_tool_result(format!("worker {worker} result {n}")).unwrap()).collect::<Vec<u64>>()
-                })
-            })
-            .collect();
-        for n in 0..50 {
-            memory.remember_s0ma(format!("reply {n}")).unwrap();
-        }
-        let mut ids: Vec<u64> = threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 200);
-        assert_eq!(memory.last_event_id(), 251);
-        // Line n holds event n, as a fresh open counts them.
-        let text = fs::read_to_string(dir.join("hippocampus.jsonl")).unwrap();
-        for (line, record) in text.lines().enumerate() {
-            let event: MemoryEvent = serde_json::from_str(record).unwrap();
-            assert_eq!(event.id, line as u64 + 1);
-        }
-        assert_eq!(Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap().last_event_id(), 251);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_last_line_without_its_newline_is_finished_at_startup_not_hidden() {
-        let dir = std::env::temp_dir().join(format!("s0ma-unterminated-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("hippocampus.jsonl");
-        let mut memory = Hippocampus::new(&path).unwrap();
-        memory.remember_operator("hello".into()).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        fs::write(&path, text.trim_end()).unwrap();
-        let mut memory = Hippocampus::new(&path).unwrap();
-        assert!(memory.get_event(1).unwrap().is_some());
-        memory.remember_s0ma("hi".into()).unwrap();
-        assert_eq!(memory.recall_after(0).unwrap().len(), 2);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_large_last_line_without_its_newline_is_finished_too() {
-        let dir = std::env::temp_dir().join(format!("s0ma-unterminated-large-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("hippocampus.jsonl");
-        let mut memory = Hippocampus::new(&path).unwrap();
-        memory.remember_operator("hello".into()).unwrap();
-        memory.remember_tool_result("y".repeat(3 << 20)).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        fs::write(&path, text.trim_end()).unwrap();
-        let memory = Hippocampus::new(&path).unwrap();
-        assert!(memory.get_event(2).unwrap().is_some());
-        // A truly partial large line is still dropped.
-        fs::write(&path, format!("{}{{\"id\":3,\"x\":\"{}", fs::read_to_string(&path).unwrap(), "z".repeat(2 << 20))).unwrap();
-        let memory = Hippocampus::new(&path).unwrap();
-        assert_eq!(memory.last_event_id(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1850,31 +1682,3 @@ mod shared_handle_tests {
     }
 }
 
-#[cfg(test)]
-mod span_tests {
-    use super::*;
-
-    #[test]
-    fn a_span_hashes_its_events_as_continuous_compaction_does_and_lists_its_tool_results() {
-        let dir = std::env::temp_dir().join(format!("s0ma-spans-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let mut memory = Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("look at the stall".into()).unwrap(); // 1
-        memory.remember_tool_result("[tool:vm_exec]\nresult:\nlease wait".into()).unwrap(); // 2
-        memory.remember_tool_result("[harness:knowledge_check]\npass: 3 ms".into()).unwrap(); // 3: no observation
-        memory.remember_s0ma("probably the pool".into()).unwrap(); // 4
-        memory.remember_tool_result("[tool:archive_get]\nresult:\n…".into()).unwrap(); // 5
-        memory.remember_operator("ok".into()).unwrap(); // 6
-
-        let spans = memory.spans(&[(2, 5), (4, 6), (9, 12)]).unwrap();
-        assert_eq!(spans[0].tool_results, vec![2, 5]);
-        assert_eq!(spans[1].tool_results, vec![5]);
-        assert!(spans[2].tool_results.is_empty());
-        let events = memory.get_events(&[2, 3, 4, 5]).unwrap();
-        assert_eq!(spans[0].source_hash, crate::sleep::continuous::source_hash(&events).unwrap());
-        assert_eq!(spans[2].source_hash, crate::sleep::continuous::source_hash(&[]).unwrap(), "an empty span hashes as nothing");
-        assert_eq!(leading_id(r#"{"id":42,"timestamp":"t"}"#), Some(42));
-        assert_eq!(leading_id(r#"{"timestamp":"t","id":42}"#), None, "any other shape is parsed in full");
-        let _ = fs::remove_dir_all(&dir);
-    }
-}

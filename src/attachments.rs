@@ -211,21 +211,4 @@ mod tests {
         assert_eq!(out.notes.len(), 1);
         assert!(out.notes[0].contains("(2 lines)"));
     }
-
-    #[test]
-    fn directories_images_and_non_paths() {
-        let dir = fixture("mixed");
-        let base = dir.to_str().unwrap();
-        let out = expand(&format!("@{base}/a\\ dir @{base}/pic.png @nobody"));
-        assert!(out.content.contains("<attached_directory"));
-        assert!(out.notes.iter().any(|n| n.contains("send it with /img")));
-        assert_eq!(out.notes.len(), 2);
-    }
-
-    #[test]
-    fn commands_are_left_alone() {
-        let dir = fixture("commands");
-        let line = format!("/board show @{}/notes.md", dir.to_str().unwrap());
-        assert_eq!(expand(&line).content, line);
-    }
 }

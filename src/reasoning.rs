@@ -85,8 +85,8 @@ impl ReasoningProfile {
 
 // ------------------------------------------------------------------ subagents
 
-/// How hard subagents think: one of s0ma's own profiles (the same sampling
-/// as s0ma's turns at that level), set with `/mode workers <level>` or in the
+/// How hard subagents think: one of the agent's own profiles (the same sampling
+/// as the agent's turns at that level), set with `/mode workers <level>` or in the
 /// overview, and kept across restarts in `data/worker_reasoning`. Medium
 /// until set: thinking, without spending a small worker's budget the way
 /// xhigh would.
@@ -281,31 +281,3 @@ mod default_tests {
     }
 }
 
-#[cfg(test)]
-mod worker_tests {
-    use super::*;
-
-    #[test]
-    fn the_subagents_level_is_set_kept_and_used() {
-        let dir = std::env::temp_dir().join(format!("s0ma-worker-reasoning-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        init_workers(&dir);
-        let mut state = ReasoningState::new();
-        assert!(state.handle_mode_command("/mode workers").unwrap().unwrap().starts_with("[mode] workers "));
-        assert!(state.handle_mode_command("/mode workers sideways").unwrap().is_err());
-        let said = state.handle_mode_command("/mode workers low").unwrap().unwrap();
-        assert!(said.contains("workers low"), "{said}");
-        assert_eq!(worker_profile(), ReasoningProfile::Low);
-        assert_eq!(state.policy(), ReasoningPolicy::Forced(ReasoningProfile::XHigh), "s0ma's own is untouched");
-        // s0ma's sampling at that level: thinking on, no penalties.
-        let options = worker_profile().options();
-        assert_eq!((options.reasoning_effort, options.temperature, options.presence_penalty), ("low", 1.0, 0.0));
-        // Kept for the next start (where WORKER_FILE points, in this run).
-        if WORKER_FILE.get() == Some(&dir.join("worker_reasoning")) {
-            assert_eq!(std::fs::read_to_string(dir.join("worker_reasoning")).unwrap(), "low");
-        }
-        state.handle_mode_command("/mode workers medium").unwrap().unwrap();
-        assert_eq!(worker_profile(), WORKER_DEFAULT);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}

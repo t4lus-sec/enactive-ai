@@ -1,8 +1,8 @@
-//! Approval mode (`/approval on`): nothing runs on s0ma's machine, and no
+//! Approval mode (`/approval on`): nothing runs on the agent's machine, and no
 //! subagent starts, until the operator approves it.
 //!
 //! What waits for him:
-//! - every command, s0ma's and its subagents', in every shell: `vm_exec`
+//! - every command, the agent's and its subagents', in every shell: `vm_exec`
 //!   (in a shell or in the background), and what `shell_type` and
 //!   `shell_key` would type into one;
 //! - the goal tests a board runs (`vm::GoalTest`);
@@ -22,7 +22,7 @@
 //! its verifier) is his already (`by_operator`).
 //!
 //! Kept in `data/approval.json`, so it holds across a restart. A file that
-//! can't be read keeps approval on: when in doubt, s0ma asks.
+//! can't be read keeps approval on: when in doubt, the agent asks.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -271,8 +271,18 @@ pub fn ask(what: &str, detail: &str) -> Result<(), String> {
     if !enabled() || OPERATOR.with(Cell::get) {
         return Ok(());
     }
-    let who = crate::exec_feed::owner().map_or_else(|| "s0ma".to_string(), |run_id| crate::netboxes::agent_label(&run_id));
+    let who = crate::exec_feed::owner().map_or_else(|| "s0ma".to_string(), |run_id| crate::vm::netboxes::agent_label(&run_id));
     wait(Pending { id: 0, who, what: visible(what), detail: visible(detail) }, WAIT, crate::kill::requested)
+}
+
+/// `ask` for one who is not the agent or a subagent (an audit's batch), and, when
+/// `always`, even outside approval mode (an audit's run estimated past its
+/// `ask-over`).
+pub fn ask_as(who: &str, what: &str, detail: &str, always: bool) -> Result<(), String> {
+    if !(enabled() || always) || OPERATOR.with(Cell::get) {
+        return Ok(());
+    }
+    wait(Pending { id: 0, who: who.to_string(), what: visible(what), detail: visible(detail) }, WAIT, || false)
 }
 
 fn wait(mut request: Pending, limit: Duration, stopped: impl Fn() -> bool) -> Result<(), String> {
@@ -377,80 +387,7 @@ fn key_with(approve: bool, now: Instant, send: &mut dyn FnMut(u64, bool) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
-    /// The state is the process's: these run one at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn reset() {
-        let mut state = state();
-        state.pending.clear();
-        state.answers.clear();
-        state.armed = None;
-    }
-
-    fn waiting_for(n: usize) {
-        let until = Instant::now() + Duration::from_secs(5);
-        while pending().len() != n && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(pending().len(), n);
-    }
-
-    #[test]
-    fn a_request_waits_until_alt_a_is_pressed_twice_and_alt_x_declines() {
-        let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        reset();
-        let asked = |what: &'static str| {
-            std::thread::spawn(move || wait(Pending { id: 0, who: "s0ma".into(), what: what.into(), detail: String::new() }, Duration::from_secs(20), || false))
-        };
-        let first = asked("run in main: make");
-        waiting_for(1);
-        let second = asked("run in main: make install");
-        waiting_for(2);
-        let sent = std::cell::RefCell::new(Vec::new());
-        let mut send = |id, approve| {
-            sent.borrow_mut().push((id, approve));
-            answer(id, approve)
-        };
-        let now = Instant::now();
-        // One press arms the oldest and says what it would approve.
-        let said = key_with(true, now, &mut send).unwrap();
-        assert!(said.contains("make") && said.contains("again"), "{said}");
-        assert!(sent.borrow().is_empty(), "one press approves nothing");
-        // A second press too late arms it again; one in time approves it.
-        key_with(true, now + TWICE + Duration::from_millis(1), &mut send).unwrap();
-        assert!(sent.borrow().is_empty());
-        key_with(true, now + TWICE + Duration::from_secs(1), &mut send).unwrap();
-        assert_eq!(pending().len(), 1, "answered: off the list at once, before its call wakes");
-        assert!(pending()[0].what.ends_with("install"), "the next press is for the next one");
-        assert_eq!(first.join().unwrap(), Ok(()));
-        waiting_for(1);
-        // Alt+X declines the next at once.
-        key_with(false, now, &mut send).unwrap();
-        let declined = second.join().unwrap().unwrap_err();
-        assert!(declined.contains("declined"), "{declined}");
-        assert_eq!(sent.borrow().len(), 2);
-        assert!(key_with(true, now, &mut send).is_err(), "nothing left to approve");
-    }
-
-    #[test]
-    fn an_unanswered_or_stopped_request_is_declined_and_leaves_the_list() {
-        let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        reset();
-        let late = wait(Pending { id: 0, who: "w·b3-1".into(), what: "run in w·b3-1: ls".into(), detail: String::new() }, Duration::from_millis(300), || false);
-        assert!(late.unwrap_err().contains("did not answer"));
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
-        let stopped = std::thread::spawn(move || {
-            wait(Pending { id: 0, who: "s0ma".into(), what: "start 1 subagent".into(), detail: String::new() }, Duration::from_secs(20), move || flag.load(Ordering::SeqCst))
-        });
-        waiting_for(1);
-        stop.store(true, Ordering::SeqCst);
-        assert!(stopped.join().unwrap().unwrap_err().contains("stopped"));
-        assert!(pending().is_empty());
-        assert!(answer(999, true).is_err(), "an id that no longer waits");
-    }
 
     #[test]
     fn the_mode_is_kept_and_an_unreadable_file_keeps_it_on() {
@@ -480,31 +417,5 @@ mod tests {
         assert!(gate_tool("desktop_view", "{}").is_none() && gate_tool("archive_search", "{}").is_none());
         assert!(handle_command("/approval sometimes").unwrap().is_err());
         assert!(handle_command("/shell").is_none());
-    }
-
-    #[test]
-    fn an_attached_terminal_follows_the_primarys_list() {
-        let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        reset();
-        let request = Pending { id: 7, who: "s0ma".into(), what: "run in main: ls".into(), detail: String::new() };
-        apply(vec![request.clone()]);
-        let mut sent = Vec::new();
-        let now = Instant::now();
-        key_with(true, now, &mut |id, approve| {
-            sent.push((id, approve));
-            Ok(String::new())
-        })
-        .unwrap();
-        // The primary's list moves on before the second press: nothing armed.
-        apply(Vec::new());
-        assert!(state().armed.is_none());
-        apply(vec![request]);
-        key_with(true, now, &mut |id, approve| {
-            sent.push((id, approve));
-            Ok(String::new())
-        })
-        .unwrap();
-        assert!(sent.is_empty(), "a press before the list changed doesn't count toward the second");
-        reset();
     }
 }

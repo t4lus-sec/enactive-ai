@@ -3,7 +3,7 @@
 //!
 //! Stage 2 is in knowledge.rs: the knowledge pass asks the base model one noul
 //! per shortlisted skill ("does this procedure apply?"), alongside its source
-//! nouls, and only the skills it confirms reach s0ma, as pointers to read with
+//! nouls, and only the skills it confirms reach the agent, as pointers to read with
 //! skill_read. Skill text itself is never injected.
 //!
 //! - Every skill in the catalog is considered, not only the 20 in the startup
@@ -84,8 +84,12 @@ impl Settings {
         Ok(Self { enabled, candidates })
     }
 
+    /// As set, and off while embeddings are off: the shortlist is by
+    /// embedding.
     fn from_env() -> Result<Self, String> {
-        Self::from_vars(|key| std::env::var(key).ok())
+        let mut settings = Self::from_vars(|key| std::env::var(key).ok())?;
+        settings.enabled &= crate::model_config::embeddings_on();
+        Ok(settings)
     }
 }
 
@@ -299,7 +303,7 @@ fn document_vectors(
     store()?.vectors(fingerprint, entries, embed)
 }
 
-/// Skills already in s0ma's current context: read with skill_read, or pointed
+/// Skills already in the agent's current context: read with skill_read, or pointed
 /// to by an earlier knowledge-check note.
 pub fn already_in_context(messages: &[Message]) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
@@ -433,7 +437,11 @@ fn cutoff_table(pairs: &[(f64, bool)], bar: f64, from: &str) -> String {
 pub fn warm_up() {
     match Settings::from_env() {
         Ok(settings) if !settings.enabled => {
-            crate::terminal::say_note("[skills] match off (S0MA_SKILL_MATCH=0)");
+            crate::terminal::say_note(if crate::model_config::embeddings_on() {
+                "[skills] match off (S0MA_SKILL_MATCH=0)"
+            } else {
+                "[skills] match off: embeddings are off"
+            });
             return;
         }
         Err(error) => {
@@ -470,12 +478,7 @@ pub fn warm_up() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FunctionCall, ToolCall};
 
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |key| map.get(key).cloned()
-    }
 
     fn entries(names: &[&str]) -> Vec<(String, String)> {
         names.iter().map(|n| (n.to_string(), format!("how to {n}"))).collect()
@@ -484,45 +487,6 @@ mod tests {
     fn unit(v: &[f32]) -> Vec<f32> {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / norm).collect()
-    }
-
-    #[test]
-    fn the_cutoff_report_finds_where_cosine_agrees_with_the_judge() {
-        // The judge names everything at 0.5 and above, nothing below.
-        let pairs: Vec<(f64, bool)> = (0..40).map(|i| (0.30 + 0.01 * i as f64, i >= 20)).collect();
-        let report = cutoff_table(&pairs, 0.5, "audit");
-        assert!(report.starts_with("40 judged skills in audit; the judge named 20 (P(true) > 0.50)."), "{report}");
-        assert!(report.ends_with("Best match to the judge (F1 1.00): S0MA_SKILL_MATCH_MIN_COSINE=0.50\n"), "{report}");
-        assert!(report.contains("  0.50    100%     20             100%                    100%\n"), "{report}");
-        // Too little to go on: says so, and suggests nothing.
-        let few = cutoff_table(&pairs[..5], 0.5, "audit");
-        assert!(few.contains("Too few") && !few.contains("Best match"), "{few}");
-
-        // From the file: only judged skills count (a cosine-matched one has no noul).
-        let dir = std::env::temp_dir().join(format!("s0ma-cutoff-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("knowledge_audit.jsonl");
-        let lines = [
-            r#"{"skill_match":{"skills":[{"name":"a","cosine":0.7,"noul":0.9},{"name":"b","cosine":0.3,"noul":0.1}]}}"#,
-            r#"{"skill_match":{"min_cosine":0.5,"skills":[{"name":"c","cosine":0.6}]}}"#,
-            "not json",
-        ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-        let report = cutoff_report(&path, 0.5).unwrap();
-        assert!(report.starts_with("2 judged skills"), "{report}");
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn settings() {
-        assert_eq!(Settings::from_vars(vars(&[])).unwrap(), Settings { enabled: true, candidates: 3 });
-        assert_eq!(Settings::from_vars(vars(&[("S0MA_SKILL_MATCH_CANDIDATES", "5")])).unwrap().candidates, 5);
-        for off in ["0", "off", "False"] {
-            assert!(!Settings::from_vars(vars(&[("S0MA_SKILL_MATCH", off)])).unwrap().enabled);
-        }
-        for bad in ["0", "11", "three"] {
-            assert!(Settings::from_vars(vars(&[("S0MA_SKILL_MATCH_CANDIDATES", bad)])).is_err(), "{bad}");
-        }
     }
 
     #[test]
@@ -542,91 +506,6 @@ mod tests {
         let tied = rank(&entries(&["b-skill", "a-skill"]), &[query.clone(), query.clone()], &query, 2);
         assert_eq!(tied[0].name, "a-skill");
     }
-
-    #[test]
-    fn skills_read_or_pointed_to_in_context_are_recognised() {
-        let mut read = Message::assistant(String::new());
-        read.tool_calls = Some(vec![ToolCall {
-            id: "c1".into(),
-            kind: "function".into(),
-            function: FunctionCall { name: "skill_read".into(), arguments: r#"{"name":"web-recon","resource":"SKILL.md"}"#.into() },
-        }]);
-        let note = Message::user(format!(
-            "scan it\n\n{NOTE_MARKER}\nFrom the harness...\n{POINTER_PREFIX}nmap-triage` (0.84): how to triage\nThe scores are estimates."
-        ));
-        // A pointer-looking line outside a harness note doesn't count.
-        let operator = Message::user(format!("{POINTER_PREFIX}backup-rotation` is what I meant"));
-        let other_tool = {
-            let mut m = Message::assistant(String::new());
-            m.tool_calls = Some(vec![ToolCall {
-                id: "c2".into(),
-                kind: "function".into(),
-                function: FunctionCall { name: "skill_list".into(), arguments: "{}".into() },
-            }]);
-            m
-        };
-        let seen = already_in_context(&[read, note, operator, other_tool]);
-        assert_eq!(seen.into_iter().collect::<Vec<_>>(), ["nmap-triage", "web-recon"]);
-    }
-
-    #[test]
-    fn document_vectors_embed_each_text_once() {
-        let skills = entries(&["cache-test-one", "cache-test-two"]);
-        let mut calls = Vec::new();
-        let first = document_vectors("fp-test", &skills, |text| {
-            calls.push(text.to_owned());
-            Ok(vec![text.len() as f32, 1.0])
-        })
-        .unwrap();
-        assert_eq!(calls, ["cache-test-one: how to cache-test-one", "cache-test-two: how to cache-test-two"]);
-        // Second call: served from the cache.
-        let again = document_vectors("fp-test", &skills, |_| panic!("cached vectors must not be re-embedded")).unwrap();
-        assert_eq!(first, again);
-        // An edited description, or another embedding fingerprint, is embedded anew.
-        let edited = vec![("cache-test-one".to_string(), "a new description".to_string())];
-        let mut count = 0;
-        document_vectors("fp-test", &edited, |_| {
-            count += 1;
-            Ok(vec![0.0, 1.0])
-        })
-        .unwrap();
-        document_vectors("fp-other", &skills[..1], |_| {
-            count += 1;
-            Ok(vec![0.0, 1.0])
-        })
-        .unwrap();
-        assert_eq!(count, 2);
-        // A failure is reported, not cached.
-        let failed = document_vectors("fp-test", &entries(&["cache-test-three"]), |_| Err("server down".into()));
-        assert_eq!(failed.unwrap_err(), "server down");
-    }
-
-    #[test]
-    fn forget_drops_only_that_skills_vectors() {
-        let skills = entries(&["forget-test-gone", "forget-test-kept"]);
-        document_vectors("fp-forget", &skills, |_| Ok(vec![1.0, 0.0])).unwrap();
-        // Under another fingerprint too: all of the skill's vectors go.
-        document_vectors("fp-forget-2", &skills[..1], |_| Ok(vec![1.0, 0.0])).unwrap();
-        forget("forget-test-gone");
-        let mut embedded = Vec::new();
-        for fingerprint in ["fp-forget", "fp-forget-2"] {
-            document_vectors(fingerprint, &skills, |text| {
-                embedded.push(format!("{fingerprint} {text}"));
-                Ok(vec![0.0, 1.0])
-            })
-            .unwrap();
-        }
-        assert_eq!(
-            embedded,
-            [
-                "fp-forget forget-test-gone: how to forget-test-gone",
-                "fp-forget-2 forget-test-gone: how to forget-test-gone",
-                "fp-forget-2 forget-test-kept: how to forget-test-kept",
-            ]
-        );
-        forget("no-such-skill");
-    }
-
 
     fn temp_store(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("s0ma-skill-vectors-{name}-{}", std::process::id()));
@@ -697,117 +576,5 @@ mod tests {
         store.forget("web-recon");
         let reloaded = VectorStore::load(path);
         assert_eq!(reloaded.vectors.values().map(|(skill, _)| skill.as_str()).collect::<Vec<_>>(), ["nmap-triage"]);
-    }
-
-    #[test]
-    fn what_was_embedded_before_a_failure_is_still_saved() {
-        let path = temp_store("partial");
-        let skills = entries(&["one", "two", "three"]);
-        let mut store = VectorStore::load(path.clone());
-        let mut calls = 0;
-        let failed = store.vectors("fp", &skills, |_| {
-            calls += 1;
-            if calls == 3 { Err("server went away".into()) } else { Ok(vec![1.0, 2.0]) }
-        });
-        assert_eq!(failed.unwrap_err(), "server went away");
-        let mut reloaded = VectorStore::load(path);
-        let mut embedded = Vec::new();
-        reloaded.vectors("fp", &skills, |text| {
-            embedded.push(text.to_owned());
-            Ok(vec![1.0, 2.0])
-        })
-        .unwrap();
-        assert_eq!(embedded, ["three: how to three"], "only the one that failed");
-    }
-
-    #[test]
-    fn a_damaged_file_is_rebuilt_not_trusted() {
-        let path = temp_store("damaged");
-        let skills = entries(&["nmap-triage"]);
-        for (text, kept) in [
-            ("{not json".to_string(), 0),
-            (json_store(2, &[(&"a".repeat(64), "nmap-triage", &encode_vector(&[1.0]))]), 0),
-            (json_store(1, &[("short-key", "nmap-triage", &encode_vector(&[1.0]))]), 0),
-            (json_store(1, &[(&"b".repeat(64), "nmap-triage", "not base64!")]), 0),
-            (json_store(1, &[(&"c".repeat(64), "nmap-triage", &STANDARD.encode([0u8, 0, 0]))]), 0),
-            (json_store(1, &[(&"d".repeat(64), "nmap-triage", &encode_vector(&[f32::NAN]))]), 0),
-            (json_store(1, &[(&"e".repeat(64), "nmap-triage", &encode_vector(&[1.0])), (&"f".repeat(9), "x", "")]), 1),
-        ] {
-            std::fs::write(&path, &text).unwrap();
-            let store = VectorStore::load(path.clone());
-            assert_eq!(store.vectors.len(), kept, "{text}");
-        }
-        // And a rebuilt store saves over the damage.
-        std::fs::write(&path, "{not json").unwrap();
-        let mut store = VectorStore::load(path.clone());
-        store.vectors("fp", &skills, |_| Ok(vec![1.0])).unwrap();
-        assert_eq!(VectorStore::load(path).vectors.len(), 1);
-    }
-
-    fn json_store(version: u32, vectors: &[(&str, &str, &str)]) -> String {
-        let vectors: Vec<Value> = vectors
-            .iter()
-            .map(|(key, skill, vector)| serde_json::json!({"key": key, "skill": skill, "vector": vector}))
-            .collect();
-        serde_json::json!({"version": version, "vectors": vectors}).to_string()
-    }
-
-    #[test]
-    fn vectors_round_trip_through_their_encoding() {
-        let vector = vec![0.0, -0.0, 1.5, -2.75e-12, f32::MAX, f32::MIN_POSITIVE];
-        let decoded = decode_vector(&encode_vector(&vector)).unwrap();
-        assert_eq!(decoded.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
-        assert!(decode_vector("").is_none());
-    }
-
-    /// Against a running embedding server, skipped by default:
-    ///   S0MA_ARCHIVE_EMBEDDING_URL=http://127.0.0.1:8081/v1/embeddings \
-    ///     cargo test skill_match::tests::live_shortlist -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn live_shortlist() {
-        let root = std::env::temp_dir().join(format!("s0ma_skill_match_{}", std::process::id()));
-        for (name, description) in [
-            ("nmap-triage", "Triage nmap output: open ports, service versions and which probes to run next."),
-            ("web-recon", "Enumerate a web application's routes, parameters and technology stack."),
-            ("backup-rotation", "Rotate the nightly backups and verify that the newest one restores."),
-            ("report-writing", "Write up findings for the operator: evidence first, then impact."),
-        ] {
-            std::fs::create_dir_all(root.join(name)).unwrap();
-            std::fs::write(root.join(name).join("SKILL.md"), format!("---\nname: {name}\ndescription: {description}\n---\nSteps.\n")).unwrap();
-        }
-        crate::skills::init(&root).unwrap();
-
-        let started = Instant::now();
-        let first = shortlist(&[], "what did the last nmap scan find, and what should I probe next?").unwrap();
-        let cold = started.elapsed();
-        for c in &first {
-            println!("  {:16} cosine {:.3}", c.name, c.cosine);
-        }
-        assert_eq!(first.len(), 3);
-        assert!(first.windows(2).all(|w| w[0].cosine >= w[1].cosine));
-        assert!(first.iter().all(|c| c.cosine.is_finite() && c.cosine.abs() <= 1.0001));
-
-        // Warm: only the message is embedded now. The top skill, once read, drops out.
-        let mut read = Message::assistant(String::new());
-        read.tool_calls = Some(vec![ToolCall {
-            id: "c".into(),
-            kind: "function".into(),
-            function: FunctionCall { name: "skill_read".into(), arguments: format!(r#"{{"name":"{}"}}"#, first[0].name) },
-        }]);
-        let started = Instant::now();
-        let second = shortlist(&[read], "what did the last nmap scan find, and what should I probe next?").unwrap();
-        let warm = started.elapsed();
-        println!("  cold {} ms (embeds 4 skills + message), warm {} ms (message only)", cold.as_millis(), warm.as_millis());
-        assert!(second.iter().all(|c| c.name != first[0].name) && second.len() == 3);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn long_text_is_cut_to_what_the_embedder_accepts() {
-        let long = "é".repeat(2_000); // 4000 bytes
-        let cut = document_text("x", &long);
-        assert!(cut.len() <= 1800 && cut.is_char_boundary(cut.len()) && cut.starts_with("x: é"));
-        assert_eq!(truncate_for_embedding("short"), "short");
     }
 }

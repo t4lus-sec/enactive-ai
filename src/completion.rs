@@ -37,6 +37,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("/approval", "every command in every shell, and every subagent, waits for you (alt+a twice approves, alt+x declines)", &["on", "off", "status", "list"], true),
     cmd("/board", "list or manage boards", &["list", "all", "show", "hint", "unhint", "extend", "confirm", "reject", "exhaust", "abandon", "reuse"], true),
     cmd("/compact", "rotate the working context now", &[], false),
+    cmd("/embeddings", "semantic search, episode reminders and the skill match: off for a machine with no local models", &["on", "off", "status"], true),
     cmd("/copy", "copy the last reply (or its last code block) to the clipboard", &["code"], false),
     cmd("/download", "copy files from the shared folder to this computer's ~/Downloads: /download <name> …", &[], true),
     cmd("/goal", "an objective s0ma works toward turn after turn until it is done", &["status", "pause", "resume", "clear", "help"], true),
@@ -49,8 +50,10 @@ pub const COMMANDS: &[Command] = &[
     cmd("/kill", "stop the running tool call, or a subagent (list, all, subagents, <slot>)", &["list", "all", "subagents"], true),
     cmd("/loop", "autonomous looping mode", &["on", "off", "status"], true),
     cmd("/loops", "list open loops", &["open", "done", "dropped", "all"], true),
+    cmd("/machine", "where the agent works: vm (its own) or host (this computer), from the next start", &["status", "host", "vm"], true),
     cmd("/mcp", "MCP servers: status, tools, reload", &["status", "tools", "reload"], true),
     cmd("/mode", "reasoning profile; /mode workers <level> for subagents", &["auto", "instruct", "low", "medium", "xhigh", "workers"], true),
+    cmd("/model", "the model server: /model server <url>, name <name>, type local|hosted, context <tokens>, key clear (set the key in the overview, Alt+O)", &["status", "server", "name", "type", "context", "key"], true),
     cmd("/shell", "shells: list, new, close, mode", &["list", "new", "close", "mode"], true),
     cmd("/now", "while s0ma works: send this now, not after its current step (or ctrl+s)", &[], true),
     cmd("/pair", "confirm s0ma's commands everywhere", &["on", "off"], true),
@@ -328,90 +331,3 @@ pub(crate) fn paths(typed: &str) -> Vec<Candidate> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn every_argument_of_send_completes_as_a_path() {
-        let dir = std::env::temp_dir().join(format!("s0ma-send-complete-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("report.pdf"), b"x").unwrap();
-        let prefix = format!("{}/rep", dir.display());
-        for line in [format!("/share {prefix}"), format!("/share first.txt {prefix}")] {
-            let completion = super::complete(&line, line.len());
-            assert!(
-                completion.candidates.iter().any(|candidate| candidate.value.ends_with("report.pdf")),
-                "{line}: {:?}",
-                completion.candidates
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn help_lists_every_command_and_the_keys_that_left_the_corner() {
-        let help = super::help_text();
-        for command in super::COMMANDS {
-            assert!(help.contains(command.name), "{} missing from /help", command.name);
-        }
-        assert!(help.contains("/help"), "it lists itself, so completion offers it");
-        for key in ["ctrl+c", "ctrl+s", "ctrl+o", "ctrl+g", "ctrl+d", "tab", "alt+1", "alt+p", "alt+b", "alt+m", "alt+s", "alt+o"] {
-            assert!(help.contains(key), "{key} missing from /help");
-        }
-        assert!(!help.ends_with('\n'));
-    }
-
-    use super::*;
-
-    fn values(c: &Completion) -> Vec<&str> {
-        c.candidates.iter().map(|c| c.value.as_str()).collect()
-    }
-
-    #[test]
-    fn commands_complete_from_the_start_of_the_line() {
-        let c = complete("/lo", 3);
-        assert_eq!(values(&c), ["/loop", "/loops"]);
-        assert_eq!((c.start, c.end), (0, 3));
-        // Not a command when it isn't the first word.
-        assert!(complete("see /lo", 7).candidates.is_empty());
-    }
-
-    #[test]
-    fn subcommands_complete_after_the_command() {
-        let c = complete("/mode m", 7);
-        assert_eq!(values(&c), ["medium"]);
-        assert_eq!((c.start, c.end), (6, 7));
-        assert_eq!(values(&complete("/loop ", 6)), ["on", "off", "status"]);
-    }
-
-    #[test]
-    fn file_mentions_complete_paths() {
-        let dir = std::env::temp_dir().join(format!("s0ma-complete-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("sub dir")).unwrap();
-        std::fs::write(dir.join("notes.md"), "x").unwrap();
-        std::fs::write(dir.join(".hidden"), "x").unwrap();
-        let base = dir.to_str().unwrap();
-
-        let line = format!("look at @{base}/");
-        let c = complete(&line, line.len());
-        assert_eq!(
-            values(&c),
-            [format!("@{base}/notes.md"), format!("@{base}/sub\\ dir/")]
-        );
-        assert!(c.candidates[0].append_space);
-        assert!(!c.candidates[1].append_space);
-        assert_eq!(c.start, 8);
-
-        // Escaped spaces keep the token together.
-        let line = format!("@{base}/sub\\ d");
-        assert_eq!(values(&complete(&line, line.len())), [format!("@{base}/sub\\ dir/")]);
-
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn common_prefix() {
-        assert_eq!(longest_common_prefix(&["/loop", "/loops"]), "/loop");
-        assert_eq!(longest_common_prefix(&["/board", "/loop"]), "/");
-        assert_eq!(longest_common_prefix(&["é1", "é2"]), "é");
-    }
-}

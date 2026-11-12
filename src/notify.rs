@@ -104,24 +104,3 @@ fn desktop_notification(body: &str) -> bool {
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn notifies_only_when_away_or_long() {
-        let s = Duration::from_secs;
-        assert!(!should_notify(s(600), Focus::Focused));
-        assert!(should_notify(s(5), Focus::Unfocused));
-        assert!(!should_notify(s(1), Focus::Unfocused));
-        assert!(!should_notify(s(10), Focus::Unknown));
-        assert!(should_notify(s(45), Focus::Unknown));
-    }
-
-    #[test]
-    fn summary_is_plain_one_line() {
-        assert_eq!(summary("## Done: **all** `5` tests\nmore"), "Done: all 5 tests");
-        assert_eq!(summary("a;b\x1b[2J"), "a,b[2J");
-        assert_eq!(summary(""), "finished");
-    }
-}

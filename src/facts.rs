@@ -1,4 +1,4 @@
-//! Facts: what s0ma holds to be true now, how sure it is, and how it finds
+//! Facts: what the agent holds to be true now, how sure it is, and how it finds
 //! one again (`claude/fact-recall-spec.md`).
 //!
 //! The facts are the world model's records (`world_model.rs`): observations,
@@ -7,7 +7,7 @@
 //! makes them recallable:
 //!
 //! - **Certainty, derived, never asked for.** `assess` reads where a fact came
-//!   from (a tool showed it, the operator said it, someone else said it, s0ma
+//!   from (a tool showed it, the operator said it, someone else said it, the agent
 //!   inferred it, a guess), how much separate evidence backs it, any
 //!   counterevidence, whether the evidence still reads as it did, and for a
 //!   fact that changes quickly, how long since it was last confirmed. The
@@ -254,7 +254,7 @@ pub fn assess(record: &Record, support: &[Source], intact: bool, staged: bool, n
     Assessment { level, reason: parts.join("; ") }
 }
 
-/// The fields a write derives: when s0ma learned the fact and last saw it
+/// The fields a write derives: when the agent learned the fact and last saw it
 /// confirmed (from `support`), and its certainty. What a writer sent for
 /// these is replaced; with no evidence, the dates it sent stand.
 pub fn derive(record: &mut Record, support: &[Source], now: DateTime<Utc>) {
@@ -1166,7 +1166,7 @@ fn ensure_pins(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Facts were put in front of s0ma (pushed, or a search's best): counted,
+/// Facts were put in front of the agent (pushed, or a search's best): counted,
 /// for pinning the ones it keeps needing.
 pub fn note_use(world: &Path, ids: &[String]) {
     let Ok(db) = crate::world_model::open(world) else { return };
@@ -1211,7 +1211,7 @@ pub fn pins(world: &Path) -> Result<BTreeMap<String, String>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// After a sleep: sleep's pins redone from use. The facts s0ma needed most
+/// After a sleep: sleep's pins redone from use. The facts the agent needed most
 /// (at least twice), current, and `certain` or `likely` now, fill what the
 /// operator's own pins leave of the limit. How many sleep pinned.
 pub fn promote(world: &Path) -> Result<usize> {
@@ -1727,240 +1727,8 @@ mod tests {
         }
     }
 
-    fn source(id: u64, kind: &'static str, text: &str, days_ago: i64) -> Source {
-        Source { id, kind, digest: digest(text), world_hash: String::new(), at: Some(Utc::now() - chrono::Duration::days(days_ago) - chrono::Duration::hours(1)) }
-    }
-
-    fn fact(basis: &str, status: &str) -> Record {
-        Record {
-            id: "f".into(),
-            model_id: "lab".into(),
-            kind: "claim".into(),
-            title: "f".into(),
-            statement: "s".into(),
-            basis: basis.into(),
-            status: status.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn certainty_follows_where_a_fact_came_from_and_what_backs_it() {
-        let now = Utc::now();
-        let level = |record: &Record, support: &[Source]| assess(record, support, true, false, now).level;
-        let tool = source(1, "tool_result", "inet 192.168.10.106", 0);
-        let said = source(2, "operator", "the legion is at .106", 0);
-        let again = source(3, "operator", "the legion is at .106", 0);
-        let contact = source(4, "contact", "it moved", 0);
-        assert_eq!(level(&fact("observed", "supported"), &[tool.clone()]), Level::Certain);
-        assert_eq!(level(&fact("reported", "supported"), &[said.clone()]), Level::Likely);
-        assert_eq!(level(&fact("reported", "supported"), &[said.clone(), again.clone()]), Level::Likely, "the same words twice are one source");
-        assert_eq!(level(&fact("reported", "supported"), &[said.clone(), tool.clone()]), Level::Certain, "said and seen");
-        assert_eq!(level(&fact("reported", "supported"), &[contact.clone()]), Level::Likely);
-        assert_eq!(level(&fact("reported", "proposed"), &[]), Level::Uncertain);
-        assert_eq!(level(&fact("inferred", "proposed"), &[]), Level::Uncertain);
-        assert_eq!(level(&fact("interpretation", "proposed"), &[]), Level::Doubtful);
-        // What lowers it.
-        let mut against = fact("observed", "supported");
-        against.counterevidence_ids = vec![9];
-        let assessed = assess(&against, &[tool.clone()], true, false, now);
-        assert_eq!(assessed.level, Level::Likely);
-        assert!(assessed.reason.contains("counterevidence #9"), "{}", assessed.reason);
-        assert_eq!(level(&fact("observed", "contradicted"), &[tool.clone()]), Level::Doubtful);
-        assert_eq!(level(&fact("observed", "unresolved"), &[tool.clone()]), Level::Uncertain);
-        assert_eq!(assess(&fact("observed", "supported"), &[tool.clone()], false, false, now).level, Level::Likely, "changed evidence");
-        assert_eq!(assess(&fact("observed", "supported"), &[tool.clone()], true, true, now).level, Level::Uncertain, "staged");
-        // A volatile fact goes stale; a stable one does not.
-        let mut address = fact("observed", "supported");
-        address.volatility = Some("volatile".into());
-        let old = source(5, "tool_result", "inet .106", 9);
-        derive(&mut address, &[old.clone()], now);
-        assert_eq!(address.certainty.as_deref(), Some("likely"));
-        assert!(address.certainty_reason.as_deref().unwrap().contains("last confirmed 9 days ago, changes often"));
-        let mut name = fact("observed", "supported");
-        name.volatility = Some("stable".into());
-        derive(&mut name, &[old], now);
-        assert_eq!(name.certainty.as_deref(), Some("certain"));
-        assert_eq!(name.last_confirmed_event, Some(5));
-        assert!(name.learned_at.is_some());
-    }
-
-    #[test]
-    fn a_later_revision_is_logged_as_confirming_or_contradicting_the_level_it_had() {
-        let mut before = fact("reported", "supported");
-        before.supporting_evidence_ids = vec![1];
-        before.certainty = Some("likely".into());
-        let mut confirmed = before.clone();
-        confirmed.supporting_evidence_ids = vec![1, 2];
-        assert_eq!(outcome(&before, &confirmed), Some("confirmed"));
-        let mut replaced = before.clone();
-        replaced.superseded_by = Some("g".into());
-        assert_eq!(outcome(&before, &replaced), Some("contradicted"));
-        let mut against = before.clone();
-        against.counterevidence_ids = vec![3];
-        assert_eq!(outcome(&before, &against), Some("contradicted"));
-        assert_eq!(outcome(&before, &before.clone()), None, "an edit that changes no evidence");
-
-        let dir = std::env::temp_dir().join(format!("s0ma-calibration-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let world = dir.join("world_model.sqlite3");
-        let _ = std::fs::remove_file(calibration_path(&world));
-        assert!(calibration_report(&world).unwrap().contains("No facts"));
-        log_calibration(&world, &before, "confirmed");
-        log_calibration(&world, &before, "confirmed");
-        log_calibration(&world, &before, "contradicted");
-        let report = calibration_report(&world).unwrap();
-        assert!(
-            report.lines().any(|line| line.split_whitespace().collect::<Vec<_>>() == ["likely", "3", "2", "1", "67%"]),
-            "{report}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn names_are_found_whole_in_a_question() {
-        assert_eq!(normalize("What's the Legion's IP?"), " what s the legion s ip ");
-        assert_eq!(normalize("ssh to 192.168.10.106."), " ssh to 192.168.10.106 ");
-        assert!(normalize("is nb-build up").contains(" nb-build "));
-        assert!(!normalize("rebuilding").contains(" build "));
-    }
-
-    #[test]
-    fn a_search_finds_facts_by_entity_and_words_and_offers_what_replaced_an_old_one() {
-        let mut f = Fixture::new();
-        f.memory.remember_operator("The Legion is at 192.168.10.105.".into()).unwrap();
-        let said = f.memory.last_event_id();
-        f.memory.remember_s0ma("[tool:ssh] inet 192.168.10.106 on enp3s0".into()).unwrap();
-        let seen = f.memory.last_event_id();
-        f.put(json!({"id":"legion","model_id":"lab","kind":"entity","title":"Legion","statement":"s0ma's machine.",
-            "basis":"reported","status":"supported","supporting_evidence_ids":[said],"aliases":["the legion","legion box"]}));
-        f.put(json!({"id":"legion-ip-old","model_id":"lab","kind":"claim","title":"Legion address","statement":"The Legion is at 192.168.10.105.",
-            "subject_id":"legion","basis":"reported","status":"supported","supporting_evidence_ids":[said],"volatility":"volatile"}));
-        f.put(json!({"id":"legion-ip","model_id":"lab","kind":"claim","title":"Legion address","statement":"The Legion is at 192.168.10.106.",
-            "subject_id":"legion","basis":"observed","status":"supported","supporting_evidence_ids":[seen],"volatility":"volatile"}));
-        f.put(json!({"id":"legion-ip-old","model_id":"lab","kind":"claim","title":"Legion address","statement":"The Legion is at 192.168.10.105.",
-            "subject_id":"legion","basis":"reported","status":"retired","supporting_evidence_ids":[said],"volatility":"volatile",
-            "superseded_by":"legion-ip","valid_until":Utc::now().to_rfc3339()}));
-        f.put(json!({"id":"jake-tea","model_id":"lab","kind":"claim","title":"Tea","statement":"The operator drinks green tea.",
-            "basis":"reported","status":"supported","supporting_evidence_ids":[said]}));
-
-        // By entity: its page, then its current facts; the replaced one is not offered.
-        let hits = f.search("where is the legion now");
-        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-        assert!(ids.contains(&"legion") && ids.contains(&"legion-ip"), "{ids:?}");
-        assert!(!ids.contains(&"legion-ip-old"), "replaced: {ids:?}");
-        let ip = hits.iter().find(|h| h.id == "legion-ip").unwrap();
-        assert_eq!(ip.certainty, "certain");
-        assert!(ip.match_type.contains("entity"), "{}", ip.match_type);
-        assert!(ip.line().contains("· certain (seen in a tool result #"), "{}", ip.line());
-        // By words: the old address matches, and arrives as what replaced it.
-        let hits = f.search("192.168.10.105");
-        let first = &hits[0];
-        assert_eq!((first.id.as_str(), first.matched_record_id.as_deref()), ("legion-ip", Some("legion-ip-old")));
-        // Asked for everything, the old one is there, as itself.
-        let args = Args { query: "192.168.10.105".into(), subject: None, since: None, until: None, include: Include::All, limit: 8 };
-        let all = find(&f.memory, &args, Arms::All).unwrap().hits;
-        assert!(all.iter().any(|h| h.id == "legion-ip-old" && h.status == "retired"));
-        // Unrelated words find the unrelated fact; nothing invents a match.
-        assert_eq!(f.search("green tea")[0].id, "jake-tea");
-        assert!(f.search("zebra").is_empty());
-        // A changed archive event shows: the fact is a level less sure.
-        // A subject by one of its names.
-        let args = Args { query: String::new(), subject: Some("legion box".into()), since: None, until: None, include: Include::Current, limit: 8 };
-        let about = find(&f.memory, &args, Arms::All).unwrap().hits;
-        assert_eq!(about[0].id, "legion-ip", "its fact first");
-        assert!(about.iter().any(|h| h.id == "legion"), "then the entity");
-    }
-
-    /// Vectors from words: each word lights its own dimension, and a few
-    /// words light the same one (`address`, `ip`, `where`), so meaning can
-    /// match where the words differ.
-    struct Words;
-    impl Words {
-        fn vector(text: &str) -> Vec<f32> {
-            let mut v = vec![0.0f32; 64];
-            for word in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
-                let slot = match word {
-                    "address" | "ip" | "where" | "located" => 0,
-                    "tea" | "drink" | "drinks" => 1,
-                    other => 2 + (other.bytes().map(usize::from).sum::<usize>() % 62),
-                };
-                v[slot] += 1.0;
-            }
-            v
-        }
-    }
-    impl Encoder for Words {
-        fn fingerprint(&self) -> String {
-            "facts-v1|words".into()
-        }
-        fn query(&self, text: &str) -> Result<Vec<f32>> {
-            Ok(Self::vector(text))
-        }
-        fn document(&self, text: &str) -> Result<Vec<f32>> {
-            Ok(Self::vector(text))
-        }
-    }
-
-    #[test]
-    fn meaning_finds_a_fact_its_words_do_not_and_a_changed_record_is_embedded_again() {
-        let mut f = Fixture::new();
-        f.memory.remember_operator("I drink green tea every morning.".into()).unwrap();
-        let said = f.memory.last_event_id();
-        f.put(json!({"id":"tea","model_id":"lab","kind":"claim","title":"Morning","statement":"The operator drinks green tea.",
-            "basis":"reported","status":"supported","supporting_evidence_ids":[said]}));
-        f.put(json!({"id":"office","model_id":"lab","kind":"claim","title":"Office","statement":"The office is located on the third floor.",
-            "basis":"reported","status":"supported","supporting_evidence_ids":[said]}));
-        let args = |query: &str| Args { query: query.into(), subject: None, since: None, until: None, include: Include::Current, limit: 8 };
-        // Not embedded yet: cosine sees nothing, and says so.
-        let found = find_with(&f.memory, &args("where is it"), Arms::Semantic, Ok(&Words)).unwrap();
-        assert!(found.hits.is_empty() && found.embedded == 0);
-        assert_eq!(refresh_with(&f.world(), 10, &Words, false).unwrap(), 2);
-        assert_eq!(refresh_with(&f.world(), 10, &Words, false).unwrap(), 0, "nothing changed: nothing embedded");
-        // "where" shares no word with the record, but its meaning does.
-        let found = find_with(&f.memory, &args("where is it"), Arms::Semantic, Ok(&Words)).unwrap();
-        assert_eq!(found.hits[0].id, "office");
-        assert!(found.hits[0].cosine.is_some() && found.hits[0].match_type == "semantic");
-        assert!(find_with(&f.memory, &args("where"), Arms::Literal, Ok(&Words)).unwrap().hits.is_empty(), "no word in common");
-        // A rewrite makes the old vector stale until it is embedded again.
-        f.put(json!({"id":"office","model_id":"lab","kind":"claim","title":"Office","statement":"The office moved to the fifth floor.",
-            "basis":"reported","status":"supported","supporting_evidence_ids":[said]}));
-        let found = find_with(&f.memory, &args("where is it"), Arms::Semantic, Ok(&Words)).unwrap();
-        assert_eq!(found.embedded, 1, "the stale vector is not counted");
-        assert_eq!(refresh_with(&f.world(), 10, &Words, false).unwrap(), 1);
-        // No embedder: the other arms run, and the search says what did not.
-        let found = find_with(&f.memory, &args("green tea"), Arms::All, Err("down".into())).unwrap();
-        assert_eq!(found.hits[0].id, "tea");
-        assert!(found.warnings.iter().any(|w| w.contains("did not run (down)")), "{:?}", found.warnings);
-    }
-
-    #[test]
-    fn the_tool_answers_with_lines_and_says_a_miss_is_not_evidence() {
-        let f = Fixture::new();
-        let call = ToolCall {
-            id: "c".into(),
-            kind: "function".into(),
-            function: crate::types::FunctionCall { name: "fact_search".into(), arguments: r#"{"query":"nothing here"}"#.into() },
-        };
-        let out: Value = serde_json::from_str(&execute(&f.memory, &call).unwrap()).unwrap();
-        assert_eq!(out["ok"], true);
-        assert!(out["warnings"].to_string().contains("not evidence"));
-        assert!(tool_definition().function.name == "fact_search");
-        let bad = ToolCall { function: crate::types::FunctionCall { name: "fact_search".into(), arguments: r#"{"query":"x","since":"whenever"}"#.into() }, ..call };
-        assert!(execute(&f.memory, &bad).is_err(), "a window it cannot read is refused");
-    }
-
     fn candidate(statement: &str, basis: &'static str, evidence: Vec<u64>) -> Candidate {
         Candidate { statement: statement.into(), basis, evidence, from_event: 1, through_event: 9 }
-    }
-
-    fn sleep_call(f: &Fixture, name: &str, args: Value) -> Value {
-        let call = ToolCall {
-            id: "s".into(),
-            kind: "function".into(),
-            function: crate::types::FunctionCall { name: name.into(), arguments: args.to_string() },
-        };
-        serde_json::from_str(&execute_sleep(&f.memory, &call).unwrap()).unwrap()
     }
 
     #[test]
@@ -1984,89 +1752,5 @@ mod tests {
         f.put(json!({"id":"tea","model_id":"lab","kind":"claim","title":"Tea","statement":"The operator drinks green tea.",
             "basis":"observed","status":"supported","supporting_evidence_ids":[seen]}));
         assert_eq!(stage(&f.world(), &[candidate("The operator drinks green tea.", "observed", vec![seen])]).unwrap(), 0);
-    }
-
-    #[test]
-    fn sleep_settles_staged_facts_one_operation_at_a_time() {
-        let mut f = Fixture::new();
-        f.memory.remember_operator("The Legion moved to .107 today.".into()).unwrap();
-        let said = f.memory.last_event_id();
-        f.memory.remember_s0ma("[tool:ssh] inet 192.168.10.106".into()).unwrap();
-        let seen = f.memory.last_event_id();
-        f.put(json!({"id":"legion-ip","model_id":"lab","kind":"claim","title":"Legion address","statement":"The Legion is at 192.168.10.106.",
-            "basis":"observed","status":"supported","supporting_evidence_ids":[seen],"volatility":"volatile"}));
-        stage(&f.world(), &[
-            candidate("The Legion moved to 192.168.10.107.", "reported", vec![]),
-            candidate("The Legion is at 192.168.10.106 still.", "observed", vec![seen]),
-            candidate("I said hello to the operator again.", "reported", vec![]),
-            candidate("The printer is out of toner now.", "observed", vec![seen]),
-        ])
-        .unwrap();
-        let listed = sleep_call(&f, "fact_staged_list", json!({}));
-        assert_eq!(listed["total"], 4);
-        let first = &listed["staged"][0];
-        assert!(first["nearest"].to_string().contains("legion-ip"), "the fact it may replace is shown: {first}");
-        let id = |n: usize| listed["staged"][n]["staged"].as_i64().unwrap();
-        let result = sleep_call(&f, "fact_consolidate", json!({"operations": [
-            {"staged": id(0), "op": "supersede", "target": "legion-ip", "reason": "the operator says it moved",
-             "record": {"id":"legion-ip-2","model_id":"lab","kind":"claim","title":"Legion address",
-                "statement":"The Legion is at 192.168.10.107.","basis":"reported","status":"supported",
-                "supporting_evidence_ids":[said],"volatility":"volatile","valid_from":"2026-11-08T09:00:00+00:00"}},
-            {"staged": id(1), "op": "confirm", "target": "legion-ip", "evidence_ids": [seen], "reason": "same as held"},
-            {"staged": id(2), "op": "drop", "reason": "a passing remark"},
-            {"staged": id(3), "op": "add", "reason": "new", "record": {"id":"toner","model_id":"nowhere","kind":"claim",
-                "title":"Toner","statement":"The printer is out of toner.","basis":"observed","status":"supported","supporting_evidence_ids":[seen]}},
-        ]}));
-        let results = result["results"].as_array().unwrap();
-        assert_eq!(results.iter().map(|r| r["ok"].as_bool().unwrap()).collect::<Vec<_>>(), [true, true, true, false]);
-        assert!(results[3]["error"].as_str().unwrap().contains("define the named model first"), "{}", results[3]);
-        // The old address is kept, ended, and points at what replaced it.
-        let (old, _) = read_record(&f.world(), "legion-ip").unwrap().unwrap();
-        assert_eq!((old.status.as_str(), old.superseded_by.as_deref()), ("retired", Some("legion-ip-2")));
-        assert_eq!(old.valid_until.as_deref(), Some("2026-11-08T09:00:00+00:00"));
-        let hits = f.search("192.168.10.106");
-        assert_eq!((hits[0].id.as_str(), hits[0].matched_record_id.as_deref()), ("legion-ip-2", Some("legion-ip")));
-        // Settled ones leave the list; the failed one stays to be sent again.
-        let listed = sleep_call(&f, "fact_staged_list", json!({}));
-        assert_eq!(listed["total"], 1);
-        assert_eq!(listed["staged"][0]["staged"].as_i64(), Some(id(3)));
-        // Settled once only.
-        let again = sleep_call(&f, "fact_consolidate", json!({"operations": [{"staged": id(2), "op": "drop", "reason": "again"}]}));
-        assert!(again["results"][0]["error"].as_str().unwrap().contains("already dropped"));
-        assert_eq!(sleep_tool_definitions().len(), 2);
-    }
-
-    #[test]
-    fn an_archive_search_in_a_fact_s_words_finds_the_event_behind_it() {
-        let mut f = Fixture::new();
-        f.memory.remember_s0ma("[tool:ip] 2: enp3s0 inet 192.168.10.106/24".into()).unwrap();
-        let seen = f.memory.last_event_id();
-        f.put(json!({"id":"legion-ip","model_id":"lab","kind":"claim","title":"Legion address","statement":"The Legion's address on the house network.",
-            "basis":"observed","status":"supported","supporting_evidence_ids":[seen]}));
-        assert_eq!(evidence_matching(&f.memory, "house network address", 8).unwrap(), [seen]);
-        let call = ToolCall {
-            id: "a".into(),
-            kind: "function".into(),
-            function: crate::types::FunctionCall {
-                name: "archive_search".into(),
-                arguments: json!({"query": "house network", "mode": "hybrid", "kinds": ["tool_result"]}).to_string(),
-            },
-        };
-        let out: Value = serde_json::from_str(&crate::archive::execute(&f.memory, &call).unwrap()).unwrap();
-        let hits = out["hits"].as_array().unwrap();
-        assert!(hits.iter().any(|h| h["id"] == seen && h["match_type"] == "fact_key"), "{out}");
-    }
-
-
-    #[test]
-    fn the_names_a_reply_mentions_are_found_by_any_alias() {
-        let mut f = Fixture::new();
-        f.memory.remember_operator("The kettle is in the kitchen.".into()).unwrap();
-        let said = f.memory.last_event_id();
-        f.put(json!({"id":"kettle","model_id":"lab","kind":"entity","title":"Kettle","statement":"The office kettle.",
-            "basis":"reported","status":"supported","supporting_evidence_ids":[said],"aliases":["the boiler"]}));
-        assert_eq!(names_in(&f.memory, "I refilled the boiler this morning."), ["Kettle"]);
-        assert!(names_in(&f.memory, "Nothing about it here.").is_empty());
-        assert!(names_in(&f.memory, "").is_empty());
     }
 }

@@ -1,6 +1,10 @@
 //! Task-scoped VM workers. They never receive canonical memory stores: the
 //! archive handle they hold is the harness's, used only to copy the tool results
 //! a worker cites in a board fact.
+pub(crate) mod context;
+pub(crate) mod feed;
+pub(crate) mod fold;
+
 use crate::hippocampus::Hippocampus;
 use crate::llm::{self, ChatOptions, ToolDefinition};
 use crate::types::{Message, ToolCall};
@@ -80,7 +84,7 @@ pub fn total_worker_context() -> usize {
 pub const MAIN_CONTEXT_RESERVE: usize = 262_144;
 
 /// The main turn's reserve for the window being served: on a long window it
-/// folds by 650k (`context_guard::FoldSchedule::main_reserve`), so it holds
+/// folds by 650k (`crate::context::guard::FoldSchedule::main_reserve`), so it holds
 /// that, a step past it and an output, not the whole window. Read from the
 /// server once it answers; `MAIN_CONTEXT_RESERVE` until then.
 pub fn main_context_reserve() -> usize {
@@ -126,7 +130,7 @@ const RESERVE_RETRY: Duration = Duration::from_secs(30);
 
 /// The main turn's reserve on `window` (`main_context_reserve`, without the server).
 fn reserve_for_window(window: usize) -> usize {
-    crate::context_guard::FoldSchedule::for_window(window).main_reserve(window)
+    crate::context::guard::FoldSchedule::for_window(window).main_reserve(window)
 }
 
 /// A pool that leaves workers less than a fold's lease beside a long window's
@@ -134,7 +138,7 @@ fn reserve_for_window(window: usize) -> usize {
 /// would all go without. The usual cause is the built-in pool (fne's) with ds41
 /// at 1M and no `S0MA_KV_POOL_TOKENS`.
 fn long_window_pool_warning(pool: usize, reserve: usize, window: usize) -> Option<String> {
-    if reserve <= MAIN_CONTEXT_RESERVE || pool >= reserve + crate::context_guard::FOLD_RESERVE_TOKENS {
+    if reserve <= MAIN_CONTEXT_RESERVE || pool >= reserve + crate::context::guard::FOLD_RESERVE_TOKENS {
         return None;
     }
     Some(format!(
@@ -162,14 +166,14 @@ pub const MAX_WORKER_CONTEXT: usize = if TOTAL_WORKER_CONTEXT < MAIN_CONTEXT_RES
 /// the task's context_tokens, so a large value leaves less room for input.
 const MAX_OUTPUT: u32 = 16_384;
 /// Default wall-clock budget for a worker's own activity. Time spent paused
-/// waiting for s0ma to decide on any budget does not count against it.
+/// waiting for the agent to decide on any budget does not count against it.
 /// 900s proved short for real enumeration work; 2400s leaves headroom under
 /// MAX_WORKER_TIME_BUDGET for one subagent_resize extension.
 const WORKER_TIME_BUDGET: Duration = Duration::from_secs(2_400);
-/// Ceiling on a worker's active-time budget when s0ma extends it.
+/// Ceiling on a worker's active-time budget when the agent extends it.
 const MAX_WORKER_TIME_BUDGET: Duration = Duration::from_secs(3_600);
 const _: () = assert!(WORKER_TIME_BUDGET.as_secs() <= MAX_WORKER_TIME_BUDGET.as_secs());
-/// How long a paused worker (context, output or time) waits for s0ma to grant
+/// How long a paused worker (context, output or time) waits for the agent to grant
 /// more (subagent_resize / subagent_compact) or stop it (subagent_cancel)
 /// before falling back to what it did before pausing existed.
 const BUDGET_DECISION_TIMEOUT: Duration = Duration::from_secs(600);
@@ -192,7 +196,7 @@ they showed, so you do not repeat them, with the result_ref of any long result y
 on the machine, including your shell's working directory and anything still running; dead ends and why; \
 open questions; and the concrete next steps. Be dense: facts over narrative. Do not invent results.";
 const MAX_TASK_BYTES: usize = MAX_WORKER_CONTEXT * 4;
-/// Upper bound on one direction from s0ma to a running worker. A direction is a
+/// Upper bound on one direction from the agent to a running worker. A direction is a
 /// course correction on the task the worker already holds, not a new task: it is
 /// spent out of that worker's own context budget, so roughly a thousand tokens.
 const MAX_STEER_BYTES: usize = 4_000;
@@ -302,13 +306,13 @@ struct WorkerResult {
     /// written, to keep it inside its reservation (P2).
     context_elided: usize,
     context_summaries: usize,
-    /// Directions from s0ma this worker took into its context, and any still
+    /// Directions from the agent this worker took into its context, and any still
     /// queued when it stopped. The second is never zero silently: a direction
     /// the worker never saw did not shape the report being read here.
     steers_delivered: usize,
     steers_undelivered: usize,
     /// What the operator told this worker himself, from its tab (Alt+2…), in the
-    /// order it took them: s0ma reads the report knowing what shaped it.
+    /// order it took them: the agent reads the report knowing what shaped it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     operator_directions: Vec<String>,
     /// Set when the worker was stopped as stuck (A03): the stop reason, the
@@ -462,13 +466,13 @@ Budgets cannot shrink; use subagent_cancel to stop a worker instead.", MAX_WORKE
     ));
     definitions.push(ToolDefinition::function(
         "subagent_compact",
-        match crate::worker_fold::Strategy::from_env() {
-            crate::worker_fold::Strategy::Notes => format!("Compact a worker paused for context: lend it a temporary budget, have it write notes on its progress, evidence \
+        match crate::subagent::fold::Strategy::from_env() {
+            crate::subagent::fold::Strategy::Notes => format!("Compact a worker paused for context: lend it a temporary budget, have it write notes on its progress, evidence \
 and next steps, replace its transcript with those notes, then shrink it back to the context_tokens it was spawned with and resume. \
 Its shell and the state it left on the machine are kept; anything it leaves out of its notes is gone from its context (the full transcript stays in \
 subagent_events.jsonl). context_tokens is the temporary total; omit it to use the paused history plus {COMPACT_SUMMARY_MAX} \
 tokens of notes. The temporary increase must fit the free worker pool. If compaction fails, the grant is returned and the worker stays paused."),
-            crate::worker_fold::Strategy::Liveness => format!("Compact a worker paused for context by folding what it no longer uses: lend it a \
+            crate::subagent::fold::Strategy::Liveness => format!("Compact a worker paused for context by folding what it no longer uses: lend it a \
 temporary budget, keep verbatim everything its task and its intent in progress still reach (by claims and cited refs), have it write a short \
 digest of each other stretch of its work (identifiers, numbers, paths and hashes copied exactly, anything else dropped), then shrink it back \
 to the context_tokens it was spawned with and resume. Its shell and the state it left on the machine are kept, and nothing is lost: a digest expands back to \
@@ -557,7 +561,7 @@ pub fn share_archive(memory: &Hippocampus) {
 }
 
 /// The board tools as a worker sees them: the explore set, and a fact cites
-/// the worker's own tool results by ref (archive event IDs are s0ma's).
+/// the worker's own tool results by ref (archive event IDs are the agent's).
 fn worker_board_tools() -> Vec<ToolDefinition> {
     let mut tools: Vec<ToolDefinition> = crate::board::tool_definitions()
         .into_iter()
@@ -712,7 +716,7 @@ fn finish_call(tx: &mpsc::Sender<WorkerEvent>, results: &mut Results, scoped: &T
 /// What each kind of result can be elided to: a VM result to its ref, a
 /// `result_read` page to the part of the result it was, a read-only skill or
 /// board call to the call itself. Anything else stays.
-impl crate::worker_context::Stubs for Results {
+impl crate::subagent::context::Stubs for Results {
     fn stub(&self, message: &Message) -> Option<String> {
         let (name, arguments, reference) = self.calls.get(message.tool_call_id.as_deref()?)?;
         if let Some(reference) = reference {
@@ -780,7 +784,7 @@ const CONTEXT_SUMMARY_MAX: u32 = 2_048;
 const CONTEXT_SUMMARY_MIN: u32 = 512;
 
 /// Journal what a context pass did, and count it on the result.
-fn record_managed(result: &mut WorkerResult, managed: &crate::worker_context::Managed, before: usize, usable: usize)
+fn record_managed(result: &mut WorkerResult, managed: &crate::subagent::context::Managed, before: usize, usable: usize)
     -> Result<(), Box<dyn Error>> {
     if !managed.elided.is_empty() {
         result.context_elided += managed.elided.len();
@@ -900,7 +904,7 @@ judging success yourself. Opening, linking and closing boards are s0ma's; claims
 back to the frontier.";
 
 /// What a worker is told about the time, in its first message (and again
-/// when its transcript is compacted): s0ma's host clock, the operator's local time
+/// when its transcript is compacted): the agent's host clock, the operator's local time
 /// when his zone is set, and that the machine it works on keeps its own clock.
 /// Not in the system prompt, which stays the same for every worker so their
 /// requests share its cached prefix.
@@ -933,10 +937,12 @@ there without repeating finished work. Your shell is still open."}),
 
 /// A worker's system prompt, with the board guide when it has the board tools.
 fn worker_system(tools: &[ToolDefinition]) -> String {
+    // Host mode: the machine is the operator's own computer.
+    let machine = crate::vm::machine::prompt_block().map(|block| format!("\n\n{block}")).unwrap_or_default();
     if tools.iter().any(|tool| is_worker_board_tool(&tool.function.name)) {
-        format!("{SYSTEM}\n\n{BOARD_GUIDE}\n\n{}", crate::skills::GUIDE)
+        format!("{SYSTEM}{machine}\n\n{BOARD_GUIDE}\n\n{}", crate::skills::GUIDE)
     } else {
-        format!("{SYSTEM}\n\n{}", crate::skills::GUIDE)
+        format!("{SYSTEM}{machine}\n\n{}", crate::skills::GUIDE)
     }
 }
 
@@ -961,7 +967,7 @@ fn worker_tools(with_boards: bool) -> Vec<ToolDefinition> {
                 properties.remove("shell");
                 properties.remove("background");
             }
-            tool.function.description.push_str(&match crate::netboxes::worker_user() {
+            tool.function.description.push_str(&match crate::vm::netboxes::worker_user() {
                 Some(user) => format!(" As a worker, your commands run in a shell of your own that the operator can watch, \
                     as your own account ({user}), not s0ma's: /workspace is shared with s0ma, s0ma's home is not yours. \
                     A command that waits for keyboard input is stopped: give it none to wait for, or run it with shell_type."),
@@ -970,7 +976,7 @@ fn worker_tools(with_boards: bool) -> Vec<ToolDefinition> {
             });
         }
     }
-    tools.extend(crate::netboxes::worker_tool_definitions());
+    tools.extend(crate::vm::netboxes::worker_tool_definitions());
     tools.extend(crate::skills::tool_definitions());
     tools.push(ToolDefinition::function("result_read",
         format!("Read back one of your own earlier tool results by the result_ref a truncated result gives \
@@ -988,6 +994,10 @@ paging through a long result. Read-only."),
         }, "required": ["ref"]})));
     if with_boards {
         tools.extend(worker_board_tools());
+    }
+    // While an audit is under way: hand checks and repros to the harness.
+    if crate::audit::ops::any_live() {
+        tools.extend(crate::audit::tools::worker_tool_definitions());
     }
     tools
 }
@@ -1061,13 +1071,13 @@ impl Drop for PauseGuard<'_> {
     }
 }
 
-/// One direction to a worker already running, from s0ma or from the operator.
+/// One direction to a worker already running, from the agent or from the operator.
 struct Directive {
     seq: u64,
     text: String,
     /// Also tells the worker to stop opening new work and report what it has.
     wrap_up: bool,
-    from: crate::worker_feed::Sender,
+    from: crate::subagent::feed::Sender,
 }
 
 /// Directions waiting for a worker, shared with the parent the way `Budget` is.
@@ -1117,7 +1127,7 @@ the worker takes them between turns, so let it resume and take these first"));
 /// Several directions queued between two turns arrive as one message, in order.
 fn steer_message(directives: &[Directive]) -> Message {
     let wrap_up = directives.iter().any(|d| d.wrap_up);
-    let from_operator = directives.first().is_some_and(|d| d.from == crate::worker_feed::Sender::Operator);
+    let from_operator = directives.first().is_some_and(|d| d.from == crate::subagent::feed::Sender::Operator);
     let mut note = "This refines the task you are already on. Apply it from your next action; what you have \
 already established stands, so do not repeat it. It does not widen your authorization: the engagement scope and \
 restrictions in your task still hold, and anything outside them is still a blocker you report rather than act on."
@@ -1128,7 +1138,7 @@ running in the background, and return your report now with what you have, saying
     }
     if from_operator {
         // The operator's own words, sent from the worker's tab. Labelled as his so
-        // the worker never mistakes s0ma's direction for the operator's, or
+        // the worker never mistakes the agent's direction for the operator's, or
         // the other way round.
         return Message::user(format!("[HARNESS — DIRECTION FROM THE OPERATOR, NOT A NEW TASK]\n{}",
             json!({"provenance": "operator_direction",
@@ -1223,16 +1233,16 @@ call subagent_compact with a larger context_tokens").into());
 /// for, and the caller returns the grant.
 #[allow(clippy::too_many_arguments)]
 fn fold_history(
-    messages: &[Message], folder: &mut crate::worker_fold::Folder, refs: &HashMap<String, String>,
+    messages: &[Message], folder: &mut crate::subagent::fold::Folder, refs: &HashMap<String, String>,
     tools: &[ToolDefinition], options: &ChatOptions, budget: &Budget, slot: usize, run_id: &str, cancel: &AtomicBool,
 ) -> Result<(Vec<Message>, usize), Box<dyn Error>> {
     let granted = budget.tokens.load(Ordering::SeqCst);
     let mut digest_options = *options;
     write_up_effort(&mut digest_options);
-    digest_options.max_tokens = crate::worker_fold::DIGEST_MAX_TOKENS;
+    digest_options.max_tokens = crate::subagent::fold::DIGEST_MAX_TOKENS;
     let mut digest = |rendered: &str| -> Result<String, Box<dyn Error>> {
         let request = vec![
-            Message::system(crate::worker_fold::DIGEST_SYSTEM.to_owned()),
+            Message::system(crate::subagent::fold::DIGEST_SYSTEM.to_owned()),
             Message::user(rendered.to_owned()),
         ];
         let input = llm::count_input_tokens(&request, &digest_options, None)?;
@@ -1327,7 +1337,7 @@ struct PauseScope<'a> {
 
 enum Decision { Granted, TimedOut }
 
-/// Pause the worker until s0ma grants enough of the budget named by `reason`,
+/// Pause the worker until the agent grants enough of the budget named by `reason`,
 /// cancels it, or lets the decision time out. `input_tokens` is the history as
 /// last measured; `active` is the worker's active time so far.
 ///
@@ -1339,7 +1349,7 @@ enum Decision { Granted, TimedOut }
 fn await_decision(
     reason: Pause, scope: &PauseScope, messages: &mut Vec<Message>, options: &ChatOptions,
     input_tokens: usize, active: Duration, turn: u32, truncated_tool_call: bool,
-    folder: &mut crate::worker_fold::Folder, refs: &HashMap<String, String>,
+    folder: &mut crate::subagent::fold::Folder, refs: &HashMap<String, String>,
 ) -> Result<Decision, Box<dyn Error>> {
     let PauseScope { task, tools, budget, slot, run_id, cancel, tx } = *scope;
     let limit = budget.tokens.load(Ordering::SeqCst);
@@ -1356,16 +1366,16 @@ fn await_decision(
         "needed_tokens": (reason == Pause::Context).then(|| needed(paused_output)),
         "active_secs": active.as_secs(), "time_budget_secs": budget.time().as_secs(),
         "truncated_tool_call": (reason == Pause::Output).then_some(truncated_tool_call)}))?;
-    crate::worker_feed::push(run_id, crate::worker_feed::Item::Note(format!(
+    crate::subagent::feed::push(run_id, crate::subagent::feed::Item::Note(format!(
         "paused: out of {} budget; waiting for s0ma to grant more or stop it", reason.name())));
     // The tab's status line says so until this returns, however it does.
     struct FeedPause<'a>(&'a str);
     impl Drop for FeedPause<'_> {
         fn drop(&mut self) {
-            crate::worker_feed::paused(self.0, None);
+            crate::subagent::feed::paused(self.0, None);
         }
     }
-    crate::worker_feed::paused(run_id, Some(&format!("paused: {}", reason.name())));
+    crate::subagent::feed::paused(run_id, Some(&format!("paused: {}", reason.name())));
     let _feed_pause = FeedPause(run_id);
     tx.send(WorkerEvent::NeedsBudget(BudgetRequest { reason, run_id: run_id.to_owned(), input_tokens,
         reserved_output_tokens: paused_output, context_tokens: limit,
@@ -1381,18 +1391,18 @@ fn await_decision(
         let granted = budget.tokens.load(Ordering::SeqCst);
         let output = budget.output();
         if reason == Pause::Context {
-            // s0ma may raise the output cap while the worker waits; keep the
+            // The agent may raise the output cap while the worker waits; keep the
             // advertised minimum honest.
             budget.needed.store(needed(output), Ordering::SeqCst);
         }
         if reason == Pause::Context && budget.compacting() {
             let mut compact_options = *options;
             compact_options.max_tokens = output;
-            let outcome = match crate::worker_fold::Strategy::from_env() {
+            let outcome = match crate::subagent::fold::Strategy::from_env() {
                 // The rollback path, for one release: prose notes replace the transcript.
-                crate::worker_fold::Strategy::Notes =>
+                crate::subagent::fold::Strategy::Notes =>
                     compact_history(messages, task, tools, &compact_options, budget, slot, run_id, cancel),
-                crate::worker_fold::Strategy::Liveness =>
+                crate::subagent::fold::Strategy::Liveness =>
                     fold_history(messages, folder, refs, tools, &compact_options, budget, slot, run_id, cancel),
             };
             if cancel.load(Ordering::SeqCst) {
@@ -1433,7 +1443,7 @@ fn await_decision(
         if resumed { break; }
         if waited.elapsed() >= BUDGET_DECISION_TIMEOUT {
             journal(&json!({"run_id": run_id, "event": format!("{}_decision_timeout", reason.name()), "turn": turn}))?;
-            crate::worker_feed::push(run_id, crate::worker_feed::Item::Note(format!(
+            crate::subagent::feed::push(run_id, crate::subagent::feed::Item::Note(format!(
                 "no decision on its {} budget in time", reason.name())));
             return Ok(Decision::TimedOut);
         }
@@ -1442,7 +1452,7 @@ fn await_decision(
     journal(&json!({"run_id": run_id, "event": format!("{}_resumed", reason.name()), "turn": turn,
         "context_tokens": budget.tokens.load(Ordering::SeqCst), "reserved_output_tokens": budget.output(),
         "time_budget_secs": budget.time().as_secs(), "paused_ms": started.elapsed().as_millis()}))?;
-    crate::worker_feed::push(run_id, crate::worker_feed::Item::Note("resumed".into()));
+    crate::subagent::feed::push(run_id, crate::subagent::feed::Item::Note("resumed".into()));
     Ok(Decision::Granted)
 }
 
@@ -1604,13 +1614,13 @@ fn audit(tx: &mpsc::Sender<WorkerEvent>, record: serde_json::Value) -> Result<u6
 
 fn scoped_call(call: &ToolCall, boards: bool) -> Result<ToolCall, Box<dyn Error>> {
     let name = call.function.name.as_str();
-    if matches!(name,"skill_list"|"skill_read"|"result_read") || (boards && is_worker_board_tool(name)) {return Ok(call.clone());}
+    if matches!(name,"skill_list"|"skill_read"|"result_read") || (boards && is_worker_board_tool(name)) || crate::audit::tools::WORKER_TOOLS.contains(&name) {return Ok(call.clone());}
     if !matches!(name, "vm_exec" | "shell_type" | "shell_key" | "shell_read") {
         return Err(format!("worker tool not permitted: {name}").into());
     }
     let mut args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
     let object = args.as_object_mut().ok_or("tool arguments must be an object")?;
-    // Its own shell, never one of the operator's or s0ma's, whatever it names
+    // Its own shell, never one of the operator's or the agent's, whatever it names
     // (vm.rs puts it there by its run id).
     for key in ["shell", "netbox", "session"] {
         object.remove(key);
@@ -1640,9 +1650,9 @@ impl Drop for WorkerShell {
     fn drop(&mut self) {
         if self.netbox && !cfg!(test) {
             let _cleanup = crate::kill::suspend();
-            let name = crate::netboxes::worker_name(&self.run_id);
-            let outcome = crate::netboxes::close(&mut crate::netboxes::machine, &name, true);
-            crate::vm_terms::touch();
+            let name = crate::vm::netboxes::worker_name(&self.run_id);
+            let outcome = crate::vm::netboxes::close(&mut crate::vm::netboxes::machine, &name, true);
+            crate::vm::terms::touch();
             let _ = audit(&self.tx, json!({"run_id": self.run_id, "event": "netbox_cleanup", "netbox": name, "result": format!("{outcome:?}")}));
         }
     }
@@ -1671,15 +1681,15 @@ fn run_worker(task: &Task, index: usize, batch: &str, cancel: &AtomicBool, budge
             Message::user(worker_brief(task, None)),
         ];
         let mut evidence = Results::new(&result.run_id, index + 1, JOURNAL.get().cloned().unwrap_or_default());
-        let context_mode = crate::worker_context::Mode::from_env();
-        let mut context_state = crate::worker_context::State::default();
+        let context_mode = crate::subagent::context::Mode::from_env();
+        let mut context_state = crate::subagent::context::State::default();
         // Liveness folding's digests and memo: empty, and inert, until the
         // worker is first compacted.
-        let mut folder = crate::worker_fold::Folder::new(index + 1);
+        let mut folder = crate::subagent::fold::Folder::new(index + 1);
         // Stuck detection (A03): streaks of identical calls.
         let mut streaks = crate::streak::Streaks::new(&result.run_id);
         let mut shell = WorkerShell { netbox: false, tx: tx.clone(), run_id: result.run_id.clone() };
-        // s0ma's own settings at the subagents' level (`/mode workers`, the
+        // The agent's own settings at the subagents' level (`/mode workers`, the
         // overview): its sampling, and thinking unless the level is instruct.
         let mut options = crate::reasoning::worker_profile().options();
         options.max_tokens = budget.output();
@@ -1687,7 +1697,7 @@ fn run_worker(task: &Task, index: usize, batch: &str, cancel: &AtomicBool, budge
         let mut turn = 0u32;
         // Time spent paused for a budget decision is excluded from the time budget.
         let mut paused = Duration::ZERO;
-        // Once s0ma lets an output pause time out, later cut-offs take the old
+        // Once the agent lets an output pause time out, later cut-offs take the old
         // path at once instead of each waiting out another decision timeout.
         let mut output_declined = false;
         let run_id = result.run_id.clone();
@@ -1708,7 +1718,7 @@ fn run_worker(task: &Task, index: usize, batch: &str, cancel: &AtomicBool, budge
             continue;
         }
         if cancel.load(Ordering::SeqCst) { return Err("cancelled".into()); }
-        // A direction from s0ma enters the history here and nowhere else. This
+        // A direction from the agent enters the history here and nowhere else. This
         // is the only point in the loop where the history is complete: every
         // tool call of the previous batch already has its result beside it.
         // Injecting mid-batch would separate a call from its result and vLLM
@@ -1725,16 +1735,16 @@ fn run_worker(task: &Task, index: usize, batch: &str, cancel: &AtomicBool, budge
                 "seqs": directives.iter().map(|d| d.seq).collect::<Vec<_>>(),
                 "wrap_up": directives.iter().any(|d| d.wrap_up),
                 "from": directives.iter().map(|d| match d.from {
-                    crate::worker_feed::Sender::Operator => "operator",
-                    crate::worker_feed::Sender::S0ma => "s0ma",
+                    crate::subagent::feed::Sender::Operator => "operator",
+                    crate::subagent::feed::Sender::S0ma => "s0ma",
                 }).collect::<Vec<_>>(),
                 "directions": directives.iter().map(|d| d.text.as_str()).collect::<Vec<_>>()}))?;
             result.operator_directions.extend(directives.iter()
-                .filter(|d| d.from == crate::worker_feed::Sender::Operator).map(|d| d.text.clone()));
-            crate::worker_feed::delivered(&result.run_id, &directives.iter().map(|d| d.seq).collect::<Vec<_>>());
+                .filter(|d| d.from == crate::subagent::feed::Sender::Operator).map(|d| d.text.clone()));
+            crate::subagent::feed::delivered(&result.run_id, &directives.iter().map(|d| d.seq).collect::<Vec<_>>());
             messages.extend(steer_messages(&directives));
         }
-        // Pick up any output cap s0ma granted since the last turn.
+        // Pick up any output cap the agent granted since the last turn.
         options.max_tokens = budget.output();
         result.reserved_output_tokens = options.max_tokens;
         let measured = llm::count_input_tokens(&messages, &options, Some(&tools))?;
@@ -1742,7 +1752,7 @@ fn run_worker(task: &Task, index: usize, batch: &str, cancel: &AtomicBool, budge
         result.context_tokens = limit;
         // P2: keep the transcript inside the window before asking for more of it.
         let usable = limit.saturating_sub(options.max_tokens as usize);
-        let managed = crate::worker_context::manage(&mut messages, &mut context_state, &evidence, context_mode, usable, measured,
+        let managed = crate::subagent::context::manage(&mut messages, &mut context_state, &evidence, context_mode, usable, measured,
             &mut |request| llm::count_input_tokens(request, &options, Some(&tools)),
             &mut |request| summarize_for_worker(request, &options, budget, index + 1, &run_id, cancel))?;
         record_managed(&mut result, &managed, measured, usable)?;
@@ -1779,13 +1789,13 @@ fn run_worker(task: &Task, index: usize, batch: &str, cancel: &AtomicBool, budge
                 llm::StreamEvent::Started => {
                     generations += 1;
                     if generations > 1 {
-                        crate::worker_feed::push(&run_id, crate::worker_feed::Item::Note(
+                        crate::subagent::feed::push(&run_id, crate::subagent::feed::Item::Note(
                             "the model's answer was incomplete; generating it again".into()));
                     }
                 }
-                llm::StreamEvent::Reasoning(text) => crate::worker_feed::stream(&run_id, true, &text),
+                llm::StreamEvent::Reasoning(text) => crate::subagent::feed::stream(&run_id, true, &text),
                 llm::StreamEvent::Content(text) => {
-                    crate::worker_feed::stream(&run_id, false, &text);
+                    crate::subagent::feed::stream(&run_id, false, &text);
                     result.result.push_str(&text);
                 }
                 _ => {}
@@ -1882,7 +1892,7 @@ re-issue this call if it is still needed"}).to_string()));
                 // a call refused before it ran is keyed as the model wrote it.
                 let mut key_arguments = call.function.arguments.clone();
                 let call_started = Instant::now();
-                crate::worker_feed::push(&run_id, crate::worker_feed::Item::Call {
+                crate::subagent::feed::push(&run_id, crate::subagent::feed::Item::Call {
                     name: call.function.name.clone(), arguments: call.function.arguments.clone() });
                 let output = match scoped_call(&call, archive.is_some()) {
                     Err(e) => json!({"ok": false, "error": e.to_string()}).to_string(),
@@ -1907,6 +1917,8 @@ re-issue this call if it is still needed"}).to_string()));
                             }
                         } else if let (true, Some(archive)) = (is_worker_board_tool(name), archive.as_mut()) {
                             execute_board(&scoped, &mut evidence, archive)
+                        } else if crate::audit::tools::WORKER_TOOLS.contains(&name) {
+                            Ok(crate::audit::tools::execute(&scoped, &crate::vm::netboxes::agent_label(&run_id)))
                         } else {crate::exec_feed::as_owner(&run_id, || vm::execute(&scoped))};
                         let output = execution.unwrap_or_else(|e| json!({"ok": false, "error": e.to_string()}).to_string());
                         // Every VM result is kept by ref, for result_read and board evidence.
@@ -1918,12 +1930,12 @@ re-issue this call if it is still needed"}).to_string()));
                 // budget checks (time before each call, context and output
                 // around each model turn) have already run, and a call skipped
                 // for budget never gets here.
-                crate::worker_feed::push(&run_id, crate::worker_feed::Item::Result(output.clone()));
+                crate::subagent::feed::push(&run_id, crate::subagent::feed::Item::Result(output.clone()));
                 let verdict = streaks.record(&call_name, &key_arguments, &crate::streak::Outcome::of(&output),
                     &chrono::Utc::now().to_rfc3339());
                 result.streaks = streaks.summary();
                 let mut view = worker_view(call.id, output, reference.as_deref(), archive.is_some());
-                // The worker's clock, as s0ma's tool results carry it: when
+                // The worker's clock, as the agent's tool results carry it: when
                 // the call finished and how long it took.
                 view.content.push_str(&crate::observation_mask::trailer(
                     &crate::clock::now(),
@@ -1965,7 +1977,7 @@ re-issue this call if it is still needed"}).to_string()));
                         // Before giving up on the batch's later calls, make room
                         // by eliding older results (this batch's stay whole).
                         let usable = limit.saturating_sub(options.max_tokens as usize);
-                        let managed = crate::worker_context::elide_to_fit(&mut messages, &evidence, context_mode, usable,
+                        let managed = crate::subagent::context::elide_to_fit(&mut messages, &evidence, context_mode, usable,
                             used, &mut |request| llm::count_input_tokens(request, &options, Some(&tools)))?;
                         record_managed(&mut result, &managed, used, usable)?;
                         used = managed.tokens;
@@ -1989,12 +2001,11 @@ re-issue this call if it is still needed"}).to_string()));
     if let Err(error) = run { result.error = Some(error.to_string()); }
     if cancel.load(Ordering::SeqCst) { result.status = "cancelled".into(); }
     // Anything still queued was never seen, however the worker ended: say so in
-    // the result rather than letting s0ma read the report as though it had landed.
+    // the result rather than letting the agent read the report as though it had landed.
     result.steers_undelivered = steer.pending();
     result.duration_ms = started.elapsed().as_millis();
     result
 }
-
 
 struct Job {
     slot: usize,
@@ -2040,7 +2051,7 @@ fn holds_reservation(job: &Job) -> bool {
     job.result.is_none() || job.result.as_ref().is_some_and(|r| r.status == "slot_release_failed")
 }
 /// What the engine says about its KV right now (`GET /v1/models`), when it
-/// says: the s0ma engine reports `kv_free_tokens` and `kv_tokens_per_sequence`,
+/// says: the agent engine reports `kv_free_tokens` and `kv_tokens_per_sequence`,
 /// vLLM neither, and then only the pool accounting above applies.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LiveKv {
@@ -2073,15 +2084,17 @@ fn read_live_kv(response: &serde_json::Value, model: &str) -> Option<LiveKv> {
 /// None when the server doesn't report it or doesn't answer quickly; a server
 /// that is down fails the spawn's own checks a moment later anyway.
 fn live_kv() -> Option<LiveKv> {
-    if cfg!(test) {
+    // A hosted API reports no KV cache; its limits are its own.
+    if cfg!(test) || crate::model_config::hosted() {
         return None;
     }
-    let response: serde_json::Value = reqwest::blocking::Client::builder()
+    let request = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
         .build()
         .ok()?
-        .get(llm::endpoint("/v1/models"))
+        .get(llm::endpoint("/v1/models"));
+    let response: serde_json::Value = crate::model_config::authorize(request)
         .send()
         .ok()?
         .error_for_status()
@@ -2272,8 +2285,8 @@ error says so), use subagent_resize, or subagent_cancel.",
                     result.error.as_ref().map(|e|format!("; {e}")).unwrap_or_default()));
                 if let Some(job) = m.jobs.get_mut(&id) { job.result = Some(result.clone()); }
                 // A board's independent verifier: its report is kept on the
-                // board, held from s0ma until s0ma has filed its own check.
-                let verifier = crate::board_flow::verifier_finished(&id, &result.status, &result.result, result.error.as_deref());
+                // board, held from the agent until the agent has filed its own check.
+                let verifier = crate::board::flow::verifier_finished(&id, &result.status, &result.result, result.error.as_deref());
                 match &verifier {
                     Some(Some(note)) => m.notifications.push_back(note.clone()),
                     Some(None) => m.statuses.push_back(format!("[board] the verifier {id} finished; its report waits for s0ma's own check")),
@@ -2492,7 +2505,7 @@ fn compact(m: &mut Manager, id: &str, requested: Option<usize>) -> Result<serde_
 /// and compact, and the directive is validated before any job is touched, so a
 /// refused one reaches nobody. Jobs are reported on individually: steering four
 /// workers where one has just finished should still reach the other three.
-fn steer(m: &mut Manager, ids: &[String], text: &str, wrap_up: bool, from: crate::worker_feed::Sender)
+fn steer(m: &mut Manager, ids: &[String], text: &str, wrap_up: bool, from: crate::subagent::feed::Sender)
     -> Result<serde_json::Value, String> {
     if ids.is_empty() { return Err("steering requires explicit job IDs".into()); }
     let text = text.trim();
@@ -2516,10 +2529,10 @@ task a worker already has, so spawn a fresh worker for genuinely new work", text
             let seq = NEXT_STEER.fetch_add(1, Ordering::Relaxed);
             // Into the feed first: the worker may take it from the mailbox
             // the moment it is there, and marks it taken in the feed then.
-            crate::worker_feed::push(id, crate::worker_feed::Item::Direction {
+            crate::subagent::feed::push(id, crate::subagent::feed::Item::Direction {
                 seq, from, text: text.to_owned(), wrap_up, delivered: false });
             let pending = job.steer.push(Directive { seq, text: text.to_owned(), wrap_up, from })
-                .inspect_err(|_| crate::worker_feed::withdraw(id, seq))?;
+                .inspect_err(|_| crate::subagent::feed::withdraw(id, seq))?;
             // A paused worker is parked inside its pause rather than between
             // turns, so it reads nothing until a budget decision frees it.
             let paused = job.budget.paused();
@@ -2536,11 +2549,11 @@ times out", reason.name(), if reason == Pause::Context { " or subagent_compact" 
         }
     }
     m.statuses.push_back(match from {
-        crate::worker_feed::Sender::S0ma => format!("[subagent] steered {queued} worker{}{}{}",
+        crate::subagent::feed::Sender::S0ma => format!("[subagent] steered {queued} worker{}{}{}",
             if queued == 1 { "" } else { "s" },
             if wrap_up { ", wrap up" } else { "" },
             if refused > 0 { format!("; {refused} refused") } else { String::new() }),
-        crate::worker_feed::Sender::Operator => format!("[subagent {}] you {}: {}", ids.join(", "),
+        crate::subagent::feed::Sender::Operator => format!("[subagent {}] you {}: {}", ids.join(", "),
             if wrap_up { "told it to wrap up" } else { "sent it a direction" }, task_label(text)),
     });
     Ok(json!({"ok": refused == 0, "queued": queued, "refused": refused, "wrap_up": wrap_up,
@@ -2551,13 +2564,13 @@ never saw as steers_undelivered. Steering neither resumes a paused worker nor st
 subagent_compact and subagent_cancel do that."}))
 }
 
-/// The operator's direction to one running worker, from its tab: queued like s0ma's
+/// The operator's direction to one running worker, from its tab: queued like the agent's
 /// (`subagent_steer`), labelled as his, and taken before the worker's next
 /// step. What to tell him, or why it was refused.
 pub fn steer_from_operator(id: &str, text: &str, wrap_up: bool) -> Result<String, String> {
     let outcome = {
         let mut m = manager().map_err(|e| e.to_string())?;
-        steer(&mut m, &[id.to_owned()], text, wrap_up, crate::worker_feed::Sender::Operator)?
+        steer(&mut m, &[id.to_owned()], text, wrap_up, crate::subagent::feed::Sender::Operator)?
     };
     wake_input();
     let entry = &outcome["jobs"][0];
@@ -2635,9 +2648,9 @@ where F: FnMut(String) -> Result<(), Box<dyn Error>>,
         }
         let outcome = {
             let mut m = manager()?;
-            steer(&mut m, &args.job_ids, &args.directive, args.wrap_up, crate::worker_feed::Sender::S0ma)?
+            steer(&mut m, &args.job_ids, &args.directive, args.wrap_up, crate::subagent::feed::Sender::S0ma)?
         };
-        // The full directive goes to the worker journal; s0ma's own thread keeps
+        // The full directive goes to the worker journal; the agent's own thread keeps
         // a bounded copy, as it does for a worker's report.
         journal(&json!({"event":"steer", "job_ids":&args.job_ids, "wrap_up":args.wrap_up,
             "directive":&args.directive, "queued":outcome["queued"], "refused":outcome["refused"],
@@ -2668,7 +2681,7 @@ where F: FnMut(String) -> Result<(), Box<dyn Error>>,
                 for status in take_statuses()? { let _ = on_status(status); }
                 let done = {
                     let m = manager()?;
-                    // A paused job needs s0ma's decision, so stop waiting on it.
+                    // A paused job needs the agent's decision, so stop waiting on it.
                     let settled = |j: &Job| j.result.is_some() || (j.budget.paused().is_some() && !j.budget.compacting());
                     if query.job_ids.is_empty() { m.jobs.values().all(settled) }
                     else { query.job_ids.iter().all(|id|m.jobs.get(id).is_none_or(settled)) }
@@ -2735,17 +2748,17 @@ where F: FnMut(String) -> Result<(), Box<dyn Error>>,
         let worker_batch = batch.clone();
         let fallback_id = id.clone();
         let label = task_label(&task.task);
-        crate::worker_feed::begin(slot, &id, &task.task);
+        crate::subagent::feed::begin(slot, &id, &task.task);
         // Its conversation for the engine's kept prompts: a uuid of its own,
         // so a slot used again is never mistaken for this worker.
         let conversation = crate::conversations::Conversation::worker(
-            &crate::netboxes::agent_label(&id), &crate::conversations::new_uuid());
+            &crate::vm::netboxes::agent_label(&id), &crate::conversations::new_uuid());
         let handle = std::thread::Builder::new().name(id.clone()).spawn(move || {
             // Every model call of the worker names it; ended once the worker
             // is done for good (a pause is inside this scope).
             let entered = conversation.enter(true);
             // The job's cancel flag doubles as this thread's kill token, so a
-            // cancel (s0ma's, Ctrl+C's or the operator's /kill) also stops a
+            // cancel (the agent's, Ctrl+C's or the operator's /kill) also stops a
             // VM command the worker is waiting on, not just its next step.
             let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _token = crate::kill::install(Arc::clone(&worker_cancel));
@@ -2770,9 +2783,9 @@ where F: FnMut(String) -> Result<(), Box<dyn Error>>,
                 result.error = Some(format!("journal failure: {error}"));
             }
             if let Some(error) = &result.error {
-                crate::worker_feed::push(&result.run_id, crate::worker_feed::Item::Note(error.clone()));
+                crate::subagent::feed::push(&result.run_id, crate::subagent::feed::Item::Note(error.clone()));
             }
-            crate::worker_feed::finish(&result.run_id, &result.status);
+            crate::subagent::feed::finish(&result.run_id, &result.status);
             let _ = tx.send(WorkerEvent::Finished(Box::new(result)));
             wake_input();
         });
@@ -2920,75 +2933,36 @@ pub fn shutdown(memory: &mut Hippocampus) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub(crate) struct MaintenanceLease {pub slot:usize,pub capacity:usize,released:bool}
+pub(crate) fn reserve_maintenance(maximum:usize,minimum:usize)->Result<Option<MaintenanceLease>,Box<dyn Error>> {
+    let advertised=llm::sleep_worker_slots()?;let mut m=manager()?;
+    let free=available_slots(&m);let available=total_worker_context().saturating_sub(reserved_context(&m));
+    for (slot,capacity) in advertised.into_iter().rev() {
+        let capacity=capacity.min(maximum).min(available);
+        if free.contains(&slot) && capacity>=minimum {
+            m.maintenance.insert(slot,capacity);return Ok(Some(MaintenanceLease{slot,capacity,released:false}));
+        }
+    }
+    Ok(None)
+}
+impl MaintenanceLease {
+    pub fn release(&mut self)->Result<(),Box<dyn Error>> {
+        if self.released{return Ok(());}
+        llm::release_worker_slot(self.slot)?;manager()?.maintenance.remove(&self.slot);self.released=true;Ok(())
+    }
+}
+impl Drop for MaintenanceLease {fn drop(&mut self){if let Err(e)=self.release(){llm::background_status(format_args!("[compaction] slot {} remains reserved: {e}",self.slot));}}}
+pub(crate) fn recover_maintenance(slot:usize)->Result<(),Box<dyn Error>> {
+    if !(1..=MAX_WORKERS).contains(&slot){return Err("invalid maintenance slot receipt".into());}
+    let mut m=manager()?;
+    if m.jobs.values().any(|job|job.slot==slot && holds_reservation(job)){return Err("maintenance cleanup deferred: slot belongs to an active worker".into());}
+    llm::release_worker_slot(slot)?;m.maintenance.remove(&slot);Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_worker_is_told_the_time_and_that_its_machine_keeps_its_own() {
-        let clock = worker_clock();
-        let now = clock["now"].as_str().unwrap();
-        assert!(now.contains(" local (UTC") && now.ends_with(" UTC"), "{now}");
-        let note = clock["note"].as_str().unwrap();
-        assert!(note.contains("not your training data") && note.contains("keeps its own clock"), "{note}");
-        // Not in the system prompt, whose bytes every worker shares.
-        assert!(!worker_system(&[]).contains(now));
-        // In the brief the worker starts from, and the one compaction leaves it.
-        for notes in [None, Some("did step one")] {
-            let brief: serde_json::Value = serde_json::from_str(&worker_brief(&task(), notes)).unwrap();
-            assert!(brief["clock"]["now"].as_str().is_some_and(|now| now.ends_with(" UTC")), "{brief}");
-            assert_eq!(brief["task"], "Compare these facts");
-        }
-    }
-
-    #[test]
-    fn the_pool_comes_from_the_environment_when_it_says() {
-        // A long window's reserve, and a pool that can't hold it beside workers.
-        assert_eq!(reserve_for_window(262_144), MAIN_CONTEXT_RESERVE);
-        let long = reserve_for_window(1_048_576);
-        assert_eq!(long, crate::context_guard::LONG_WINDOW_MIN_TOKENS);
-        let warning = long_window_pool_warning(KV_POOL_TOKENS, long, 1_048_576).expect("the built-in pool is too small at 1M");
-        assert!(warning.contains("S0MA_KV_POOL_TOKENS") && warning.contains(" leaves 0 for workers"), "{warning}");
-        assert!(long_window_pool_warning(2_097_152, long, 1_048_576).is_none(), "ds41's 2x pool is enough");
-        assert!(long_window_pool_warning(KV_POOL_TOKENS, MAIN_CONTEXT_RESERVE, 262_144).is_none(), "the short window as before");
-        assert_eq!(pool_setting(None), (KV_POOL_TOKENS, None));
-        assert_eq!(pool_setting(Some("  ")), (KV_POOL_TOKENS, None));
-        assert_eq!(pool_setting(Some("574932")), (574_932, None), "start-s0ma.sh's figure");
-        assert_eq!(pool_setting(Some("574_932")).0, 574_932);
-        let (pool, warning) = pool_setting(Some("lots"));
-        assert_eq!(pool, KV_POOL_TOKENS, "unreadable: the built-in figure");
-        assert!(warning.unwrap().contains("not a number"));
-        // Smaller than the main turn's reserve: used as given, and said.
-        let (pool, warning) = pool_setting(Some("200000"));
-        assert_eq!(pool, 200_000);
-        assert!(warning.unwrap().contains("subagents can't start"));
-        // Tests budget against the built-in pool whatever the environment says.
-        assert_eq!(kv_pool_tokens(), KV_POOL_TOKENS);
-        assert_eq!(total_worker_context(), TOTAL_WORKER_CONTEXT);
-    }
-
-    #[test]
-    fn the_engines_live_kv_is_read_where_it_reports_it() {
-        let model = "qwen3.8-flash-next";
-        let beside_the_window = json!({"object":"list","data":[{"id":model,"max_model_len":262144,
-            "kv_free_tokens":301_000,"kv_tokens_per_sequence":8_900}]});
-        assert_eq!(read_live_kv(&beside_the_window, model), Some(LiveKv { free: 301_000, per_sequence: 8_900 }));
-        let top_level = json!({"data":[{"id":model,"max_model_len":262144}],"kv_free_tokens":120_000});
-        assert_eq!(read_live_kv(&top_level, model), Some(LiveKv { free: 120_000, per_sequence: 0 }));
-        let vllm = json!({"object":"list","data":[{"id":model,"max_model_len":262144}]});
-        assert_eq!(read_live_kv(&vllm, model), None, "vLLM: only the pool accounting applies");
-        let renamed = json!({"data":[{"id":"served-under-another-name","kv_free_tokens":5,"kv_tokens_per_sequence":1}]});
-        assert_eq!(read_live_kv(&renamed, model), Some(LiveKv { free: 5, per_sequence: 1 }));
-    }
-
-    #[test]
-    fn each_new_worker_needs_its_context_and_one_sequences_state() {
-        let live = LiveKv { free: 97_800, per_sequence: 8_900 };
-        assert!(fits_live(&[40_000, 40_000], live).is_ok(), "80,000 + 2 × 8,900 = 97,800");
-        let error = fits_live(&[40_000, 40_000], LiveKv { free: 97_799, ..live }).unwrap_err();
-        assert!(error.contains("97799 KV tokens free") && error.contains("need 97800") && error.contains("17800"), "{error}");
-        assert!(fits_live(&[90_000], LiveKv { free: 90_000, per_sequence: 0 }).is_ok());
-    }
     #[test]
     fn spawns_are_refused_only_while_a_scheduled_sleep_waits() {
         assert!(held_spawn_reply(false).is_none());
@@ -2997,15 +2971,6 @@ mod tests {
         assert!(reply["error"].as_str().unwrap().contains("scheduled sleep is waiting"));
     }
 
-    #[test]
-    fn workers_expose_read_only_skill_tools_without_vm_session_rewriting() {
-        let tools=worker_tools(false);
-        assert!(tools.iter().any(|t|t.function.name=="skill_list"));
-        assert!(tools.iter().any(|t|t.function.name=="skill_read"));
-        let call=ToolCall{id:"skill".into(),kind:"function".into(),function:crate::types::FunctionCall{
-            name:"skill_read".into(),arguments:"{\"name\":\"demo\"}".into()}};
-        assert_eq!(scoped_call(&call,false).unwrap().function.arguments,call.function.arguments);
-    }
     fn finished(slot: usize, status: &str) -> WorkerResult {
         WorkerResult {
             run_id:"test".into(), task_index:0, slot, context_tokens:24_000,
@@ -3015,44 +2980,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn slots_are_reserved_until_the_worker_reports_its_slot_released() {
-        // Reservation follows the worker's own report, not the parent's
-        // bookkeeping. A worker sends Finished only after slot erase succeeds, so
-        // joining its thread frees nothing; this test used to join a handle and
-        // expect the slot back, which stopped being true when holds_reservation
-        // moved to keying on the result.
-        let (tx, rx) = mpsc::channel();
-        let mut m = Manager { tx, rx, jobs: HashMap::new(), notifications: VecDeque::new(), statuses:VecDeque::new(),
-            completed: VecDeque::new(), pending_audit: None, maintenance: HashMap::new() };
-        assert_eq!(available_slots(&m), (1..=MAX_WORKERS).collect::<Vec<_>>());
-
-        for slot in 1..=MAX_WORKERS {
-            m.jobs.insert(slot.to_string(), Job {slot, context_tokens:24_000, budget:Arc::new(Budget::new(24_000, 1024)),
-                steer:Arc::new(Mailbox::default()), cancel:Arc::new(AtomicBool::new(false)),
-                handle:Some(std::thread::spawn(|| {})), result:None, operator:OperatorView::default()});
-        }
-        assert!(available_slots(&m).is_empty());
-        assert_eq!(reserved_context(&m), 24_000 * MAX_WORKERS);
-
-        // Joining the thread is not a release.
-        m.jobs.get_mut("3").unwrap().handle.take().unwrap().join().unwrap();
-        assert!(available_slots(&m).is_empty(), "a reaped thread does not free the budget");
-
-        // A reported release does.
-        m.jobs.get_mut("3").unwrap().result = Some(finished(3, "ok"));
-        assert_eq!(available_slots(&m), vec![3]);
-        assert_eq!(reserved_context(&m), 24_000 * (MAX_WORKERS - 1));
-
-        // A failed erase stays reserved, fail-closed.
-        m.jobs.get_mut("4").unwrap().result = Some(finished(4, "slot_release_failed"));
-        assert_eq!(available_slots(&m), vec![3], "a failed erase keeps its slot");
-        assert_eq!(reserved_context(&m), 24_000 * (MAX_WORKERS - 1));
-
-        for job in m.jobs.values_mut() {
-            if let Some(handle) = job.handle.take() { handle.join().unwrap(); }
-        }
-    }
     fn call(name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall { id: "test".into(), kind: "function".into(),
             function: crate::types::FunctionCall { name: name.into(), arguments: args.to_string() } }
@@ -3077,62 +3004,7 @@ mod tests {
             assert!(scoped_call(&call(name, json!({})), false).is_err());
         }
     }
-    #[test]
-    fn worker_commands_have_bounded_timeout() {
-        let mapped = scoped_call(&call("vm_exec", json!({"command": "true", "timeout_secs": 3600})), false).unwrap();
-        let args: serde_json::Value = serde_json::from_str(&mapped.function.arguments).unwrap();
-        assert_eq!(args["timeout_secs"], 60);
-        assert!(scoped_call(&call("vm_exec", json!({"timeout_secs": 0})), false).is_err());
-    }
     fn task() -> Task { Task { task: "Compare these facts".into(), context_tokens:24_000, context: String::new(), max_output_tokens: 1024 } }
-    #[test]
-    fn worker_count_is_bounded() {
-        assert!(validate(&Arguments { tasks: vec![] }).is_err());
-        assert!(validate(&Arguments { tasks: (0..MAX_WORKERS).map(|_| task()).collect() }).is_ok());
-        assert!(validate(&Arguments { tasks: (0..MAX_WORKERS + 1).map(|_| task()).collect() }).is_err());
-    }
-    #[test]
-    fn default_reservations_leave_room_for_parallel_work() {
-        // Defaults trade concurrency for depth; they must still admit a useful batch.
-        assert!(TOTAL_WORKER_CONTEXT / CONTEXT_LIMIT >= 8);
-        assert!(CONTEXT_LIMIT <= MAX_WORKER_CONTEXT);
-        assert!(MAX_WORKER_CONTEXT <= MAIN_CONTEXT_RESERVE);
-    }
-    #[test]
-    fn budget_includes_output() {
-        assert!(fits(22_976, 1024, 24_000));
-        assert!(!fits(22_977, 1024, 24_000));
-        assert!(!fits(usize::MAX, 1024, 24_000));
-    }
-    #[test]
-    fn variable_budgets_share_one_pool() {
-        let tasks = [96_000, 48_000, 24_000].into_iter().map(|budget| {
-            let mut t = task(); t.context_tokens = budget; t
-        }).collect();
-        assert!(validate(&Arguments { tasks }).is_ok());
-        let mut large = task(); large.context_tokens = MAX_WORKER_CONTEXT;
-        assert!(validate(&Arguments { tasks: vec![large] }).is_ok());
-        let mut over_window = task(); over_window.context_tokens = MAX_WORKER_CONTEXT + 1;
-        assert!(validate(&Arguments { tasks: vec![over_window] }).is_err());
-        let mut large = task(); large.context_tokens = MAX_WORKER_CONTEXT;
-        let mut rest = task(); rest.context_tokens = TOTAL_WORKER_CONTEXT - MAX_WORKER_CONTEXT + 1;
-        assert!(validate(&Arguments { tasks: vec![large, rest] }).is_err());
-        let mut too_small = task(); too_small.context_tokens = 1024;
-        assert!(validate(&Arguments { tasks: vec![too_small] }).is_err());
-    }
-    #[test]
-    fn failed_kv_release_keeps_budget_reserved() {
-        let result = WorkerResult {
-            run_id:"test".into(), task_index:0, slot:1, context_tokens:96_000,
-            status:"slot_release_failed".into(), result:String::new(), error:None,
-            input_tokens:None, reserved_output_tokens:1024, duration_ms:0, context_elided:0, context_summaries:0,
-            steers_delivered:0, steers_undelivered:0, stuck: None, streaks: None, operator_directions: Vec::new(),
-        };
-        let job = Job {slot:1, context_tokens:96_000, budget:Arc::new(Budget::new(96_000, 1024)),
-            steer:Arc::new(Mailbox::default()), cancel:Arc::new(AtomicBool::new(false)),
-            handle:None, result:Some(result), operator:OperatorView::default()};
-        assert!(holds_reservation(&job));
-    }
     #[test]
     fn rejects_empty_and_unbounded_output() {
         let mut t = task(); t.max_output_tokens = 0;
@@ -3158,13 +3030,6 @@ mod tests {
             steer:Arc::new(Mailbox::default()),
             cancel:Arc::new(AtomicBool::new(false)), handle:None, result:None, operator:OperatorView::default()}
     }
-    #[test]
-    fn output_defaults_and_ceiling() {
-        assert_eq!(default_output(), 8_192);
-        assert_eq!(MAX_OUTPUT, 16_384);
-        // The default output must still leave the default context room for input.
-        assert!((default_output() as usize) < CONTEXT_LIMIT);
-    }
     fn ctx(tokens: usize) -> Grant { Grant { context_tokens: Some(tokens), ..Grant::default() } }
     /// Mark a job's worker as paused the way await_decision does.
     fn pause(job: &Job, reason: Pause, input: usize) {
@@ -3173,18 +3038,6 @@ mod tests {
             job.budget.needed.store(input + job.budget.output() as usize, Ordering::SeqCst);
         }
         job.budget.reason.store(reason as u8, Ordering::SeqCst);
-    }
-    #[test]
-    fn resize_grows_a_paused_worker_and_updates_both_views() {
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        pause(&m.jobs["a"], Pause::Context, 45_000 - 8_192);
-        let before = reserved_context(&m);
-        let out = resize(&mut m, "a", ctx(56_000)).unwrap();
-        assert_eq!(out["resumed"], true);
-        assert_eq!(m.jobs["a"].context_tokens, 56_000);
-        assert_eq!(m.jobs["a"].budget.tokens.load(Ordering::SeqCst), 56_000, "worker sees the grant");
-        assert_eq!(reserved_context(&m), before + 16_000, "pool accounting follows the grant");
     }
     #[test]
     fn resize_refuses_insufficient_shrinking_oversized_or_finished() {
@@ -3204,20 +3057,6 @@ mod tests {
         assert!(resize(&mut m, "a", ctx(45_000)).is_ok(), "a finished job returns its budget");
         m.jobs.get_mut("a").unwrap().cancel.store(true, Ordering::SeqCst);
         assert!(resize(&mut m, "a", ctx(50_000)).is_err(), "cancelling jobs are not resized");
-    }
-    #[test]
-    fn resize_raises_output_and_time_without_touching_the_pool() {
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        let before = reserved_context(&m);
-        let grown = WORKER_TIME_BUDGET.as_secs() + 900;
-        let out = resize(&mut m, "a", Grant { max_output_tokens: Some(12_000), time_budget_secs: Some(grown),
-            ..Grant::default() }).unwrap();
-        assert_eq!(m.jobs["a"].budget.output(), 12_000, "worker sees the output grant");
-        assert_eq!(m.jobs["a"].budget.time(), Duration::from_secs(grown), "worker sees the time grant");
-        assert_eq!(m.jobs["a"].context_tokens, 40_000);
-        assert_eq!(reserved_context(&m), before, "output and time grants reserve no pool");
-        assert_eq!(out["resumed"], false, "a running worker has nothing to resume");
     }
     #[test]
     fn resize_refuses_bad_output_and_time() {
@@ -3243,130 +3082,10 @@ mod tests {
             ..Grant::default() }).is_err());
         assert_eq!(m.jobs["a"].budget.output(), 8_192, "validation precedes every write");
     }
-    #[test]
-    fn output_pause_resumes_on_an_output_grant_and_flags_a_context_shortfall() {
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        pause(&m.jobs["a"], Pause::Output, 30_000);
-        let out = resize(&mut m, "a", Grant { time_budget_secs: Some(WORKER_TIME_BUDGET.as_secs() + 300), ..Grant::default() }).unwrap();
-        assert_eq!(out["resumed"], false, "a time grant does not satisfy an output pause");
-        assert_eq!(out["still_paused_for"], "output");
-        let out = resize(&mut m, "a", Grant { max_output_tokens: Some(9_000), ..Grant::default() }).unwrap();
-        assert_eq!(out["resumed"], true);
-        assert!(out["note"].is_null(), "30,000 + 9,000 fits 40,000");
-        // Larger cap than the reservation can hold beside the history.
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        pause(&m.jobs["a"], Pause::Output, 30_000);
-        let out = resize(&mut m, "a", Grant { max_output_tokens: Some(16_000), ..Grant::default() }).unwrap();
-        assert_eq!(out["resumed"], true);
-        assert_eq!(out["minimum_context_tokens"], 46_000);
-        assert!(out["note"].is_string(), "s0ma is told it will pause for context next");
-        // Asking for context alongside, but too little, is refused outright.
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        pause(&m.jobs["a"], Pause::Output, 30_000);
-        assert!(resize(&mut m, "a", Grant { context_tokens: Some(44_000), max_output_tokens: Some(16_000),
-            ..Grant::default() }).is_err());
-        assert!(resize(&mut m, "a", Grant { context_tokens: Some(46_000), max_output_tokens: Some(16_000),
-            ..Grant::default() }).is_ok());
-        assert_eq!(m.jobs["a"].budget.output(), 16_000);
-        assert_eq!(m.jobs["a"].context_tokens, 46_000);
-    }
-    #[test]
-    fn time_pause_resumes_on_a_time_grant_and_only_context_pauses_compact() {
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        pause(&m.jobs["a"], Pause::Time, 20_000);
-        assert!(compact(&mut m, "a", None).is_err(), "compaction is for context pauses");
-        assert_eq!(m.jobs["a"].budget.awaiting(), None, "a time pause has no context minimum");
-        let grown = WORKER_TIME_BUDGET.as_secs() + 600;
-        let out = resize(&mut m, "a", Grant { time_budget_secs: Some(grown), ..Grant::default() }).unwrap();
-        assert_eq!(out["resumed"], true);
-        assert_eq!(m.jobs["a"].budget.time(), Duration::from_secs(grown));
-        let status = job_status(&m, &["a".into()]);
-        assert_eq!(status["jobs"][0]["status"], "awaiting_time_budget", "the worker clears its own marker");
-        assert_eq!(status["jobs"][0]["time_budget_secs"], grown);
-    }
-    #[test]
-    fn context_pause_tracks_a_raised_output_cap() {
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), running(40_000));
-        pause(&m.jobs["a"], Pause::Context, 35_000);
-        // Output only: the worker stays paused for context, needing more now.
-        let out = resize(&mut m, "a", Grant { max_output_tokens: Some(12_000), ..Grant::default() }).unwrap();
-        assert_eq!(out["resumed"], false);
-        assert_eq!(out["minimum_context_tokens"], 47_000);
-        // A context grant sized for the old cap is now too small.
-        assert!(resize(&mut m, "a", ctx(44_000)).is_err());
-        assert_eq!(resize(&mut m, "a", ctx(47_000)).unwrap()["resumed"], true);
-    }
-    #[test]
-    fn pause_reasons_round_trip() {
-        for reason in [Pause::Context, Pause::Output, Pause::Time] {
-            assert_eq!(Pause::from_u8(reason as u8), Some(reason));
-        }
-        assert_eq!(Pause::from_u8(0), None, "zero means not paused");
-    }
-    #[test]
-    fn suggested_budget_has_headroom_and_respects_the_window() {
-        assert!(suggested_budget(40_000) >= 48_192);
-        assert_eq!(suggested_budget(40_000) % 1024, 0);
-        assert_eq!(suggested_budget(MAX_WORKER_CONTEXT - 1), MAX_WORKER_CONTEXT);
-    }
-    #[test]
-    fn pause_marker_clears_on_any_exit() {
-        let budget = Budget::new(10_000, 1_024);
-        {
-            let _pause = PauseGuard(&budget);
-            budget.needed.store(12_000, Ordering::SeqCst);
-            budget.reason.store(Pause::Context as u8, Ordering::SeqCst);
-            assert_eq!(budget.awaiting(), Some(12_000));
-            assert_eq!(budget.paused(), Some(Pause::Context));
-        }
-        assert_eq!(budget.awaiting(), None);
-        assert_eq!(budget.paused(), None);
-    }
-    #[test]
-    fn resize_and_compact_tools_are_advertised() {
-        let tools = tool_definitions();
-        assert!(tools.iter().any(|t| t.function.name == "subagent_resize"));
-        assert!(tools.iter().any(|t| t.function.name == "subagent_compact"));
-    }
     fn paused(context_tokens: usize, input: usize) -> Job {
         let job = running(context_tokens);
         pause(&job, Pause::Context, input);
         job
-    }
-    #[test]
-    fn compaction_grant_covers_history_instruction_and_notes() {
-        let grant = compaction_grant(35_000);
-        assert!(grant >= 35_000 + COMPACT_PROMPT_ALLOWANCE + COMPACT_SUMMARY_MAX as usize);
-        assert_eq!(grant % 1024, 0);
-        assert_eq!(compaction_grant(MAX_WORKER_CONTEXT), MAX_WORKER_CONTEXT);
-    }
-    #[test]
-    fn compact_lends_a_temporary_grant_flag_first_and_blocks_resize() {
-        let mut m = empty_manager();
-        m.jobs.insert("a".into(), paused(40_000, 35_000));
-        let out = compact(&mut m, "a", None).unwrap();
-        let grant = compaction_grant(35_000);
-        assert_eq!(out["temporary_context_tokens"], grant);
-        assert_eq!(out["resume_context_tokens"], 40_000);
-        assert!(m.jobs["a"].budget.compacting());
-        assert_eq!(m.jobs["a"].budget.tokens.load(Ordering::SeqCst), grant);
-        assert_eq!(reserved_context(&m), grant, "the pool carries the temporary grant");
-        assert!(resize(&mut m, "a", ctx(grant + 10_000)).is_err(), "no resize mid-compaction");
-        assert!(compact(&mut m, "a", None).is_err(), "no second compaction");
-        // sync must not pull the reservation down while compacting.
-        sync_budgets(&mut m);
-        assert_eq!(m.jobs["a"].context_tokens, grant);
-        // Worker finishes: lowers its budget, then clears the flag.
-        m.jobs["a"].budget.tokens.store(40_000, Ordering::SeqCst);
-        m.jobs["a"].budget.compacting.store(false, Ordering::SeqCst);
-        sync_budgets(&mut m);
-        assert_eq!(m.jobs["a"].context_tokens, 40_000, "shrinks back to the original allotment");
-        assert_eq!(reserved_context(&m), 40_000);
     }
     #[test]
     fn compact_refusals() {
@@ -3384,549 +3103,13 @@ mod tests {
         assert!(compact(&mut m, "big", None).is_err(), "history too large for any compaction turn");
     }
     #[test]
-    fn the_steer_tool_is_advertised_with_its_directive_bounded() {
-        let tools = tool_definitions();
-        let steer = tools.iter().find(|t| t.function.name == "subagent_steer").expect("subagent_steer");
-        let parameters = &steer.function.parameters;
-        assert_eq!(parameters["required"], json!(["job_ids", "directive"]));
-        assert_eq!(parameters["properties"]["directive"]["maxLength"], json!(MAX_STEER_BYTES));
-        assert_eq!(parameters["properties"]["job_ids"]["maxItems"], json!(MAX_WORKERS));
-        // Spawning points at it, so a wrong course is corrected rather than respawned.
-        let spawn = tools.iter().find(|t| t.function.name == "subagent_spawn").unwrap();
-        assert!(spawn.function.description.contains("subagent_steer"));
-    }
-    #[test]
-    fn a_worker_takes_every_queued_direction_once_in_order() {
-        let mailbox = Mailbox::default();
-        assert!(mailbox.take().is_none(), "nothing queued, nothing to take");
-        mailbox.push(Directive { seq: 1, text: "first".into(), wrap_up: false, from: crate::worker_feed::Sender::S0ma }).unwrap();
-        mailbox.push(Directive { seq: 2, text: "second".into(), wrap_up: true, from: crate::worker_feed::Sender::S0ma }).unwrap();
-        assert_eq!(mailbox.pending(), 2);
-        assert_eq!(mailbox.delivered(), 0);
-        let taken = mailbox.take().expect("both directions");
-        assert_eq!(taken.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![1, 2], "oldest first");
-        assert_eq!(mailbox.pending(), 0);
-        assert_eq!(mailbox.delivered(), 2);
-        assert!(mailbox.take().is_none(), "a direction is never handed over twice");
-    }
-    #[test]
     fn a_full_mailbox_refuses_further_directions() {
         let mailbox = Mailbox::default();
         for seq in 0..MAX_PENDING_STEERS as u64 {
-            mailbox.push(Directive { seq, text: "go".into(), wrap_up: false, from: crate::worker_feed::Sender::S0ma }).unwrap();
+            mailbox.push(Directive { seq, text: "go".into(), wrap_up: false, from: crate::subagent::feed::Sender::S0ma }).unwrap();
         }
-        let refused = mailbox.push(Directive { seq: 99, text: "go".into(), wrap_up: false, from: crate::worker_feed::Sender::S0ma }).unwrap_err();
+        let refused = mailbox.push(Directive { seq: 99, text: "go".into(), wrap_up: false, from: crate::subagent::feed::Sender::S0ma }).unwrap_err();
         assert!(refused.contains("undelivered"), "{refused}");
         assert_eq!(mailbox.pending(), MAX_PENDING_STEERS, "the refused one is not queued");
     }
-    #[test]
-    fn steering_queues_for_running_workers_and_refuses_the_rest() {
-        let mut m = empty_manager();
-        m.jobs.insert("run".into(), running(40_000));
-        let mut done = running(40_000);
-        done.result = Some(finished(1, "completed"));
-        m.jobs.insert("done".into(), done);
-        let cancelling = running(40_000);
-        cancelling.cancel.store(true, Ordering::SeqCst);
-        m.jobs.insert("cancelling".into(), cancelling);
-        let ids = ["run".to_string(), "done".to_string(), "cancelling".to_string(), "ghost".to_string()];
-        let out = steer(&mut m, &ids, "  leave the mail host alone; finish the web root  ", false, crate::worker_feed::Sender::S0ma).unwrap();
-        assert_eq!(out["ok"], false, "not every named job took it");
-        assert_eq!(out["queued"], 1);
-        assert_eq!(out["refused"], 3);
-        assert_eq!(out["directive_bytes"], json!("leave the mail host alone; finish the web root".len()),
-            "trimmed before it is measured or queued");
-        assert_eq!(m.jobs["run"].steer.pending(), 1);
-        assert_eq!(out["jobs"][0]["delivery"], "next_turn");
-        assert!(out["jobs"][0]["paused_for"].is_null());
-        for refusal in 1..=3 { assert_eq!(out["jobs"][refusal]["queued"], false); }
-        assert!(out["jobs"][1]["reason"].as_str().unwrap().contains("already finished"));
-        assert!(out["jobs"][2]["reason"].as_str().unwrap().contains("cancelling"));
-        assert!(out["jobs"][3]["reason"].as_str().unwrap().contains("unknown or expired"));
-    }
-    #[test]
-    fn steering_refuses_an_empty_or_oversized_directive_without_touching_a_worker() {
-        let mut m = empty_manager();
-        m.jobs.insert("run".into(), running(40_000));
-        let one = ["run".to_string()];
-        assert!(steer(&mut m, &[], "go", false, crate::worker_feed::Sender::S0ma).is_err(), "explicit job IDs, as cancel requires");
-        assert!(steer(&mut m, &one, "   \n  ", false, crate::worker_feed::Sender::S0ma).is_err());
-        assert!(steer(&mut m, &one, &"x".repeat(MAX_STEER_BYTES + 1), false, crate::worker_feed::Sender::S0ma).is_err());
-        assert_eq!(m.jobs["run"].steer.pending(), 0, "a refused directive reaches nobody");
-        assert!(steer(&mut m, &one, &"x".repeat(MAX_STEER_BYTES), false, crate::worker_feed::Sender::S0ma).is_ok(), "the limit itself is allowed");
-    }
-    #[test]
-    fn a_paused_worker_is_told_its_direction_waits_for_resume() {
-        let mut m = empty_manager();
-        m.jobs.insert("ctx".into(), paused(40_000, 35_000));
-        let out = steer(&mut m, &["ctx".to_string()], "report what you have on the admin host", true, crate::worker_feed::Sender::S0ma).unwrap();
-        assert_eq!(out["ok"], true);
-        assert_eq!(out["wrap_up"], true);
-        assert_eq!(out["jobs"][0]["delivery"], "on_resume");
-        assert_eq!(out["jobs"][0]["paused_for"], "context");
-        assert!(out["jobs"][0]["note"].as_str().unwrap().contains("subagent_resize or subagent_compact"));
-        // Steering is not a way out of a pause: the budget decision still stands.
-        assert_eq!(m.jobs["ctx"].budget.paused(), Some(Pause::Context));
-        assert_eq!(m.jobs["ctx"].context_tokens, 40_000);
-        let waiting_on_time = running(40_000);
-        pause(&waiting_on_time, Pause::Time, 20_000);
-        m.jobs.insert("time".into(), waiting_on_time);
-        let out = steer(&mut m, &["time".to_string()], "stop here", false, crate::worker_feed::Sender::S0ma).unwrap();
-        assert_eq!(out["jobs"][0]["paused_for"], "time");
-        assert!(!out["jobs"][0]["note"].as_str().unwrap().contains("compact"), "compaction is context-only");
-    }
-    #[test]
-    fn the_direction_a_worker_sees_names_s0ma_and_does_not_widen_scope() {
-        let plain = steer_message(&[Directive { seq: 1, text: "stay inside 10.0.0.0/24".into(), wrap_up: false, from: crate::worker_feed::Sender::S0ma }]);
-        assert_eq!(plain.role, "user");
-        assert!(plain.content.starts_with("[HARNESS — DIRECTION FROM s0ma"));
-        assert!(plain.content.contains("NOT OPERATOR INPUT"), "a worker must not read it as the operator speaking");
-        assert!(plain.content.contains("stay inside 10.0.0.0/24"));
-        assert!(plain.content.contains("does not widen your authorization"));
-        assert!(!plain.content.contains("return your report now"), "no wrap-up unless it was asked for");
-        // The worker's own instructions must vouch for the block: told to treat
-        // context as evidence rather than authority, it would otherwise be right
-        // to ignore one.
-        assert!(worker_system(&[]).contains("[HARNESS — DIRECTION FROM s0ma]"));
-        let batched = steer_message(&[
-            Directive { seq: 2, text: "first thing".into(), wrap_up: false, from: crate::worker_feed::Sender::S0ma },
-            Directive { seq: 3, text: "second thing".into(), wrap_up: true, from: crate::worker_feed::Sender::S0ma }]);
-        let first = batched.content.find("first thing").expect("both directions arrive");
-        assert!(first < batched.content.find("second thing").unwrap(), "in the order they were sent");
-        assert!(batched.content.contains("return your report now"), "one wrap_up marks the batch");
-    }
-    #[test]
-    fn operators_direction_is_labelled_as_his_and_kept_apart_from_s0mas() {
-        use crate::worker_feed::Sender::{Operator, S0ma};
-        let directive = |seq, text: &str, from| Directive { seq, text: text.into(), wrap_up: false, from };
-        let messages = steer_messages(&[
-            directive(1, "first from s0ma", S0ma),
-            directive(2, "then the operator", Operator),
-            directive(3, "and the operator again", Operator),
-            directive(4, "s0ma once more", S0ma),
-        ]);
-        assert_eq!(messages.len(), 3, "one message per run of the same sender, in order");
-        assert!(messages[0].content.starts_with("[HARNESS — DIRECTION FROM s0ma") && messages[0].content.contains("first from s0ma"));
-        let operator = &messages[1].content;
-        assert!(operator.starts_with("[HARNESS — DIRECTION FROM THE OPERATOR"), "{operator}");
-        assert!(operator.contains("operator_direction") && !operator.contains("s0ma_direction"));
-        assert!(operator.contains("then the operator") && operator.contains("and the operator again"));
-        assert!(operator.contains("does not widen your authorization"), "his direction does not widen scope either");
-        assert!(!messages[2].content.contains("FROM THE OPERATOR") && messages[2].content.contains("s0ma once more"));
-        // The worker is told the block is his, so it follows it as it would s0ma's.
-        assert!(worker_system(&[]).contains("[HARNESS — DIRECTION FROM THE OPERATOR]"));
-    }
-    #[test]
-    fn operators_direction_goes_to_the_feed_and_says_so_in_s0mas_status() {
-        let _guard = crate::worker_feed::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        crate::worker_feed::clear_for_test();
-        let mut m = empty_manager();
-        m.jobs.insert("subagent-1-2-3-1".into(), running(40_000));
-        crate::worker_feed::begin(1, "subagent-1-2-3-1", "count the logs");
-        let out = steer(&mut m, &["subagent-1-2-3-1".to_string()], "only the /b endpoint", false,
-            crate::worker_feed::Sender::Operator).unwrap();
-        assert_eq!(out["queued"], 1);
-        assert_eq!(m.jobs["subagent-1-2-3-1"].steer.pending(), 1);
-        let status = m.statuses.back().unwrap();
-        assert!(status.contains("you sent it a direction") && status.contains("only the /b endpoint"), "{status}");
-        let waiting = crate::worker_feed::with_feed(1, |feed| feed.waiting.clone()).unwrap();
-        assert!(matches!(&waiting[..], [crate::worker_feed::Item::Direction { from: crate::worker_feed::Sender::Operator,
-            delivered: false, .. }]), "{waiting:?}");
-        steer(&mut m, &["subagent-1-2-3-1".to_string()], "stop", true, crate::worker_feed::Sender::Operator).unwrap();
-        assert!(m.statuses.back().unwrap().contains("told it to wrap up"));
-        // One the full mailbox refuses is not left in the feed as waiting.
-        while m.jobs["subagent-1-2-3-1"].steer.pending() < MAX_PENDING_STEERS {
-            steer(&mut m, &["subagent-1-2-3-1".to_string()], "more", false, crate::worker_feed::Sender::Operator).unwrap();
-        }
-        let out = steer(&mut m, &["subagent-1-2-3-1".to_string()], "one too many", false,
-            crate::worker_feed::Sender::Operator).unwrap();
-        assert_eq!(out["refused"], 1);
-        assert_eq!(crate::worker_feed::with_feed(1, crate::worker_feed::Feed::waiting_directions), Some(MAX_PENDING_STEERS));
-    }
-    #[test]
-    fn rejects_extra_capabilities() {
-        assert!(serde_json::from_str::<Arguments>(r#"{"tasks":[{"task":"x","tools":["vm_exec"]}]}"#).is_err());
-    }
-
-    fn board_call(name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall { id: "call".into(), kind: "function".into(),
-            function: crate::types::FunctionCall { name: name.into(), arguments: arguments.to_string() } }
-    }
-
-    #[test]
-    fn workers_get_the_explore_set_of_board_tools() {
-        // Only while a board is open.
-        assert!(!worker_tools(false).iter().any(|tool| tool.function.name.starts_with("board_")));
-        assert!(!worker_system(&worker_tools(false)).contains("work it with the board tools"));
-        assert!(scoped_call(&board_call("board_read", json!({"name": "a-board"})), false).is_err());
-        let tools = worker_tools(true);
-        assert!(worker_system(&tools).contains("work it with the board tools"));
-        let names: Vec<&str> = tools.iter().map(|tool| tool.function.name.as_str()).collect();
-        for name in crate::board::WORKER_TOOLS {
-            assert!(names.contains(&name), "{name}");
-            // Passed through as they are: no VM session to scope.
-            let call = board_call(name, json!({"name": "a-board"}));
-            assert_eq!(scoped_call(&call, true).unwrap().function.arguments, call.function.arguments);
-        }
-        for name in ["board_open", "board_link", "board_close"] {
-            assert!(!names.contains(&name), "{name}");
-            assert!(scoped_call(&board_call(name, json!({})), true).is_err(), "{name}");
-        }
-        // A fact names its intent and cites the worker's own results by ref.
-        let fact = &tools.iter().find(|tool| tool.function.name == "board_fact").unwrap().function.parameters;
-        assert!(fact["properties"]["evidence_refs"].is_object() && fact["properties"]["evidence_event_ids"].is_null());
-        assert_eq!(fact["required"], json!(["name", "intent_id", "statement", "polarity", "basis", "evidence_refs"]));
-    }
-
-    /// The worker journal, for tests: set once per test process (and nothing
-    /// else `init` sets up), started empty.
-    fn test_journal() -> PathBuf {
-        JOURNAL.get_or_init(|| {
-            let path = std::env::temp_dir().join("s0ma-test-subagent-journal.jsonl");
-            let _ = std::fs::remove_file(&path);
-            path
-        }).clone()
-    }
-
-    fn vm_call(arguments: serde_json::Value) -> ToolCall {
-        ToolCall { id: "call".into(), kind: "function".into(),
-            function: crate::types::FunctionCall { name: "vm_exec".into(), arguments: arguments.to_string() } }
-    }
-
-    #[test]
-    fn journal_offsets_point_at_their_own_records_under_concurrent_writers() {
-        let path = std::env::temp_dir().join(format!("s0ma-journal-offsets-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let written: Vec<(u64, String)> = std::thread::scope(|scope| {
-            let threads: Vec<_> = (0..6).map(|worker| {
-                let path = &path;
-                scope.spawn(move || (0..40).map(|n| {
-                    let text = format!("{worker}-{n} {}", "é界".repeat(n * 37));
-                    (journal_to(path, &json!({"result": text})).unwrap(), text)
-                }).collect::<Vec<_>>())
-            }).collect();
-            threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect()
-        });
-        use std::io::{BufRead, Seek, SeekFrom};
-        for (offset, text) in written {
-            let mut file = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            let mut line = String::new();
-            file.read_line(&mut line).unwrap();
-            assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["result"], json!(text));
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The real path: a finished VM call is journaled and kept by ref; what the
-    /// worker sees names the ref and labels the cut; result_read pages through
-    /// the omitted part, and head + omitted + tail is the original.
-    #[test]
-    fn a_truncated_result_reads_back_whole_from_the_journal() {
-        use crate::board::EvidenceRefs;
-        let journal = test_journal();
-        let (tx, _rx) = mpsc::channel();
-        let mut results = Results::new("subagent-test-read-2", 2, journal);
-        let small = finish_call(&tx, &mut results, &vm_call(json!({"command": "true"})), "ok").unwrap().unwrap();
-        let original: String = (0..5_000).map(|i| format!("line {i} \"quoted\" é\n")).collect();
-        let big = finish_call(&tx, &mut results, &vm_call(json!({"command": "dmesg"})), &original).unwrap().unwrap();
-        assert_eq!((small.as_str(), big.as_str()), ("w2.1", "w2.2"));
-        // Tools that aren't the VM's get no ref.
-        let skill = ToolCall { function: crate::types::FunctionCall { name: "skill_list".into(), arguments: "{}".into() }, ..vm_call(json!({})) };
-        assert_eq!(finish_call(&tx, &mut results, &skill, "[]").unwrap(), None);
-        assert_eq!(results.unknown(&["w2.2".into(), "w2.9".into()]), ["w2.9"]);
-        assert_eq!(results.output(&big).unwrap(), original);
-
-        let seen = worker_view_with("c".into(), original.clone(), Some(&big), false, llm::limit_worker_output_offline).content;
-        let preview: serde_json::Value = serde_json::from_str(&seen).unwrap();
-        assert_eq!(preview["result_ref"], big.as_str());
-        let (from, to) = (preview["omitted_range"][0].as_u64().unwrap(), preview["omitted_range"][1].as_u64().unwrap());
-        let mut middle = String::new();
-        let mut offset = from;
-        while offset < to {
-            let page: serde_json::Value = serde_json::from_str(
-                &results.read(&json!({"ref": big, "offset": offset, "limit": (to - offset).min(5_000)}).to_string()).unwrap()).unwrap();
-            assert_eq!(page["ok"], true, "{page}");
-            middle.push_str(page["text"].as_str().unwrap());
-            offset = page["range"][1].as_u64().unwrap();
-        }
-        assert_eq!(format!("{}{middle}{}", preview["head"].as_str().unwrap(), preview["tail"].as_str().unwrap()), original);
-        // A pattern finds a line in the omitted part.
-        let found: serde_json::Value = serde_json::from_str(&results.read(&json!({"ref": big, "pattern": "line 2500 "}).to_string()).unwrap()).unwrap();
-        assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
-        // Only its own refs.
-        let refused: serde_json::Value = serde_json::from_str(&results.read(r#"{"ref": "w3.1"}"#).unwrap()).unwrap();
-        assert_eq!(refused["ok"], false);
-        // A record that isn't the one it kept is never returned as its result.
-        let mut other = Results::new("subagent-test-read-3", 3, results.journal.clone());
-        let theirs = results.kept.get(&big).unwrap().clone();
-        other.keep("w3.1".into(), &theirs.0, &theirs.1, theirs.2);
-        assert!(other.output("w3.1").is_err());
-    }
-
-    /// P2's stubs for each kind of result in a worker's transcript.
-    #[test]
-    fn each_kind_of_result_has_its_stub() {
-        use crate::worker_context::Stubs;
-        let (tx, _rx) = mpsc::channel();
-        let mut results = Results::new("subagent-test-stubs-4", 4, test_journal());
-        let call = |id: &str, name: &str, arguments: serde_json::Value| ToolCall { id: id.into(), kind: "function".into(),
-            function: crate::types::FunctionCall { name: name.into(), arguments: arguments.to_string() } };
-        let output = "{\"exit_code\":0,\"stdout\":\"".to_string() + &"z".repeat(5_000) + "\",\"stdout_truncated\":true}";
-        let reference = finish_call(&tx, &mut results, &call("c1", "vm_exec", json!({"command": "seq 1 99999"})), &output).unwrap().unwrap();
-        let page = results.read(&json!({"ref": reference, "offset": 100, "limit": 50}).to_string()).unwrap();
-        finish_call(&tx, &mut results, &call("c2", "result_read", json!({"ref": reference, "offset": 100})), &page).unwrap();
-        finish_call(&tx, &mut results, &call("c3", "board_read", json!({"name": "a-board"})), "{\"ok\":true}").unwrap();
-        finish_call(&tx, &mut results, &call("c4", "board_fact", json!({})), "{\"ok\":true}").unwrap();
-        let message = |id: &str, content: &str| Message::tool_bounded(id.into(), content.into());
-
-        let vm: serde_json::Value = serde_json::from_str(&results.stub(&message("c1", "...")).unwrap()).unwrap();
-        assert_eq!((vm["result_ref"].as_str(), vm["total_chars"].as_u64()), (Some(reference.as_str()), Some(output.chars().count() as u64)));
-        assert!(vm["source_truncated"].is_string());
-        let paged: serde_json::Value = serde_json::from_str(&results.stub(&message("c2", &page)).unwrap()).unwrap();
-        assert_eq!(paged["omitted_range"], json!([100, 150]));
-        assert!(results.stub(&message("c3", "{}")).unwrap().contains("\"tool\":\"board_read\""));
-        // A write (and anything unknown) stays as it is.
-        assert!(results.stub(&message("c4", "{}")).is_none());
-        assert!(results.stub(&message("c9", "{}")).is_none());
-    }
-
-    #[test]
-    fn what_a_worker_sees_of_a_result() {
-        let offline = llm::limit_worker_output_offline;
-        // Within the cap: exactly the result (a ref adds nothing without boards).
-        assert_eq!(worker_view_with("c".into(), "small".into(), Some("w1.1"), false, offline).content, "small");
-        assert_eq!(worker_view_with("c".into(), "small".into(), Some("w1.1"), true, offline).content, "small\n[evidence_ref: w1.1]");
-        // Over it: labelled, with the ref, and the bounded view isn't cut again.
-        let seen = worker_view_with("c".into(), "x".repeat(20_000), Some("w1.2"), false, offline).content;
-        let value: serde_json::Value = serde_json::from_str(&seen).unwrap();
-        assert_eq!((value["result_ref"].as_str(), value["total_chars"].as_u64()), (Some("w1.2"), Some(20_000)));
-        let (from, to) = (value["omitted_range"][0].as_u64().unwrap(), value["omitted_range"][1].as_u64().unwrap());
-        assert!(from > 0 && to < 20_000 && from + (20_000 - to) <= 8_000, "{from}..{to}");
-    }
-
-    #[test]
-    fn folding_finds_refs_by_call_and_digests_by_result_read() {
-        let mut results = Results::new("subagent-9-1", 1, test_journal());
-        let (tx, _rx) = mpsc::channel();
-        finish_call(&tx, &mut results, &vm_call(json!({"command": "uname -a"})), "Linux").unwrap();
-        finish_call(&tx, &mut results, &call("board_read", json!({"name": "a-board"})), "{\"ok\":true}").unwrap();
-        let refs = results.ref_map();
-        assert_eq!(refs.len(), 1, "only machine tool results have refs: {refs:?}");
-        assert_eq!(refs.values().next().map(String::as_str), Some("w1.1"));
-        assert_eq!(read_ref(r#"{"ref": " w1.d2 "}"#).as_deref(), Some("w1.d2"));
-        assert_eq!(read_ref(r#"{"pattern": "x"}"#), None);
-        assert_eq!(read_ref("not json"), None);
-    }
-
-    #[test]
-    fn a_stuck_stop_is_its_own_reason_and_reads_as_incomplete() {
-        let mut streaks = crate::streak::Streaks::new("subagent-9-1");
-        let failing = r#"{"exit_code":1,"signal":null,"stdout":"","stderr":"permission denied"}"#;
-        let verdicts: Vec<_> = (0..8).map(|i| streaks.record("vm_exec", r#"{"command":"pkill -f x"}"#,
-            &crate::streak::Outcome::of(failing), &format!("2026-10-13T09:00:0{i}Z"))).collect();
-        let crate::streak::Verdict::Stop(report) = &verdicts[7] else { panic!("{verdicts:?}") };
-        let mut result = finished(1, STUCK_TERMINATED);
-        result.result = "So far: the flush daemon is owned by root; pkill can't touch it.".into();
-        result.stuck = Some(StuckStop::from(report));
-        let seen = visible_result(&result);
-        assert_eq!(seen["status"], "stuck_terminated");
-        assert_eq!(seen["stop_reason"], "stuck_terminated");
-        assert_eq!(seen["stuck_key_digest"], report.digest.as_str());
-        assert_eq!((seen["reps"].as_u64(), seen["fails"].as_u64()), (Some(8), Some(8)));
-        assert_eq!(seen["stuck_since"], "2026-10-13T09:00:00Z");
-        assert!(seen["last_error"].as_str().unwrap().contains("permission denied"));
-        assert!(seen["merge"].as_str().unwrap().starts_with("INCOMPLETE"));
-        assert!(seen["result"].as_str().unwrap().contains("owned by root"), "the salvage is still there");
-        // Anything else carries none of it.
-        let done = visible_result(&finished(1, "completed"));
-        assert!(done.get("stop_reason").is_none() && done.get("merge").is_none(), "{done}");
-    }
-
-    #[test]
-    fn stuck_events_are_counted_one_row_each() {
-        let path = test_journal().with_file_name(format!("counters-{}.tsv", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        append_counter(&path, &["t1".into(), "workers".into(), "w-1".into(), "stuck_reminder".into(), "vm_exec".into(),
-            "abc".into(), "5".into(), "5".into(), "exit code 1:\tdenied\nagain".into()]).unwrap();
-        append_counter(&path, &["t2".into(), "workers".into(), "w-1".into(), STUCK_TERMINATED.into(), "vm_exec".into(),
-            "abc".into(), "8".into(), "8".into(), String::new()]).unwrap();
-        let written = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = written.lines().collect();
-        assert_eq!(lines.len(), 3, "a header, then one row per event: {written}");
-        assert_eq!(lines[0], COUNTERS_HEADER);
-        assert_eq!(lines[1].split('\t').count(), 9, "a tab or line break in the error can't break the row");
-        assert!(lines[1].ends_with("exit code 1: denied again") && lines[2].starts_with("t2\tworkers\tw-1\tstuck_terminated"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn every_worker_has_result_read() {
-        for boards in [false, true] {
-            assert!(worker_tools(boards).iter().any(|tool| tool.function.name == "result_read"));
-        }
-        let call = board_call("result_read", json!({"ref": "w1.1"}));
-        assert_eq!(scoped_call(&call, false).unwrap().function.arguments, call.function.arguments);
-    }
-
-    /// A worker works a board s0ma opened through the real archive: claims an
-    /// intent and records a fact citing its own tool result, which is copied
-    /// in once, as a tool result; a refused fact copies nothing.
-    #[test]
-    fn a_worker_records_a_fact_citing_its_own_tool_result() {
-        let dir = std::env::temp_dir().join(format!("s0ma-worker-board-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut memory = Hippocampus::new(dir.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("find why the flush fails".into()).unwrap();
-        let mut archive = memory.clone();
-        let store = crate::board::BoardStore::beside_archive(memory.archive_path());
-
-        // s0ma opens the board and declares two directions.
-        struct NoTests;
-        impl crate::board::TestRunner for NoTests {
-            fn run(&self, _: &str, _: u64) -> Result<crate::board::TestRun, Box<dyn Error>> { Err("no tests here".into()) }
-        }
-        let models = crate::world_model::Models::new(crate::world_model::path_for(&memory));
-        let mut as_s0ma = |name: &str, arguments: serde_json::Value| -> serde_json::Value {
-            let mut context = crate::board::Context { store: &store, archive: &mut memory, models: &models,
-                tests: &NoTests, worker: "s0ma", subagent: None };
-            serde_json::from_str(&crate::board::execute(&mut context, &board_call(name, arguments)).unwrap()).unwrap()
-        };
-        as_s0ma("board_open", json!({"name": "flush-failure", "title": "Flush fails under load",
-            "origin": "The 2.2 build fails one run in forty.", "goal": "Fifty green runs in a row.",
-            "goal_test": "make flush-50", "goal_test_kind": "command"}));
-        let declared = as_s0ma("board_intent", json!({"name": "flush-failure", "intents": [
-            {"direction": "Check whether the batching layer drops writes", "rationale": "It was rewritten last month."},
-            {"direction": "Check the fsync path under load", "rationale": "Failures cluster under load."}]}));
-        let first = declared["declared"][0]["id"].as_str().unwrap().to_string();
-        let second = declared["declared"][1]["id"].as_str().unwrap().to_string();
-
-        let mut evidence = Results::new("subagent-9-1", 1, test_journal());
-        let (tx, _rx) = mpsc::channel();
-        let mut as_worker = |evidence: &mut Results, name: &str, arguments: serde_json::Value| -> serde_json::Value {
-            serde_json::from_str(&execute_board(&board_call(name, arguments), evidence, &mut archive).unwrap()).unwrap()
-        };
-        let claimed = as_worker(&mut evidence, "board_claim", json!({"name": "flush-failure", "intent_id": first}));
-        assert_eq!(claimed["ok"], json!(true), "{claimed}");
-        let reference = finish_call(&tx, &mut evidence, &vm_call(json!({"command": "./stress"})), "{\"stdout\":\"dropped 3 writes\"}").unwrap().unwrap();
-
-        let before = memory.last_event_id();
-        let refused = as_worker(&mut evidence, "board_fact", json!({"name": "flush-failure", "intent_id": first,
-            "statement": "short", "polarity": "supports", "basis": "observed", "evidence_refs": [reference]}));
-        assert_eq!(refused["ok"], json!(false), "{refused}");
-        assert_eq!(memory.last_event_id(), before);
-
-        let fact = as_worker(&mut evidence, "board_fact", json!({"name": "flush-failure", "intent_id": first,
-            "statement": "The batching layer drops writes under load.", "polarity": "supports", "basis": "observed",
-            "evidence_refs": [reference]}));
-        assert_eq!(fact["ok"], json!(true), "{fact}");
-        assert_eq!(memory.last_event_id(), before + 1);
-        let copied = memory.get_event(before + 1).unwrap().unwrap();
-        assert!(copied.content.starts_with("[tool:vm_exec]\nsubagent evidence: run by worker subagent-9-1 (ref w1.1)"), "{}", copied.content);
-        assert!(copied.content.contains("./stress") && copied.content.contains("dropped 3 writes"));
-        assert_eq!(crate::archive::source_kind("s0ma", &copied.content), "tool_result");
-        let board = store.board("flush-failure").unwrap().unwrap();
-        assert_eq!(store.facts(&board.id).unwrap()[0].evidence_event_ids, vec![before + 1]);
-
-        // Cited again, the same archive event is reused.
-        as_worker(&mut evidence, "board_claim", json!({"name": "flush-failure", "intent_id": second}));
-        let again = as_worker(&mut evidence, "board_fact", json!({"name": "flush-failure", "intent_id": second,
-            "statement": "The fsync path is not involved here.", "polarity": "rules_out", "basis": "observed",
-            "evidence_refs": [reference]}));
-        assert_eq!(again["ok"], json!(true), "{again}");
-        assert_eq!(memory.last_event_id(), before + 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A03 regression: the model spelling one command several ways (no
-    /// timeout, the default, one over the worker clamp) runs one call, and the
-    /// journal shows one call; the streak must count it as one call too.
-    #[test]
-    fn a_streak_is_keyed_on_the_call_as_it_ran() {
-        let spellings = [
-            json!({"command": "exit 7"}),
-            json!({"command": "exit 7", "timeout_secs": 60}),
-            json!({"timeout_secs": 300, "command": "exit 7"}),
-            json!({"command": "exit 7", "timeout_secs": 120}),
-        ];
-        let failing = r#"{"exit_code":7,"signal":null,"stdout":"","stderr":""}"#;
-        let mut streaks = crate::streak::Streaks::new("subagent-9-1");
-        let verdicts: Vec<_> = (0..8).map(|i| {
-            let scoped = scoped_call(&vm_call(spellings[i % spellings.len()].clone()), false).unwrap();
-            assert_eq!(scoped.function.arguments, r#"{"command":"exit 7","timeout_secs":60}"#);
-            streaks.record("vm_exec", &scoped.function.arguments, &crate::streak::Outcome::of(failing), "t")
-        }).collect();
-        assert!(matches!(verdicts[4], crate::streak::Verdict::Remind(_)), "{verdicts:?}");
-        assert!(matches!(verdicts[7], crate::streak::Verdict::Stop(_)), "{verdicts:?}");
-        let summary = streaks.summary().unwrap();
-        assert_eq!((summary.reminders, summary.longest_reps, summary.longest_fails), (1, 8, 8));
-    }
-
-    /// Black-box driver: the real worker loop against S0MA_LLM_BASE_URL (a
-    /// mock vLLM) and whatever `virsh` is on PATH. Prints the envelope the
-    /// caller sees and this run's stuck events.
-    #[test]
-    #[ignore]
-    fn a03_black_box_drive() {
-        let journal_path = test_journal();
-        let task = Task { task: "repeat the call".into(), context_tokens: 32_000, context: String::new(), max_output_tokens: 1024 };
-        let cancel = AtomicBool::new(false);
-        let budget = Budget::new(task.context_tokens, task.max_output_tokens);
-        let steer = Mailbox::default();
-        let (tx, _rx) = mpsc::channel();
-        let batch = format!("a03bb-{}", std::process::id());
-        let run_id = format!("{batch}-1");
-        // A03_STEER_AFTER=n: s0ma steers the worker once n of its calls finished.
-        let steer_after: Option<usize> = std::env::var("A03_STEER_AFTER").ok().and_then(|n| n.parse().ok());
-        let result = std::thread::scope(|scope| {
-            if let Some(after) = steer_after {
-                let (journal_path, run_id, steer) = (journal_path.clone(), run_id.clone(), &steer);
-                scope.spawn(move || loop {
-                    let finished = std::fs::read_to_string(&journal_path).unwrap_or_default().lines()
-                        .filter(|line| line.contains(&run_id) && line.contains("\"tool_finished\"")).count();
-                    if finished >= after {
-                        steer.push(Directive { seq: 1, text: "keep going".into(), wrap_up: false, from: crate::worker_feed::Sender::S0ma }).unwrap();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                });
-            }
-            run_worker(&task, 0, &batch, &cancel, &budget, &steer, &tx)
-        });
-        println!("ENVELOPE {}", visible_result(&result));
-        for line in std::fs::read_to_string(&journal_path).unwrap_or_default().lines() {
-            let record: serde_json::Value = serde_json::from_str(line).unwrap_or_default();
-            if record["run_id"] == result.run_id && matches!(record["event"].as_str(),
-                Some("stuck_reminder" | "stuck_terminated" | "tool_finished" | "tool_started" | "steer_delivered")) {
-                println!("EVENT {} {}", record["event"], record["call"]["function"]["arguments"]);
-            }
-        }
-    }
-}
-
-pub(crate) struct MaintenanceLease {pub slot:usize,pub capacity:usize,released:bool}
-pub(crate) fn reserve_maintenance(maximum:usize,minimum:usize)->Result<Option<MaintenanceLease>,Box<dyn Error>> {
-    let advertised=llm::sleep_worker_slots()?;let mut m=manager()?;
-    let free=available_slots(&m);let available=total_worker_context().saturating_sub(reserved_context(&m));
-    for (slot,capacity) in advertised.into_iter().rev() {
-        let capacity=capacity.min(maximum).min(available);
-        if free.contains(&slot) && capacity>=minimum {
-            m.maintenance.insert(slot,capacity);return Ok(Some(MaintenanceLease{slot,capacity,released:false}));
-        }
-    }
-    Ok(None)
-}
-impl MaintenanceLease {
-    pub fn release(&mut self)->Result<(),Box<dyn Error>> {
-        if self.released{return Ok(());}
-        llm::release_worker_slot(self.slot)?;manager()?.maintenance.remove(&self.slot);self.released=true;Ok(())
-    }
-}
-impl Drop for MaintenanceLease {fn drop(&mut self){if let Err(e)=self.release(){llm::background_status(format_args!("[compaction] slot {} remains reserved: {e}",self.slot));}}}
-pub(crate) fn recover_maintenance(slot:usize)->Result<(),Box<dyn Error>> {
-    if !(1..=MAX_WORKERS).contains(&slot){return Err("invalid maintenance slot receipt".into());}
-    let mut m=manager()?;
-    if m.jobs.values().any(|job|job.slot==slot && holds_reservation(job)){return Err("maintenance cleanup deferred: slot belongs to an active worker".into());}
-    llm::release_worker_slot(slot)?;m.maintenance.remove(&slot);Ok(())
 }

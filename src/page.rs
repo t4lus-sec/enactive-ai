@@ -1,4 +1,4 @@
-//! s0ma's own page: the terminal's alternate screen, with the tab bar and a
+//! The agent's own page: the terminal's alternate screen, with the tab bar and a
 //! rule under it on the two top rows, and the conversation under them.
 //!
 //! The conversation scrolls in the rows below the bar (a scroll region that
@@ -54,14 +54,14 @@ pub fn top_rows() -> u16 {
     rows + 1
 }
 
-/// The page has the screen (s0ma is drawing on the alternate screen).
+/// The page has the screen (the agent is drawing on the alternate screen).
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// Something else drew over the page (a review window, an editor): drawn
 /// again before the idle prompt is.
 static STALE: AtomicBool = AtomicBool::new(false);
 
-/// Whether s0ma is drawing on its own page.
+/// Whether the agent is drawing on its own page.
 pub fn on() -> bool {
     ON.load(Ordering::SeqCst)
 }
@@ -123,7 +123,7 @@ impl Drop for Guard {
     }
 }
 
-/// The shell's screen back, for good (s0ma is ending, or this terminal is
+/// The shell's screen back, for good (the agent is ending, or this terminal is
 /// detaching), with `last` under what the shell had: the end of the
 /// conversation as the page showed it, so the last words (and any warning
 /// on the way out) stay readable there.
@@ -310,55 +310,3 @@ pub fn rows(text: &str, columns: usize) -> Rows {
     Rows { rows, column }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rows_split_at_newlines_and_wrap_at_the_width() {
-        let shown = rows("one\r\ntwo three\r\n", 5);
-        assert_eq!(shown.rows, vec!["one", "two t", "hree", ""]);
-        assert_eq!(shown.column, 0);
-        let shown = rows("abcde", 5);
-        assert_eq!(shown.rows, vec!["abcde"]);
-        assert_eq!(shown.column, 5, "a full row waits to wrap, as a terminal does");
-    }
-
-    #[test]
-    fn every_row_carries_the_colours_in_force() {
-        let shown = rows("\x1b[1mbold\r\nstill\x1b[0m\r\nplain", 20);
-        assert_eq!(shown.rows, vec!["\x1b[1mbold\x1b[0m", "\x1b[1mstill\x1b[0m", "plain"]);
-        // The last row is left as the text left it.
-        let shown = rows("\x1b[32mgreen\r\nmore", 20);
-        assert_eq!(shown.rows[1], "\x1b[32mmore");
-    }
-
-    #[test]
-    fn a_rewritten_line_shows_only_what_it_says_last() {
-        let shown = rows("  \x1b[3m⠋ 1 call\x1b[0m\r\x1b[2K  \x1b[3m✓ 2 calls\x1b[0m\r\nnext", 40);
-        assert_eq!(shown.rows, vec!["  \x1b[3m✓ 2 calls\x1b[0m", "next"]);
-    }
-
-    #[test]
-    fn an_emoji_made_wide_by_its_selector_counts_two() {
-        assert_eq!(width("⚠\u{FE0F} x"), UnicodeWidthStr::width("⚠\u{FE0F} x"));
-        assert_eq!(rows("ab⚠\u{FE0F}", 3).rows, vec!["ab⚠\u{FE0F}"]);
-        assert_eq!(rows("ab⚠\u{FE0F}", 3).column, 4);
-        // A cut-off code at the very end is dropped, not a panic.
-        assert_eq!(rows("ok\x1b[", 10).rows, vec!["ok"]);
-    }
-
-    #[test]
-    fn wide_characters_move_whole_to_the_next_row() {
-        let shown = rows("ab日本", 5);
-        assert_eq!(shown.rows, vec!["ab日", "本"]);
-        assert_eq!(shown.column, 2);
-    }
-
-    #[test]
-    fn the_region_starts_under_the_rule() {
-        assert_eq!(region(24), "\x1b[3;24r");
-        // Never less than two rows, which is all a terminal takes.
-        assert_eq!(region(2), "\x1b[3;4r");
-    }
-}

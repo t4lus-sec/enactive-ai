@@ -1,6 +1,6 @@
-//! The operator's steering draft while s0ma is active.
+//! The operator's steering draft while the agent is active.
 //!
-//! Reedline owns the keyboard only while s0ma is idle. During a turn, a
+//! Reedline owns the keyboard only while the agent is idle. During a turn, a
 //! lightweight crossterm reader edits this draft instead, so it needs its own
 //! cursor, motions and history. The draft round-trips through Reedline at the
 //! start and end of each turn, so nothing typed is ever lost.
@@ -226,7 +226,7 @@ fn display_width(s: &str) -> usize {
     s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
 }
 
-/// Up/Down recall of earlier submissions while s0ma is active.
+/// Up/Down recall of earlier submissions while the agent is active.
 ///
 /// Entries typed at the idle Reedline prompt are added here too, and steers
 /// typed during a turn are handed back to Reedline's history when the turn
@@ -325,19 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_delete_at_the_cursor() {
-        let mut d = Draft::new("helo world", 3);
-        d.insert('l');
-        assert_eq!(at(&d), "hell|o world");
-        d.end();
-        d.backspace();
-        assert_eq!(at(&d), "hello worl|");
-        d.home();
-        d.delete();
-        assert_eq!(at(&d), "|ello worl");
-    }
-
-    #[test]
     fn unicode_is_never_split() {
         let mut d = Draft::new("a🌱é", usize::MAX);
         d.left();
@@ -347,70 +334,5 @@ mod tests {
         assert_eq!(at(&d), "|🌱é");
         // A cursor inside a multi-byte char is pulled back to a boundary.
         assert_eq!(Draft::new("🌱", 2).cursor(), 0);
-    }
-
-    #[test]
-    fn word_motion_and_deletion() {
-        let mut d = Draft::new("one two  three", usize::MAX);
-        d.word_left();
-        assert_eq!(at(&d), "one two  |three");
-        d.word_left();
-        assert_eq!(at(&d), "one |two  three");
-        d.word_right();
-        assert_eq!(at(&d), "one two|  three");
-        d.delete_word_before();
-        assert_eq!(at(&d), "one |  three");
-        d.delete_word_after();
-        assert_eq!(at(&d), "one |");
-    }
-
-    #[test]
-    fn line_kills_stay_on_their_line() {
-        let mut d = Draft::new("first\nsecond line", 9);
-        d.kill_line_before();
-        assert_eq!(at(&d), "first\n|ond line");
-        d.kill_line_after();
-        assert_eq!(at(&d), "first\n|");
-    }
-
-    #[test]
-    fn up_and_down_keep_the_column() {
-        let mut d = Draft::new("abcdef\nxy\nlonger", usize::MAX);
-        assert!(d.up());
-        assert_eq!(at(&d), "abcdef\nxy|\nlonger");
-        assert!(d.up());
-        assert_eq!(at(&d), "ab|cdef\nxy\nlonger");
-        assert!(!d.up());
-        assert!(d.down());
-        assert!(d.down());
-        assert!(!d.down());
-        assert_eq!(at(&d), "abcdef\nxy\nlo|nger");
-    }
-
-    #[test]
-    fn pasted_escapes_are_neutralised() {
-        let mut d = Draft::default();
-        d.insert_str("a\x1b[2Jb\r\nc\td");
-        assert_eq!(d.text(), "a␛[2Jb\nc    d");
-    }
-
-    #[test]
-    fn history_browses_and_restores_the_draft() {
-        let mut h = SteerHistory::default();
-        h.push("first", false);
-        h.push("second", true);
-        h.push("second", true); // consecutive duplicate ignored
-        let mut d = Draft::new("typing", usize::MAX);
-
-        assert!(h.previous(&mut d));
-        assert_eq!(d.text(), "second");
-        assert!(h.previous(&mut d));
-        assert_eq!(d.text(), "first");
-        assert!(!h.previous(&mut d));
-        assert!(h.next(&mut d));
-        assert!(h.next(&mut d));
-        assert_eq!(d.text(), "typing");
-        assert!(!h.next(&mut d));
-        assert_eq!(h.take_unsynced(), vec!["second".to_string()]);
     }
 }

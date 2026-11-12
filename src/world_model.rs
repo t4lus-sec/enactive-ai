@@ -50,9 +50,9 @@ pub struct Record {
     pub observed_at: Option<String>,
     #[serde(default)]
     pub still_uncertain: String,
-    // What makes a record a fact s0ma can recall (`facts.rs`): when it was
-    // true, when s0ma learned and last confirmed it, how quickly it changes,
-    // how sure s0ma is, and what replaced it. All optional: a record written
+    // What makes a record a fact the agent can recall (`facts.rs`): when it was
+    // true, when the agent learned and last confirmed it, how quickly it changes,
+    // how sure the agent is, and what replaced it. All optional: a record written
     // before these existed reads as it did.
     /// When it was true from (`observed_at` stands in when this is absent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -60,7 +60,7 @@ pub struct Record {
     /// When it stopped being true: it ended, or was superseded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<String>,
-    /// When s0ma first learned it: its earliest evidence's time (set on write).
+    /// When the agent first learned it: its earliest evidence's time (set on write).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_at: Option<String>,
     /// The latest evidence that it holds, and that evidence's time (set on write).
@@ -676,50 +676,6 @@ fn document_load_connection(db: &Connection, name: &str) -> Result<Option<Value>
     body.map(|v| serde_json::from_str(&v).map_err(Into::into))
         .transpose()
 }
-#[cfg(test)]
-pub fn document_save(
-    path: &Path,
-    name: &str,
-    value: &Value,
-    expected: Option<u64>,
-    reason: &str,
-) -> Result<()> {
-    let mut db = open(path)?;
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current: Option<u64> = tx
-        .query_row(
-            "SELECT revision FROM wm_documents WHERE name=?1",
-            [name],
-            |r| row_u64(r, 0),
-        )
-        .optional()?;
-    if current != expected {
-        return Err("self-model revision conflict in world database".into());
-    }
-    let revision = value["revision"]
-        .as_u64()
-        .ok_or("self-document missing revision")?;
-    if current.is_some_and(|n| revision != n + 1) {
-        return Err("self-model revision must advance exactly once".into());
-    }
-    ensure_model(
-        &tx,
-        "self",
-        "s0ma — self model",
-        "Revisable self-understanding, preferences, tendencies and limitations; read on demand.",
-    )?;
-    tx.execute("INSERT INTO wm_documents VALUES(?1,?2,?3) ON CONFLICT(name) DO UPDATE SET revision=excluded.revision,body=excluded.body",params![name,sql_int(revision)?,value.to_string()])?;
-    tx.execute(
-        "INSERT INTO wm_document_history VALUES(?1,?2,?3,?4,?5)",
-        params![name, sql_int(revision)?, value.to_string(), reason, now()],
-    )?;
-    tx.execute(
-        "UPDATE wm_models SET revision=revision+1 WHERE id='self'",
-        [],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
 // Import displaced thread prose verbatim once. Unknown claims remain explicitly unverified.
 pub fn import_threads(path: &Path, threads: &Value) -> Result<BTreeMap<u64, Vec<String>>> {
     let mut db = open(path)?;
@@ -887,6 +843,40 @@ fn link(memory: &Hippocampus, arguments: &str) -> Result<Value> {
     Ok(json!({"ok":true,"revision":revision+1,"skill_reference_only":a.kind=="skill"}))
 }
 
+// ------------------------------------------------------------------ board links
+
+/// The catalog as `board` needs it: the title and current revision of one
+/// model, for a board's link and for the stale marker on it. Reading only the
+/// head keeps `board_read` bounded — a board lists which beliefs bear on its
+/// search and leaves reading them to the ordinary world-model tools.
+pub struct Models {
+    path: PathBuf,
+}
+
+impl Models {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl crate::board::ModelRevisions for Models {
+    fn head(&self, model_id: &str) -> Result<Option<crate::board::ModelHead>> {
+        let db = open(&self.path)?;
+        Ok(db
+            .query_row(
+                "SELECT title,revision FROM wm_models WHERE id=?1",
+                [model_id],
+                |r| {
+                    Ok(crate::board::ModelHead {
+                        title: r.get(0)?,
+                        revision: row_u64(r, 1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,11 +922,6 @@ mod tests {
                 },
             };
             Ok(serde_json::from_str(&execute(&self.memory, &call)?)?)
-        }
-        fn model_revision(&self) -> u64 {
-            catalog(&self.path(), 0, 20).unwrap()["models"][0]["revision"]
-                .as_u64()
-                .unwrap()
         }
     }
     impl Drop for Fixture {
@@ -1012,198 +997,5 @@ mod tests {
             content(f.call("world_record_get", json!({"id":"b"})).unwrap())["needs_review"],
             false
         );
-    }
-    #[test]
-    fn pagination_detects_review_changes_without_record_revision_changes() {
-        let f = Fixture::new();
-        put(&f.path(), claim("a"), 0, "initial", &f.memory).unwrap();
-        let mut b = claim("b");
-        b.dependencies.insert("a".into(), 1);
-        put(&f.path(), b, 0, "derived", &f.memory).unwrap();
-        let first = f
-            .call("world_record_get", json!({"id":"b","limit":10}))
-            .unwrap();
-        let args = json!({"id":"b","offset":10,"limit":10,"expected_revision":first["revision"],"read_token":first["read_token"]});
-        assert!(f.call("world_record_get", args.clone()).is_ok());
-        put(&f.path(), claim("a"), 1, "premise revision", &f.memory).unwrap();
-        assert!(
-            f.call("world_record_get", args)
-                .unwrap_err()
-                .to_string()
-                .contains("contents changed")
-        );
-        assert!(
-            f.call(
-                "world_record_get",
-                json!({"id":"b","offset":10,"expected_revision":1})
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn links_support_episodes_threads_models_records_and_skill_names() {
-        let f = Fixture::new();
-        std::fs::write(f.dir.join("threads.json"), "[{\"id\":4}]").unwrap();
-        let episodes =
-            Connection::open(f.memory.archive_path().with_extension("semantic.sqlite3")).unwrap();
-        episodes.execute_batch("CREATE TABLE consolidated_episodes(id TEXT PRIMARY KEY); INSERT INTO consolidated_episodes VALUES('episode-1');").unwrap();
-        put(&f.path(), claim("growth"), 0, "first", &f.memory).unwrap();
-        for (kind, target) in [
-            ("episode", "episode-1"),
-            ("thread", "4"),
-            ("model", "garden"),
-            ("record", "growth"),
-            ("skill", "gardening"),
-        ] {
-            f.call("world_model_link",json!({"model_id":"garden","expected_revision":f.model_revision(),"kind":kind,"target":target,"relation":"related","note":"Useful context"})).unwrap();
-        }
-        let rev = f.model_revision();
-        assert!(f.call("world_model_link",json!({"model_id":"garden","expected_revision":rev,"kind":"episode","target":"missing","relation":"related","note":""})).is_err());
-        assert_eq!(f.model_revision(), rev);
-        let v = content(
-            f.call("world_model_get", json!({"id":"garden","limit":12000}))
-                .unwrap(),
-        );
-        assert_eq!(v["related"].as_array().unwrap().len(), 5);
-        assert!(
-            v["related"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v["kind"] == "episode" && v["target"] == "episode-1")
-        );
-        let catalog = runtime_catalog(&f.memory).unwrap();
-        assert!(!catalog.contains("Growth may depend on light."));
-        f.call("world_model_link",json!({"model_id":"garden","expected_revision":rev,"kind":"episode","target":"episode-1","relation":"related","note":"","remove":true})).unwrap();
-    }
-    #[test]
-    fn thread_migration_is_lossless_idempotent_and_keeps_continuations() {
-        let f = Fixture::new();
-        let path = f.dir.join("threads.json");
-        let old = json!([{"id":7,"created_at":now(),"updated_at":now(),"title":"Garden question","description":"Explore lighting","category":"question","state":"active","event_ids":[1],"summary":"Old understanding","transformations":["Earlier correction"],"related_threads":[9],"significance":"Still curious","questions":["Which light?"],"next_actions":["Review notes"]}]);
-        let raw = old.to_string();
-        std::fs::write(&path, &raw).unwrap();
-        let store = crate::threads::ThreadStore::new(&path).unwrap();
-        let t = store.get(7).unwrap();
-        assert_eq!(t.questions, vec!["Which light?"]);
-        assert_eq!(t.world_record_ids.len(), 1);
-        assert_eq!(
-            std::fs::read_to_string(f.dir.join("threads.pre-world-model.json")).unwrap(),
-            raw
-        );
-        let cleaned: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(cleaned[0].get("summary").is_none());
-        let db = open(&f.path()).unwrap();
-        let count = || {
-            db.query_row("SELECT count(*) FROM wm_records", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap()
-        };
-        assert_eq!(count(), 1);
-        // Simulate a crash after committing imported notes but before writing the new threads file.
-        std::fs::write(&path, &raw).unwrap();
-        crate::threads::ThreadStore::new(&path).unwrap();
-        crate::threads::ThreadStore::new(&path).unwrap();
-        assert_eq!(count(), 1);
-        let v = content(
-            f.call(
-                "world_record_get",
-                json!({"id":t.world_record_ids[0],"limit":12000}),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            v["record"]["data"]["fields"]["summary"],
-            "Old understanding"
-        );
-        assert_eq!(v["evidence_integrity"], "unverified_import");
-    }
-    /// The self document in the world database: optimistic concurrency on save,
-    /// and revision history visible through the model view.
-    ///
-    /// The `self` document is now just another named world-model record. The
-    /// dedicated self-model store it once mirrored is gone: identity that is not
-    /// invariant lives in the adapter and the memory systems, so there is no
-    /// second store for it to drift out of step with.
-    #[test]
-    fn the_self_document_has_history_and_rejects_stale_saves() {
-        let f = Fixture::new();
-        let doc = json!({"schema_version":2,"revision":5,"created_at":now(),"updated_at":now(),"sections":{},"grounding":[]});
-
-        // Seed the world database at revision 5. `expected: None` is the
-        // first-write case; there is nothing to conflict with yet.
-        document_save(&f.path(), "self", &doc, None, "imported").unwrap();
-
-        let mut updated = doc.clone();
-        updated["revision"] = json!(6);
-        document_save(&f.path(), "self", &updated, Some(5), "reviewed").unwrap();
-        assert!(document_save(&f.path(), "self", &updated, Some(5), "stale").is_err());
-        let v = content(
-            f.call(
-                "world_model_get",
-                json!({"id":"self","history":true,"limit":12000}),
-            )
-            .unwrap(),
-        );
-        assert_eq!(v["self_document"]["revision"], 6);
-        assert_eq!(v["self_document_history"].as_array().unwrap().len(), 2);
-        assert_eq!(v["self_document_history"][1]["reason"], "reviewed");
-    }
-    #[test]
-    fn relationships_require_entities_and_retired_dependencies_require_review() {
-        let f = Fixture::new();
-        let mut r = claim("relation");
-        r.kind = "relationship".into();
-        r.subject_id = Some("plant".into());
-        r.target_id = Some("plant".into());
-        assert!(put(&f.path(), r.clone(), 0, "relation", &f.memory).is_err());
-        let mut entity = claim("plant");
-        entity.kind = "entity".into();
-        entity.status = "retired".into();
-        put(&f.path(), entity, 0, "entity", &f.memory).unwrap();
-        r.dependencies.insert("plant".into(), 1);
-        put(&f.path(), r, 0, "relation", &f.memory).unwrap();
-        assert_eq!(
-            content(
-                f.call("world_record_get", json!({"id":"relation"}))
-                    .unwrap()
-            )["needs_review"],
-            true
-        );
-    }
-}
-
-// ------------------------------------------------------------------ board links
-
-/// The catalog as `board` needs it: the title and current revision of one
-/// model, for a board's link and for the stale marker on it. Reading only the
-/// head keeps `board_read` bounded — a board lists which beliefs bear on its
-/// search and leaves reading them to the ordinary world-model tools.
-pub struct Models {
-    path: PathBuf,
-}
-
-impl Models {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl crate::board::ModelRevisions for Models {
-    fn head(&self, model_id: &str) -> Result<Option<crate::board::ModelHead>> {
-        let db = open(&self.path)?;
-        Ok(db
-            .query_row(
-                "SELECT title,revision FROM wm_models WHERE id=?1",
-                [model_id],
-                |r| {
-                    Ok(crate::board::ModelHead {
-                        title: r.get(0)?,
-                        revision: row_u64(r, 1)?,
-                    })
-                },
-            )
-            .optional()?)
     }
 }

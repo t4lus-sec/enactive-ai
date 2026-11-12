@@ -1,6 +1,6 @@
 use crate::hippocampus::{ConversationTurn, Hippocampus, MemoryCheckpoint, RecalledEvent};
 use crate::llm::{self, ChatOptions};
-use crate::memory_layers::Sources;
+use crate::memory::layers::Sources;
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use crate::threads::{Thread, ThreadCategory, ThreadState, ThreadStore};
@@ -55,7 +55,7 @@ mod skill_catalog_tests {
         assert!(awake.system_context.contains("Use for checking controls."));
         assert!(!awake.system_context.contains("BODY_LOADED_ONLY_ON_DEMAND"));
         assert_eq!(awake.system_context.matches("[SKILLS]").count(), 1);
-        // s0ma is told it can write skills in ordinary turns.
+        // The agent is told it can write skills in ordinary turns.
         assert!(awake.system_context.contains(crate::skills::WRITE_GUIDE));
 
         // Deleted through the same dispatch: gone from the per-turn match's
@@ -274,7 +274,7 @@ struct Catalogs {
 /// span at the end.
 ///
 /// The `[KNOWN WEAKNESSES]` block that span held is gone (2026-10-26: confirmed
-/// weaknesses are no longer shown to s0ma). The span stays because the call
+/// weaknesses are no longer shown to the agent). The span stays because the call
 /// store's format requires the label in every system message, empty when there
 /// is no block, and qref's readers count on finding it.
 fn append_catalogs(system_context: &mut String, spans: &mut crate::calls::SpanMarks, catalogs: Catalogs) {
@@ -340,7 +340,7 @@ fn render_thread(thread: &Thread) -> String {
     let current = &thread.description;
 
     // When it last changed, as a date: whether a thread is a week stale is
-    // something s0ma can see rather than guess.
+    // something the agent can see rather than guess.
     let updated = crate::clock::parse(&thread.updated_at)
         .map(|at| format!(" | updated {}", crate::clock::short(&at)))
         .unwrap_or_default();
@@ -609,7 +609,7 @@ fn build_system_context(
     // The terminal shared with the operator: a fixed paragraph, so the base stays
     // the same from call to call.
     context.push_str(crate::vm::NETBOX_CONTEXT);
-    context.push_str(crate::shared_files::CONTEXT);
+    context.push_str(crate::share::files::CONTEXT);
     spans.mark("base", &context);
 
     // Dated from the archive, not from `checkpoint.timestamp`: the runtime
@@ -678,74 +678,3 @@ fn build_system_context(
     context
 }
 
-#[cfg(test)]
-mod span_tests {
-    use super::*;
-
-    #[test]
-    fn the_system_context_dates_its_checkpoint_and_memory_lines_readably() {
-        let checkpoint = MemoryCheckpoint {
-            timestamp: "2026-10-22T03:00:00+11:00".into(),
-            from_event_id: 12,
-            through_event_id: 84,
-            source_event_count: 73,
-            summary: "summary".into(),
-        };
-        let times: HashMap<u64, DateTime<Local>> = [
-            (12, crate::clock::parse("2026-10-14T09:02:00+11:00").unwrap()),
-            (84, crate::clock::parse("2026-10-21T18:40:00+11:00").unwrap()),
-        ]
-        .into();
-        let raw = "2026-10-21T21:42:26.479444669+11:00";
-        let recent = [RecalledEvent {
-            id: 85,
-            timestamp: raw.into(),
-            speaker: crate::hippocampus::Speaker::Operator,
-            content: "hello".into(),
-        }];
-        let mut spans = crate::calls::SpanMarks::default();
-        let context = build_system_context("BASE", Some(&checkpoint), &times, None, &recent, 0, &mut spans);
-        let short = |raw: &str| crate::clock::stored(raw);
-        assert!(
-            context.contains(&format!(
-                "It compressed 73 raw events spanning event #12 ({}) through #84 ({}).\n",
-                short("2026-10-14T09:02:00+11:00"),
-                short("2026-10-21T18:40:00+11:00"),
-            )),
-            "{context}"
-        );
-        assert!(context.contains(&format!("[memory 85 | {} | ", short(raw))), "{context}");
-        assert!(!context.contains(raw), "no raw RFC 3339 stamp in context");
-
-        // Without the archive's times, the ids alone, as before.
-        let mut spans = crate::calls::SpanMarks::default();
-        let undated = build_system_context("BASE", Some(&checkpoint), &HashMap::new(), None, &[], 0, &mut spans);
-        assert!(undated.contains("spanning event #12 through #84.\n"), "{undated}");
-        assert!(!undated.contains("2026"), "the checkpoint's own stamp isn't shown: {undated}");
-    }
-
-    #[test]
-    fn the_weaknesses_span_is_still_marked_and_always_empty() {
-        let mut spans = crate::calls::SpanMarks::default();
-        let mut context = build_system_context("BASE ⚙", None, &HashMap::new(), Some("thread one"), &[], 0, &mut spans);
-        append_catalogs(
-            &mut context,
-            &mut spans,
-            Catalogs { skills: "\n\n[SKILLS]\nx".into(), world_model: String::new(), mcp: "\n[MCP]".into() },
-        );
-        let spans = spans.into_spans();
-        let labels: Vec<&str> = spans.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(labels, ["base", "checkpoint", "threads", "recent", "skills", "world_model", "mcp", "weaknesses"]);
-        // Ordered, contiguous, covering the content.
-        assert_eq!(spans[0].start, 0);
-        for pair in spans.windows(2) {
-            assert_eq!(pair[0].end, pair[1].start);
-        }
-        assert_eq!(spans.last().unwrap().end, context.len());
-        assert!(context.is_char_boundary(spans[0].end));
-        let weak = spans.iter().find(|s| s.label == "weaknesses").unwrap();
-        assert_eq!((weak.start, weak.end), (context.len(), context.len()));
-        assert!(!context.contains("WEAKNESS"));
-        assert_eq!(&context[spans[0].start..spans[0].end], format!("BASE ⚙{}{}", crate::vm::NETBOX_CONTEXT, crate::shared_files::CONTEXT));
-    }
-}

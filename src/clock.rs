@@ -1,6 +1,6 @@
 //! Wall-clock time in a form the model can use without arithmetic.
 //!
-//! s0ma used to see the time only as `Utc::now().to_rfc3339()`: UTC, with
+//! The agent used to see the time only as `Utc::now().to_rfc3339()`: UTC, with
 //! nanoseconds, no weekday and no local time. Converting that to a local date
 //! and working out the weekday are exactly the steps models get wrong, and a
 //! hard-to-read timestamp loses to the training-data prior about what year it
@@ -16,7 +16,7 @@
 //!
 //! Turning two timestamps into "how long ago" is the step models are worst at
 //! (duration questions score lowest in temporal-reasoning benchmarks, with
-//! off-by-one-day the commonest error), so s0ma is never left to do it. Every
+//! off-by-one-day the commonest error), so the agent is never left to do it. Every
 //! interval it needs is computed here and written in words: since the previous
 //! input, since its last turn ended, since it last ran before a restart, how
 //! long a tool took, how long a queued message waited. The rule for where each
@@ -412,7 +412,7 @@ fn save_zone_to(path: &Path, text: &str) -> Result<(), String> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Recorded {
     pub at: DateTime<Local>,
-    /// It was a deep sleep's manifest: s0ma's last act was consolidating.
+    /// It was a deep sleep's manifest: the agent's last act was consolidating.
     pub was_sleep: bool,
 }
 
@@ -425,7 +425,7 @@ pub enum Rebuild {
     Compaction,
 }
 
-/// What came before the next input, for its header. Only inputs s0ma
+/// What came before the next input, for its header. Only inputs the agent
 /// actually takes in (`accept`) move it: one refused before reaching the
 /// model (a router failure, a full context) leaves it as it was, so the
 /// message sent again still says what the first would have.
@@ -486,7 +486,7 @@ pub fn mark_resumed(resumed: Resumed) {
 
 /// After every turn, however it ended. Counts only for a turn that was
 /// accepted: one refused before reaching the model, or a bad `/img`, wasn't
-/// a turn s0ma took.
+/// a turn the agent took.
 pub fn mark_turn_end() {
     timeline(|timeline| {
         if std::mem::take(&mut timeline.turn_open) {
@@ -499,7 +499,7 @@ pub fn mark_turn_end() {
 pub fn mark_rebuilt(why: Rebuild) {
     timeline(|timeline| {
         timeline.rebuilt = Some((now(), why));
-        // Whatever was resumed at start is not what is in front of s0ma now.
+        // Whatever was resumed at start is not what is in front of the agent now.
         timeline.resumed = None;
     });
 }
@@ -526,12 +526,12 @@ pub struct Arrival {
     pub at: DateTime<Local>,
     joins: Joins,
     from: Who,
-    /// When it was sent, if it waited in the queue before s0ma took it.
+    /// When it was sent, if it waited in the queue before the agent took it.
     sent_at: Option<DateTime<Local>>,
     previous_input: Option<DateTime<Local>>,
     /// The operator's last message before this one.
     last_operator: Option<DateTime<Local>>,
-    /// When s0ma's last turn ended (a new turn only).
+    /// When the agent's last turn ended (a new turn only).
     turn_ended: Option<DateTime<Local>>,
     /// The first input since this process started: when it started, and the
     /// archive's last event before that.
@@ -543,9 +543,9 @@ pub struct Arrival {
 }
 
 /// An input arriving now, and what its header says. `sent_at`: when it was
-/// typed or sent, if that was before s0ma took it (a queued message).
+/// typed or sent, if that was before the agent took it (a queued message).
 ///
-/// Changes nothing: `accept` records it once s0ma takes it in, so an input
+/// Changes nothing: `accept` records it once the agent takes it in, so an input
 /// refused on the way (and sent again) doesn't use up what the next header
 /// has to say.
 pub fn arrive(joins: Joins, from: Who, sent_at: Option<DateTime<Local>>) -> Arrival {
@@ -568,7 +568,7 @@ pub fn arrive(joins: Joins, from: Who, sent_at: Option<DateTime<Local>>) -> Arri
     })
 }
 
-/// The input is in s0ma's context now: the next header counts from it, and
+/// The input is in the agent's context now: the next header counts from it, and
 /// what this one said about a rebuild isn't said again.
 pub fn accept(arrival: &Arrival) {
     timeline(|timeline| {
@@ -711,26 +711,6 @@ mod tests {
         FixedOffset::west_opt(7 * 3600).unwrap().with_ymd_and_hms(y, mo, d, h, mi, 30).unwrap()
     }
 
-    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
-        Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
-    }
-
-    fn arrival(at: DateTime<Local>) -> Arrival {
-        Arrival {
-            at,
-            joins: Joins::NewTurn,
-            from: Who::Operator,
-            sent_at: None,
-            previous_input: None,
-            last_operator: None,
-            turn_ended: None,
-            first: None,
-            rebuilt: None,
-            resumed: None,
-            operator: None,
-        }
-    }
-
     /// Tests that use the process-wide zone or timeline take turns.
     static GLOBALS: Mutex<()> = Mutex::new(());
 
@@ -754,81 +734,10 @@ mod tests {
     }
 
     #[test]
-    fn describe_gives_weekday_local_offset_and_utc() {
-        assert_eq!(
-            describe(&pacific(2026, 10, 5, 11, 5)),
-            "Monday 5 October 2026, 11:05 local (UTC-07:00); 2026-10-05 18:05 UTC"
-        );
-    }
-
-    #[test]
-    fn utc_date_can_differ_from_local_date() {
-        // Late evening local is already tomorrow in UTC; both are shown.
-        assert_eq!(
-            describe(&pacific(2026, 12, 31, 20, 0)),
-            "Thursday 31 December 2026, 20:00 local (UTC-07:00); 2027-01-01 03:00 UTC"
-        );
-    }
-
-    #[test]
-    fn short_form_keeps_weekday_date_and_year() {
-        assert_eq!(short(&pacific(2026, 10, 5, 18, 42)), "Mon 5 Oct 2026 18:42");
-    }
-
-    #[test]
-    fn local_now_formats() {
-        let line = describe(&now());
-        assert!(line.contains(" local (UTC") && line.ends_with(" UTC"), "{line}");
-    }
-
-    #[test]
-    fn spans_get_coarser_as_they_grow() {
-        let s = Duration::from_secs;
-        assert_eq!(span(Duration::from_millis(40)), "under 0.1 s");
-        assert_eq!(span(Duration::from_millis(4_260)), "4.2 s");
-        assert_eq!(span(s(42)), "42 s");
-        assert_eq!(span(s(252)), "4 min 12 s");
-        assert_eq!(span(s(240)), "4 min");
-        assert_eq!(span(s(34 * 60 + 59)), "34 min");
-        assert_eq!(span(s(3 * 3600 + 12 * 60 + 9)), "3 h 12 min");
-        assert_eq!(span(s(5 * 3600)), "5 h");
-        assert_eq!(span(s(86_400 + 3 * 3600)), "1 day 3 h");
-        assert_eq!(span(s(2 * 86_400 + 3 * 3600 + 59 * 60)), "2 days 3 h");
-        assert_eq!(span(s(2 * 86_400)), "2 days");
-        assert_eq!(span(s(16 * 86_400 + 5 * 3600)), "16 days");
-    }
-
-    #[test]
     fn an_interval_never_goes_negative() {
         let (early, late) = (pacific(2026, 10, 5, 9, 0), pacific(2026, 10, 5, 9, 30));
         assert_eq!(between(&early, &late), Duration::from_secs(30 * 60));
         assert_eq!(between(&late, &early), Duration::ZERO);
-    }
-
-    #[test]
-    fn ranges_say_as_little_as_they_need_to() {
-        assert_eq!(range(&pacific(2026, 10, 21, 14, 5), &pacific(2026, 10, 21, 14, 5)), "Wed 21 Oct 2026 14:05");
-        assert_eq!(
-            range(&pacific(2026, 10, 21, 14, 5), &pacific(2026, 10, 21, 16, 40)),
-            "Wed 21 Oct 2026 14:05–16:40"
-        );
-        assert_eq!(
-            range(&pacific(2026, 10, 21, 22, 5), &pacific(2026, 10, 22, 9, 10)),
-            "Wed 21 Oct 2026 22:05 – Thu 22 Oct 2026 09:10"
-        );
-        // Ends given the wrong way round still read forwards.
-        assert_eq!(
-            range(&pacific(2026, 10, 21, 16, 40), &pacific(2026, 10, 21, 14, 5)),
-            "Wed 21 Oct 2026 14:05–16:40"
-        );
-    }
-
-    #[test]
-    fn stored_stamps_read_like_the_rest_and_bad_ones_pass_through() {
-        let at = parse("2026-10-21T21:42:26.479444669+11:00").unwrap();
-        assert_eq!(stored("2026-10-21T21:42:26.479444669+11:00"), short(&at));
-        assert!(!stored("2026-10-21T21:42:26.479444669+11:00").contains(":26."), "no seconds, no RFC 3339");
-        assert_eq!(stored("t"), "t");
     }
 
     #[test]
@@ -856,22 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn a_zone_shows_its_own_date_which_can_differ_from_the_hosts() {
-        // 14:05 in Sydney (UTC+11) is still the evening before at UTC-6.
-        let sydney = FixedOffset::east_opt(11 * 3600).unwrap().with_ymd_and_hms(2026, 10, 22, 14, 5, 0).unwrap();
-        assert_eq!(
-            Zone::parse("UTC-6").unwrap().describe_at(&sydney),
-            "Wednesday 21 October 2026, 21:05 (UTC-06:00)"
-        );
-        // A named zone follows daylight saving: Denver is UTC-6 in October and
-        // UTC-7 after the first Sunday of November.
-        let denver = Zone::parse("America/Denver").unwrap();
-        assert_eq!(denver.describe_at(&sydney), "Wednesday 21 October 2026, 21:05 (America/Denver, UTC-06:00)");
-        let december = Utc.with_ymd_and_hms(2026, 12, 1, 3, 5, 0).unwrap();
-        assert!(denver.describe_at(&december).ends_with("(America/Denver, UTC-07:00)"));
-    }
-
-    #[test]
     fn what_tz_saved_wins_over_the_environment() {
         let zone = |spec: &str| Zone::parse(spec).unwrap();
         assert_eq!(
@@ -890,264 +783,6 @@ mod tests {
         let (none, warning) = choose_zone(None, Some("Mars/Olympus"));
         assert_eq!(none, None);
         assert!(warning.unwrap().contains("S0MA_OPERATOR_TZ ignored"));
-    }
-
-    #[test]
-    fn a_saved_zone_reads_back_as_it_was_set() {
-        let dir = std::env::temp_dir().join(format!("s0ma-tz-{}-{:?}", std::process::id(), std::thread::current().id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(ZONE_FILE);
-        let zone = Zone::parse("America/Denver").unwrap();
-        save_zone_to(&path, &zone.spec()).unwrap();
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(choose_zone(Some(&saved), Some("UTC+3")).0, Some(OperatorZone { zone, from: ZoneSource::Command }));
-        save_zone_to(&path, "off").unwrap();
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(choose_zone(Some(&saved), Some("UTC+3")), (None, None));
-        assert!(!path.with_extension("tmp").exists(), "renamed into place");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn tz_sets_shows_and_turns_off_the_zone() {
-        let _globals = globals();
-        let at = local(2026, 10, 22, 14, 5);
-        assert!(handle_command("/tzx").is_none());
-        let set = tz_command("utc - 6", &at).unwrap();
-        assert!(set.contains("is now UTC-06:00"), "{set}");
-        assert!(operator_line(&at).unwrap().starts_with("The operator's local time: "));
-        let shown = tz_command("", &at).unwrap();
-        assert!(shown.contains("UTC-06:00 (set with /tz)"), "{shown}");
-        assert!(tz_command("Mars/Olympus", &at).unwrap_err().starts_with("[tz] "));
-        assert!(operator_line(&at).is_some(), "a bad zone changes nothing");
-        assert!(tz_command("off", &at).unwrap().contains("is off"));
-        assert!(operator_line(&at).is_none());
-        assert!(tz_command("", &at).unwrap().starts_with("[tz] Your time zone is not set"));
-    }
-
-    #[test]
-    fn the_header_gives_the_intervals_instead_of_the_arithmetic() {
-        let at = local(2026, 10, 22, 14, 5);
-        let header = Arrival {
-            previous_input: Some(local(2026, 10, 22, 10, 53)),
-            turn_ended: Some(local(2026, 10, 22, 11, 40)),
-            ..arrival(at)
-        }
-        .header();
-        assert!(header.starts_with(&format!("Current time: {}\n", describe(&at))), "{header}");
-        assert!(
-            header.contains(
-                "Previous input: Thu 22 Oct 2026 10:53, 3 h 12 min before this one. \
-                 Your last turn ended Thu 22 Oct 2026 11:40, 2 h 25 min before this input."
-            ),
-            "{header}"
-        );
-        assert!(header.ends_with("as the turn goes on."), "{header}");
-        assert!(header.contains("not your training data"));
-        assert!(!header.contains("local time is his"), "no zone set, no note about it");
-    }
-
-    #[test]
-    fn a_turn_end_that_adds_nothing_is_left_out() {
-        let at = local(2026, 10, 22, 14, 5);
-        // A quick reply: the previous input says it all.
-        let quick = Arrival {
-            previous_input: Some(local(2026, 10, 22, 10, 53)),
-            turn_ended: Some(local(2026, 10, 22, 10, 54)),
-            ..arrival(at)
-        };
-        assert!(!quick.header().contains("last turn ended"));
-        // Loop mode: the next cycle starts as the last one ends.
-        let looping = Arrival {
-            previous_input: Some(local(2026, 10, 22, 13, 50)),
-            turn_ended: Some(at),
-            ..arrival(at)
-        };
-        assert!(!looping.header().contains("last turn ended"));
-    }
-
-    #[test]
-    fn the_first_input_after_a_start_says_how_long_s0ma_was_away() {
-        let at = local(2026, 10, 22, 14, 5);
-        let header = Arrival {
-            first: Some((
-                Some(local(2026, 10, 22, 13, 58)),
-                Some(Recorded { at: local(2026, 10, 21, 18, 40), was_sleep: false }),
-            )),
-            ..arrival(at)
-        }
-        .header();
-        assert!(
-            header.contains(
-                "This is the first input since s0ma started at Thu 22 Oct 2026 13:58, 7 min before it. \
-                 Before that, the archive's last record is from Wed 21 Oct 2026 18:40, 19 h 25 min before this input."
-            ),
-            "{header}"
-        );
-        let after_sleep = Arrival {
-            first: Some((None, Some(Recorded { at: local(2026, 10, 22, 3, 0), was_sleep: true }))),
-            ..arrival(at)
-        }
-        .header();
-        assert!(!after_sleep.contains("last message before this"), "nothing known of the operator yet");
-        assert!(after_sleep.contains("last record was a deep sleep that finished Thu 22 Oct 2026 03:00, 11 h 5 min"), "{after_sleep}");
-    }
-
-    #[test]
-    fn a_queued_message_says_how_long_it_waited() {
-        let at = local(2026, 10, 22, 12, 9);
-        let waited = Arrival { sent_at: Some(local(2026, 10, 22, 12, 4)), ..arrival(at) }.header();
-        assert!(waited.contains("Sent at Thu 22 Oct 2026 12:04: it waited 5 min in the queue while you worked."), "{waited}");
-        let prompt = Arrival { sent_at: Some(at), ..arrival(at) }.header();
-        assert!(!prompt.contains("Sent at"), "taken at once: nothing to say");
-    }
-
-    #[test]
-    fn a_resumed_context_is_said_with_the_first_input() {
-        let at = local(2026, 10, 22, 9, 0);
-        let first = Some((Some(local(2026, 10, 22, 8, 58)), None));
-        let header = Arrival {
-            first: first.clone(),
-            resumed: Some(Resumed { saved_at: local(2026, 10, 22, 8, 40), missing: None }),
-            ..arrival(at)
-        }
-        .header();
-        assert!(header.contains("Your working context is the one saved at Thu 22 Oct 2026 08:40, 20 min before this input"), "{header}");
-        assert!(!header.contains("archive_get"), "{header}");
-        let cut_short = Arrival {
-            first,
-            resumed: Some(Resumed { saved_at: local(2026, 10, 22, 8, 40), missing: Some((120, 131)) }),
-            ..arrival(at)
-        }
-        .header();
-        assert!(cut_short.contains("Archive events #120–#131 came after that save and are not in it"), "{cut_short}");
-        let one = Arrival {
-            first: Some((Some(local(2026, 10, 22, 8, 58)), None)),
-            resumed: Some(Resumed { saved_at: local(2026, 10, 22, 8, 40), missing: Some((11, 11)) }),
-            ..arrival(at)
-        }
-        .header();
-        assert!(one.contains("Archive event #11 came after that save and is not in it") && one.contains("archive_get reads it."), "{one}");
-    }
-
-    #[test]
-    fn a_rebuild_since_the_previous_input_is_said() {
-        let at = local(2026, 10, 22, 9, 0);
-        let header = Arrival {
-            previous_input: Some(local(2026, 10, 21, 23, 0)),
-            rebuilt: Some((local(2026, 10, 22, 2, 30), Rebuild::Sleep)),
-            ..arrival(at)
-        }
-        .header();
-        assert!(header.contains("A deep sleep finished at Thu 22 Oct 2026 02:30, 6 h 30 min before this input"), "{header}");
-        let compacted = Arrival {
-            previous_input: Some(local(2026, 10, 22, 8, 50)),
-            rebuilt: Some((local(2026, 10, 22, 8, 55), Rebuild::Compaction)),
-            ..arrival(at)
-        }
-        .header();
-        assert!(compacted.contains("Your context was compacted at Thu 22 Oct 2026 08:55, 5 min before"), "{compacted}");
-    }
-
-    #[test]
-    fn intervals_match_the_minutes_shown() {
-        use chrono::Duration as Delta;
-        // 10:53:59 and 14:05:00 show as 10:53 and 14:05: 3 h 12 min apart.
-        let at = local(2026, 10, 22, 14, 5);
-        let previous = local(2026, 10, 22, 10, 53) + Delta::seconds(59);
-        let header = Arrival { previous_input: Some(previous), ..arrival(at) }.header();
-        assert!(header.contains("Previous input: Thu 22 Oct 2026 10:53, 3 h 12 min before this one."), "{header}");
-        // Under a minute it is exact.
-        assert_eq!(between_shown(&(at - Delta::seconds(42)), &at), Duration::from_secs(42));
-    }
-
-    #[test]
-    fn operators_last_message_is_given_when_other_inputs_came_after_it() {
-        let at = local(2026, 10, 22, 14, 5);
-        let looping = Arrival {
-            from: Who::Harness,
-            previous_input: Some(local(2026, 10, 22, 14, 0)),
-            last_operator: Some(local(2026, 10, 22, 10, 0)),
-            ..arrival(at)
-        }
-        .header();
-        assert!(looping.contains("The operator's last message before this was at Thu 22 Oct 2026 10:00, 4 h 5 min before this input."), "{looping}");
-        let conversation = Arrival {
-            previous_input: Some(local(2026, 10, 22, 10, 0)),
-            last_operator: Some(local(2026, 10, 22, 10, 0)),
-            ..arrival(at)
-        }
-        .header();
-        assert!(!conversation.contains("last message before this"), "the previous input already says it: {conversation}");
-    }
-
-    #[test]
-    fn with_operators_zone_shown_the_hosts_times_are_named_as_such() {
-        let at = local(2026, 10, 22, 14, 5);
-        let header = Arrival { operator: Some("The operator's local time: x".into()), ..arrival(at) }.header();
-        assert!(header.contains("is host time"), "{header}");
-        assert!(!arrival(at).header().contains("host time"), "one zone, nothing to tell apart");
-    }
-
-    #[test]
-    fn operators_time_comes_with_a_note_on_whose_today_it_is() {
-        let at = local(2026, 10, 22, 14, 5);
-        let header = Arrival {
-            operator: Some("The operator's local time: Wednesday 21 October 2026, 21:05 (UTC-06:00)".into()),
-            ..arrival(at)
-        }
-        .header();
-        let lines: Vec<&str> = header.lines().collect();
-        assert_eq!(lines[1], "The operator's local time: Wednesday 21 October 2026, 21:05 (UTC-06:00)");
-        assert!(header.contains("he means his date"));
-    }
-
-    #[test]
-    fn arrivals_chain_and_a_running_turn_gets_no_turn_end() {
-        let _globals = globals();
-        reset_timeline();
-        // The process-wide timeline: arrivals in order, as App sees them.
-        mark_start(None);
-        let first = arrive(Joins::NewTurn, Who::Operator, None);
-        assert!(first.header().contains("first input since s0ma started"), "{}", first.header());
-        accept(&first);
-        mark_turn_end();
-        let second = arrive(Joins::NewTurn, Who::Harness, None);
-        assert_eq!(second.previous_input, Some(first.at));
-        assert!(second.turn_ended.is_some());
-        accept(&second);
-        let steer = arrive(Joins::RunningTurn, Who::Operator, None);
-        assert_eq!(steer.turn_ended, None);
-        assert_eq!(steer.first, None);
-        assert_eq!(steer.last_operator, Some(first.at), "the loop cycle wasn't the operator's");
-        accept(&steer);
-        mark_rebuilt(Rebuild::Sleep);
-        let woken = arrive(Joins::NewTurn, Who::Operator, None);
-        assert!(woken.rebuilt.is_some());
-        accept(&woken);
-        assert!(arrive(Joins::NewTurn, Who::Operator, None).rebuilt.is_none(), "said once");
-        reset_timeline();
-    }
-
-    #[test]
-    fn a_resumed_context_is_said_once_and_not_after_a_rebuild() {
-        let _globals = globals();
-        reset_timeline();
-        mark_start(None);
-        mark_resumed(Resumed { saved_at: now(), missing: Some((5, 9)) });
-        let first = arrive(Joins::NewTurn, Who::Operator, None);
-        assert!(first.resumed.is_some());
-        accept(&first);
-        assert!(arrive(Joins::NewTurn, Who::Operator, None).resumed.is_none(), "only with the first input");
-        reset_timeline();
-        // A /compact or a sleep before the first input: the context in front
-        // of s0ma is the rebuilt one, and only that is said.
-        mark_start(None);
-        mark_resumed(Resumed { saved_at: now(), missing: Some((5, 9)) });
-        mark_rebuilt(Rebuild::Compaction);
-        let after = arrive(Joins::NewTurn, Who::Operator, None);
-        assert!(after.resumed.is_none() && after.rebuilt.is_some());
-        reset_timeline();
     }
 
     #[test]

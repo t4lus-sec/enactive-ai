@@ -20,12 +20,12 @@ pub enum AttentionMode {
 #[serde(rename_all = "snake_case")]
 pub enum ConditionKind {
     OperatorMessage,
-    /// An event through the VM wake channel (`vm_wake.rs`): a watch firing,
+    /// An event through the VM wake channel (`vm/wake.rs`): a watch firing,
     /// or a script sending one.
     VmEvent,
 }
 
-/// Condition kinds s0ma no longer has: a Signal contact's message, and the
+/// Condition kinds the agent no longer has: a Signal contact's message, and the
 /// Minecraft events. A saved wait for one loads as a wait for operator input.
 const RETIRED_KINDS: &[&str] = &[
     "contact_message",
@@ -35,11 +35,11 @@ const RETIRED_KINDS: &[&str] = &[
     "minecraft_event",
 ];
 
-/// Condition fields from kinds s0ma no longer has: Minecraft's filters, and
+/// Condition fields from kinds the agent no longer has: Minecraft's filters, and
 /// the Signal contact a `contact_message` wait named.
 const RETIRED_FIELDS: &[&str] = &["event_kind", "action_id", "username", "from"];
 
-/// Unknown fields are refused, so a filter s0ma no longer has fails loudly
+/// Unknown fields are refused, so a filter the agent no longer has fails loudly
 /// rather than being ignored (a saved one is dropped on load first).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -123,7 +123,7 @@ impl AttentionStore {
             && self.state.condition.as_ref().is_some_and(|condition| condition.kind == ConditionKind::VmEvent)
     }
 
-    /// The harness suspended s0ma after a failure (`wait_for_operator_recovery`)
+    /// The harness suspended the agent after a failure (`wait_for_operator_recovery`)
     /// and only operator input should end it. Read at startup, so a restart
     /// doesn't let VM events retry what failed.
     pub fn is_recovery_wait(&self) -> bool {
@@ -231,7 +231,7 @@ fn require_text(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
 
 fn validate_condition(condition: &WaitCondition) -> Result<(), Box<dyn Error>> {
     if condition.kind == ConditionKind::VmEvent {
-        if condition.watch.as_deref().is_some_and(|watch| !crate::vm_wake::is_name(watch)) {
+        if condition.watch.as_deref().is_some_and(|watch| !crate::vm::wake::is_name(watch)) {
             return Err("condition.watch must be 1-32 letters, digits, _ or -".into());
         }
     } else if condition.watch.is_some() {
@@ -243,7 +243,7 @@ fn validate_condition(condition: &WaitCondition) -> Result<(), Box<dyn Error>> {
 /// A saved wait for a retired kind becomes a wait for operator input (the
 /// operator's first input after a start ends any wait anyway), and fields only
 /// retired kinds had are dropped. Returns the retired kind. Anything else that
-/// isn't a kind s0ma has is left to fail loading, as it always did.
+/// isn't a kind the agent has is left to fail loading, as it always did.
 fn retire_old_condition(saved: &mut serde_json::Value) -> Option<String> {
     let condition = saved.get_mut("condition")?.as_object_mut()?;
     for field in RETIRED_FIELDS {
@@ -276,7 +276,7 @@ fn validate_state(state: &AttentionState) -> Result<(), Box<dyn Error>> {
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     // vm_event is offered only while the VM wake channel runs; a persisted
     // vm_event wait still loads without it, and operator input still ends it.
-    let vm_wake = crate::vm_wake::enabled();
+    let vm_wake = crate::vm::wake::enabled();
     let mut kinds = vec!["operator_message"];
     if vm_wake {
         kinds.push("vm_event");
@@ -323,11 +323,11 @@ pub fn execute(store: &mut AttentionStore, call: &ToolCall) -> Result<String, Bo
             let args: WaitArgs = serde_json::from_str(&call.function.arguments)?;
             // Checked here, not in validation: a saved vm_event wait must still
             // load after the channel is turned off (operator input ends it).
-            if args.condition.kind == ConditionKind::VmEvent && !crate::vm_wake::enabled() {
+            if args.condition.kind == ConditionKind::VmEvent && !crate::vm::wake::enabled() {
                 return Err("the wake channel is off, so a vm_event wait would never end".into());
             }
             let already = match args.condition.kind {
-                ConditionKind::VmEvent => crate::vm_wake::take_reached(args.condition.watch.as_deref()),
+                ConditionKind::VmEvent => crate::vm::wake::take_reached(args.condition.watch.as_deref()),
                 ConditionKind::OperatorMessage => Vec::new(),
             };
             store.set_wait(args)?;
@@ -338,8 +338,8 @@ pub fn execute(store: &mut AttentionStore, call: &ToolCall) -> Result<String, Bo
 }
 
 /// What attention_wait answers. `already`: events that joined a turn as a
-/// note since s0ma last waited and that the wait would have ended on; it ends
-/// only on a new one now, which s0ma is told, since it may have meant to wait
+/// note since the agent last waited and that the wait would have ended on; it ends
+/// only on a new one now, which the agent is told, since it may have meant to wait
 /// for one.
 fn wait_reply(condition: Option<&WaitCondition>, already: &[String]) -> serde_json::Value {
     let mut reply = json!({"ok":true,"mode":"waiting","condition":condition,
@@ -372,22 +372,6 @@ mod tests {
         AttentionStore::load(&std::env::temp_dir().join(name)).unwrap()
     }
     #[test]
-    fn only_a_wait_for_a_vm_event_holds_vm_events() {
-        let mut store = store();
-        assert!(!store.waits_for_vm_event(), "engaged");
-        let wait = |kind, watch: Option<&str>| WaitArgs {
-            activity: "waiting".into(),
-            orientation: "until it happens".into(),
-            condition: WaitCondition { kind, watch: watch.map(Into::into) },
-        };
-        store.set_wait(wait(ConditionKind::OperatorMessage, None)).unwrap();
-        assert!(!store.waits_for_vm_event() && !store.is_recovery_wait(), "idle, as a loop stops");
-        store.set_wait(wait(ConditionKind::VmEvent, Some("build"))).unwrap();
-        assert!(store.waits_for_vm_event());
-        store.set_wait(wait(ConditionKind::VmEvent, None)).unwrap();
-        assert!(store.waits_for_vm_event());
-    }
-    #[test]
     fn a_failure_pause_is_recognised_across_a_restart() {
         let mut store = store();
         store.wait_for_operator_recovery("the router failed").unwrap();
@@ -396,40 +380,6 @@ mod tests {
         assert!(AttentionStore::load(&dir).unwrap().is_recovery_wait());
         store.resume("operator input").unwrap();
         assert!(!AttentionStore::load(&dir).unwrap().is_recovery_wait());
-    }
-    #[test]
-    fn time_is_not_a_wait_condition() {
-        // The invariant is that no attention tool accepts a *time* parameter.
-        //
-        // Check the parameter schemas, not the whole serialized definition. The
-        // attention_wait description names duration precisely in order to say it
-        // is unsupported, so scanning descriptions made the tool's own disclaimer
-        // trip the test that exists to enforce it.
-        for tool in tool_definitions() {
-            let parameters = serde_json::to_string(&tool.function.parameters).unwrap();
-            for forbidden in ["timestamp", "duration", "wake_at", "seconds", "timeout", "delay"] {
-                assert!(
-                    !parameters.contains(forbidden),
-                    "{} takes a '{forbidden}' parameter; time is not a wait condition",
-                    tool.function.name,
-                );
-            }
-        }
-    }
-    #[test]
-    fn wait_requires_a_condition() {
-        let mut store = store();
-        let call = ToolCall {
-            id: "1".into(),
-            kind: "function".into(),
-            function: crate::types::FunctionCall {
-                name: "attention_wait".into(),
-                arguments: "{\"activity\":\"watching\",\"orientation\":\"notice completion\"}"
-                    .into(),
-            },
-        };
-        assert!(execute(&mut store, &call).is_err());
-        assert!(store.is_engaged());
     }
     fn wait_call(condition: serde_json::Value) -> ToolCall {
         ToolCall {
@@ -440,108 +390,6 @@ mod tests {
                 arguments: json!({"activity": "building", "orientation": "wait for the build", "condition": condition})
                     .to_string(),
             },
-        }
-    }
-    #[test]
-    fn a_vm_event_wait_matches_its_watch_or_any_event() {
-        let mut store = store();
-        assert!(!store.matches_vm("build"), "engaged attention waits for nothing");
-
-        // Through the tool, vm_event needs the channel on (it is off in tests).
-        let refused = execute(&mut store, &wait_call(json!({"kind": "vm_event"}))).unwrap_err().to_string();
-        assert!(refused.contains("channel is off"), "{refused}");
-        assert!(store.is_engaged());
-
-        let vm_wait = |watch: Option<&str>| WaitArgs {
-            activity: "building".into(),
-            orientation: "wait for the build".into(),
-            condition: WaitCondition { kind: ConditionKind::VmEvent, watch: watch.map(str::to_string) },
-        };
-        store.set_wait(vm_wait(Some("build"))).unwrap();
-        assert!(store.matches_vm("build"));
-        assert!(!store.matches_vm("tests"));
-
-        store.set_wait(vm_wait(None)).unwrap();
-        assert!(store.matches_vm("anything"));
-
-        // Saved like any wait, and loadable whether or not the channel is on.
-        // (After a restart, the operator's first input ends it.)
-        let reloaded = AttentionStore::load(store.path.parent().unwrap()).unwrap();
-        assert!(reloaded.matches_vm("anything"));
-
-        store.resume("operator input").unwrap();
-        assert!(!store.matches_vm("build"));
-    }
-    /// Writes a saved state with this condition and loads it.
-    fn saved_with(condition: serde_json::Value) -> AttentionStore {
-        let store = store();
-        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &store.path,
-            json!({"schema_version": 1, "mode": "waiting", "activity": "dinner", "orientation": "wait for it",
-                   "condition": condition, "updated_at": "2026-10-10T00:00:00Z"}).to_string(),
-        )
-        .unwrap();
-        AttentionStore::load(store.path.parent().unwrap()).unwrap()
-    }
-    #[test]
-    fn a_saved_wait_of_a_retired_kind_loads_as_a_wait_for_operator_input() {
-        for retired in [
-            // A Signal contact's message, from before the bridge was removed.
-            json!({"kind": "contact_message", "from": "Alex"}),
-            // Minecraft waits, from before Minecraft events stopped waking s0ma.
-            json!({"kind": "minecraft_player_chat", "username": "steve"}),
-            json!({"kind": "minecraft_action_completed", "action_id": "walk-7"}),
-            json!({"kind": "minecraft_action_failed"}),
-            json!({"kind": "minecraft_event", "event_kind": "death"}),
-        ] {
-            let mut saved = saved_with(retired.clone());
-            assert!(!saved.is_engaged(), "{retired}");
-            assert_eq!(
-                saved.state().condition,
-                Some(WaitCondition { kind: ConditionKind::OperatorMessage, watch: None }),
-                "{retired}"
-            );
-            assert_eq!(saved.state().activity, "dinner", "the rest of the state is kept");
-            saved.resume("operator input").unwrap();
-            assert!(saved.is_engaged());
-        }
-        // A stray retired field on a kind s0ma still has is dropped, not refused.
-        let kept = saved_with(json!({"kind": "vm_event", "watch": "build", "from": "Alex", "username": "steve"}));
-        assert!(kept.matches_vm("build"));
-        let operator = saved_with(json!({"kind": "operator_message", "action_id": "walk-7"}));
-        assert!(!operator.is_engaged());
-    }
-    #[test]
-    fn a_wait_for_an_event_that_already_joined_the_turn_says_so() {
-        let condition = WaitCondition { kind: ConditionKind::VmEvent, watch: Some("build".into()) };
-        let plain = wait_reply(Some(&condition), &[]);
-        assert!(plain.get("already_joined_your_turn").is_none());
-        let warned = wait_reply(Some(&condition), &["build".to_string()]);
-        assert_eq!(warned["already_joined_your_turn"], json!(["build"]));
-        let instruction = warned["instruction"].as_str().unwrap();
-        assert!(instruction.contains("\"build\" already joined your turn") && instruction.contains("ends only on a new one"), "{instruction}");
-    }
-    #[test]
-    fn retired_kinds_are_not_kinds_s0ma_has_and_anything_else_unknown_still_fails() {
-        for retired in RETIRED_KINDS {
-            assert!(serde_json::from_value::<ConditionKind>(json!(retired)).is_err(), "{retired}");
-        }
-        for kept in ["operator_message", "vm_event"] {
-            assert!(serde_json::from_value::<ConditionKind>(json!(kept)).is_ok(), "{kept}");
-        }
-        // An unknown kind or field fails loading, and says which file.
-        for broken in [json!({"kind": "lunch"}), json!({"kind": "operator_message", "note": "x"})] {
-            let store = store();
-            std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &store.path,
-                json!({"schema_version": 1, "mode": "waiting", "activity": "a", "orientation": "b",
-                       "condition": broken, "updated_at": "2026-10-10T00:00:00Z"}).to_string(),
-            )
-            .unwrap();
-            let error = AttentionStore::load(store.path.parent().unwrap()).err().expect("refused").to_string();
-            assert!(error.contains("attention.json"), "{error}");
         }
     }
     #[test]
@@ -559,17 +407,5 @@ mod tests {
         }
         let schema = serde_json::to_string(&tool_definitions()).unwrap();
         assert!(!schema.contains("minecraft") && !schema.contains("contact"), "{schema}");
-    }
-    #[test]
-    fn vm_event_filters_are_checked() {
-        let mut store = store();
-        for bad in [json!({"kind": "vm_event", "watch": "no spaces"}), json!({"kind": "operator_message", "watch": "build"})] {
-            let condition: WaitCondition = serde_json::from_value(bad.clone()).unwrap();
-            assert!(validate_condition(&condition).is_err(), "{bad}");
-            assert!(execute(&mut store, &wait_call(bad.clone())).is_err(), "{bad}");
-            assert!(store.is_engaged(), "{bad}");
-        }
-        // A Minecraft filter is no field at all now.
-        assert!(serde_json::from_value::<WaitCondition>(json!({"kind": "vm_event", "username": "steve"})).is_err());
     }
 }

@@ -37,7 +37,7 @@
 //! * **Nothing is written.** The archive is opened read-only
 //!   (`Hippocampus::open_read_only`), the attach socket is not bound, and no
 //!   worker, watcher or reader is started. It is safe to run beside a live
-//!   s0ma, which matters because an eval probe usually does.
+//!   the agent, which matters because an eval probe usually does.
 //!
 //! # What it cannot promise
 //!
@@ -105,7 +105,7 @@ pub fn run(root: &Path, options: &Options) -> Result<(), Box<dyn std::error::Err
     // tools. This process never holds it, so the caller has to say which
     // variant it wants. `init` only reads a queue file; nothing is written.
     if options.assume_vm_wake {
-        crate::vm_wake::init(&data_dir);
+        crate::vm::wake::init(&data_dir);
     }
     if options.with_mcp {
         crate::mcp::init(root, &data_dir);
@@ -121,7 +121,7 @@ pub fn run(root: &Path, options: &Options) -> Result<(), Box<dyn std::error::Err
     // The [SKILLS] block and, through the catalog, whatever S0MA_SKILL_DENY
     // withholds. `skill_match::init` is deliberately skipped: the per-turn
     // match does not contribute to this block, and it would open the vector
-    // store a live s0ma may be using.
+    // store a live agent may be using.
     crate::skills::init(&root.join("skills"))?;
 
     if !options.with_mcp {

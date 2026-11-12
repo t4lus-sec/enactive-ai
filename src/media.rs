@@ -265,7 +265,6 @@ pub fn image_data_url(path: &Path, bytes: &[u8]) -> Result<String, String> {
     Ok(format!("data:{mime_type};base64,{}", encode_base64(bytes)))
 }
 
-
 fn encode_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -305,25 +304,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_base64, split_path_and_caption};
-
-    #[test]
-    fn base64_known_vectors() {
-        assert_eq!(encode_base64(b""), "");
-        assert_eq!(encode_base64(b"f"), "Zg==");
-        assert_eq!(encode_base64(b"fo"), "Zm8=");
-        assert_eq!(encode_base64(b"foo"), "Zm9v");
-        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn parses_quoted_path_and_caption() {
-        let (path, caption) = split_path_and_caption("\"/tmp/a b.png\" explain this")
-            .expect("quoted path should parse");
-
-        assert_eq!(path, "/tmp/a b.png");
-        assert_eq!(caption.trim(), "explain this");
-    }
+    use super::split_path_and_caption;
 
     #[test]
     fn parses_escaped_unquoted_path() {

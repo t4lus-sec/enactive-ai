@@ -1,9 +1,9 @@
-//! `/mistake`: flagging s0ma's mistakes during use, for nightly correction
+//! `/mistake`: flagging the agent's mistakes during use, for nightly correction
 //! training (`claude/mistake-capture-spec.md` §2–§4).
 //!
 //! The operator flags a model call the call store saved (calls.rs). A rewriter
 //! (qref's `mistake-rewrite`) proposes a minimally corrected response in the
-//! background; the operator reviews it (`/mistake view`, mistake_view.rs) and
+//! background; the operator reviews it (`/mistake view`, mistakes/view.rs) and
 //! approves it, edits it by hand, or discards it. Nothing here ever executes a
 //! corrected tool call (R2): a proposal is text to train on. The operator's
 //! note is the rewriter's hint and lives only in the mistake's own files (R3);
@@ -23,7 +23,9 @@
 //! ```
 //!
 //! Every change to a record and its history line happen under one lock file
-//! (`.lock`), so the review window may run as a process of its own beside s0ma.
+//! (`.lock`), so the review window may run as a process of its own beside the agent.
+
+pub(crate) mod view;
 
 use crate::calls::{self, CallRef, FlagEvent, Latest, PendingFlag, Store};
 use crate::llm::ToolDefinition;
@@ -54,7 +56,7 @@ const HELDOUT_FRACTION: f64 = 0.2;
 /// rewrites lost (and a regenerated week-old mistake lost at once). A process
 /// that is gone without a result is marked lost at the next look instead.
 const REWRITE_GIVE_UP: Duration = Duration::from_secs(12 * 3600);
-/// How often s0ma looks for rewrites it did not launch itself (one launched
+/// How often the agent looks for rewrites it did not launch itself (one launched
 /// before a restart, or by a review window running on its own).
 const WATCH_INTERVAL: Duration = Duration::from_secs(15);
 /// A lock file that names no process is broken after this long.
@@ -194,7 +196,7 @@ pub struct Record {
     /// The calls since the operator last spoke (or the turn began), oldest
     /// first and ending with the flagged one (`call_id`): the steps a
     /// correction may target. By the flagged call the mistake is often
-    /// already in what s0ma saw; correcting the step where it started is
+    /// already in what the agent saw; correcting the step where it started is
     /// what can teach anything. Empty on records from before: then the only
     /// step is `call_id`.
     #[serde(default)]
@@ -212,11 +214,11 @@ pub struct Record {
     /// correction may not quote it, and only the operator approves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flagged_by: Option<String>,
-    /// For s0ma's flags: the turn it flagged from, which its per-turn limit
+    /// For the agent's flags: the turn it flagged from, which its per-turn limit
     /// counts (the mistake's own turn may be an earlier one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flagged_in: Option<String>,
-    /// For s0ma's flags: the archive event it pointed at, if it did.
+    /// For the agent's flags: the archive event it pointed at, if it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointed_at: Option<u64>,
 }
@@ -826,6 +828,10 @@ impl Book {
                 .stderr(Stdio::from(err))
                 .env("S0MA_LLM_BASE_URL", &self.base_url)
                 .env("S0MA_LLM_MODEL", &self.model);
+            // The same server's key, when it takes one.
+            if let Some((name, key)) = crate::model_config::key_env() {
+                command.env(name, key);
+            }
             command.spawn().map_err(|e| format!("cannot start the rewriter: {e}"))
         })();
         match result {
@@ -862,7 +868,7 @@ impl Book {
         let lock = self.lock().ok()?;
         let mut record = self.load(n).ok()?;
         if record.attempts == attempt && record.state != State::Pending {
-            // Applied already, by the other process watching it (s0ma and a
+            // Applied already, by the other process watching it (the agent and a
             // review window of its own both may), or decided on since.
             return None;
         }
@@ -1385,11 +1391,6 @@ fn proposal_counts(proposal: &Proposal) -> String {
     }
 }
 
-#[cfg(test)]
-pub fn read_edit(path: &Path) -> Result<Response> {
-    read_edit_with_target(path).map(|(response, _)| response)
-}
-
 /// An edit file's response, and the step it corrects (None on edits made
 /// before stretches: the flagged call).
 fn read_edit_with_target(path: &Path) -> Result<(Response, Option<String>)> {
@@ -1418,7 +1419,6 @@ pub fn one_line(text: &str, max: usize) -> String {
         format!("{}…", flat.chars().take(max.saturating_sub(1)).collect::<String>())
     }
 }
-
 
 fn absolute(path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -1500,7 +1500,7 @@ pub fn take_statuses() -> Vec<String> {
     statuses().lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
 }
 
-// ------------------------------------------------------------------ the running s0ma's book
+// ------------------------------------------------------------------ the running agent's book
 
 static BOOK: OnceLock<Book> = OnceLock::new();
 
@@ -1512,7 +1512,7 @@ fn listing() -> &'static Mutex<Vec<CallRef>> {
     LISTING.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Start `/mistake` for this s0ma: the call store, the watcher for rewrites
+/// Start `/mistake` for this agent: the call store, the watcher for rewrites
 /// it is not waiting on, and the start-up notice.
 pub fn init(data_dir: &Path, wake: Arc<AtomicBool>) -> Option<String> {
     let _ = WAKE.set(wake);
@@ -1541,7 +1541,7 @@ pub fn init(data_dir: &Path, wake: Arc<AtomicBool>) -> Option<String> {
 }
 
 /// An attached terminal's `/mistake view`: the book only, for the review
-/// window (the calls and the watcher are the running s0ma's).
+/// window (the calls and the watcher are the running agent's).
 pub fn open_for_view(data_dir: &Path) {
     let _ = BOOK.get_or_init(|| Book::open(data_dir));
 }
@@ -1625,7 +1625,7 @@ pub enum Place {
     Turn,
     /// The local keyboard's steering pane while a turn runs: the review
     /// window opens over the paused transcript, as Ctrl+G's editor does, and
-    /// s0ma keeps working meanwhile (input.rs `open_mistake_view`).
+    /// the agent keeps working meanwhile (input.rs `open_mistake_view`).
     Steering,
 }
 
@@ -2043,18 +2043,18 @@ fn rewriting(record: &Record, now: &chrono::DateTime<chrono::Local>) -> String {
     format!("rewriting (attempt {}{started})", record.attempts.max(1))
 }
 
-// ------------------------------------------------------------------ s0ma's own flags
+// ------------------------------------------------------------------ the agent's own flags
 
-/// s0ma's tool: flag a mistake of its own, for the same rewrite and review as
+/// The agent's tool: flag a mistake of its own, for the same rewrite and review as
 /// the operator's `/mistake`.
 pub const TOOL: &str = "mistake_flag";
 
-/// At most this many of s0ma's own flags from one turn, and in any 24 hours:
+/// At most this many of the agent's own flags from one turn, and in any 24 hours:
 /// a flag costs a rewrite on the engine and a review of the operator's time.
 const SELF_FLAGS_PER_TURN: usize = 3;
 const SELF_FLAGS_PER_DAY: usize = 20;
 
-/// How far back an event s0ma points at may be: its newest this many calls.
+/// How far back an event the agent points at may be: its newest this many calls.
 /// It bounds the scan of the call store, and covers days of work.
 const EVENT_WITHIN_CALLS: usize = 2_000;
 
@@ -2102,7 +2102,7 @@ of (wk-NNNN, from weakness_list), to link them."}
     )]
 }
 
-/// What s0ma asked for, with the call that asked.
+/// What the agent asked for, with the call that asked.
 #[derive(Debug)]
 struct SelfFlag {
     reason: String,
@@ -2114,7 +2114,7 @@ struct SelfFlag {
     current_events: Vec<u64>,
 }
 
-/// Run `mistake_flag`. Always a JSON result for s0ma, never an error: a
+/// Run `mistake_flag`. Always a JSON result for the agent, never an error: a
 /// refusal says why.
 pub fn execute_tool(call: &ToolCall) -> String {
     #[derive(Deserialize)]
@@ -2140,7 +2140,7 @@ pub fn execute_tool(call: &ToolCall) -> String {
     let finished = bounded(
         TOOL_WAIT,
         move || log_own(book, recorder, &flag),
-        // Too late for s0ma's answer: the operator hears of a failure instead.
+        // Too late for the agent's answer: the operator hears of a failure instead.
         |result| {
             if let Err(error) = result {
                 push_status(format!("[mistake] s0ma's flag was not logged: {error}"));
@@ -2202,7 +2202,7 @@ where
     }
 }
 
-/// What can be checked on s0ma's thread, at once: the arguments, and which
+/// What can be checked on the agent's thread, at once: the arguments, and which
 /// call is asking.
 fn prepare_own(
     book: &Book,
@@ -2357,7 +2357,7 @@ fn log_own(book: &Book, recorder: &calls::Recorder, flag: &SelfFlag) -> Result<V
         }
         let combined = format!("{}\nAlso, from s0ma: {note}", open.note);
         let manual = open.current.as_deref().is_some_and(|rel| rel.starts_with("edits/"));
-        // s0ma's own flag, nothing of the operator's in it yet: drafted again with
+        // The agent's own flag, nothing of the operator's in it yet: drafted again with
         // both reasons. Otherwise the reason waits for the operator's `r`.
         let redraft = open.flagged_by.as_deref() == Some("s0ma") && open.state.waiting() && !manual;
         if redraft {
@@ -2415,24 +2415,6 @@ changes nothing now: if the mistake still matters, fix what it broke or tell the
         "note": "Logged for the operator to review; a correction is drafted in the background. This changes nothing now: if \
 the mistake still matters, fix what it broke or tell the operator.",
     }))
-}
-
-/// A command run to completion on this thread, for tests.
-#[cfg(test)]
-pub(crate) fn run_for_test(book: &Book, recorder: Option<&calls::Recorder>, input: &str, place: Place) -> Reply {
-    match parse(input).expect("a /mistake line") {
-        Ok(command) => match plan(book, recorder, command, place) {
-            Step::Done(reply) => reply,
-            Step::Flag { target, note, weakness } => complete_flag(book, recorder, &target, &note, weakness),
-            Step::Reopen(n) => reopen_reply(book, n),
-        },
-        Err(error) => Reply::Error(error),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn set_listing_for_test(calls: Vec<CallRef>) {
-    *listing().lock().unwrap() = calls;
 }
 
 #[cfg(test)]
@@ -2547,118 +2529,6 @@ mod tests {
     }
 
     #[test]
-    fn the_split_follows_the_stated_rule_on_fixed_vectors() {
-        // Shared with qref's tests: int(sha256("mistake-split:" + turn)[:8], 16) / 2**32 < 0.2,
-        // the values computed in Python.
-        for (turn, expected) in [
-            ("t-20261022T010403.345Z", Split::Heldout), // 0.1732
-            ("t-20261022T010406.345Z", Split::Heldout), // 0.1176
-            ("t-20261022T010408.345Z", Split::Heldout), // 0.1644
-            ("t-20261022T010400.345Z", Split::Train),   // 0.7039
-            ("t-20261022T010401.345Z", Split::Train),   // 0.8571
-            ("t-20261022T010402.345Z", Split::Train),   // 0.7848
-        ] {
-            assert_eq!(split_for(turn), expected, "{turn}");
-        }
-        let held = (0..10_000).filter(|i| split_for(&format!("t-{i}")) == Split::Heldout).count();
-        assert!((1_800..2_200).contains(&held), "{held} of 10000 held out");
-    }
-
-    #[test]
-    fn subcommands_are_recognised_only_as_exactly_their_grammar() {
-        let flag = |call, weakness: Option<&str>, note: &str| {
-            Some(Ok(Parsed::Flag { call, weakness: weakness.map(str::to_owned), note: note.into() }))
-        };
-        assert_eq!(parse("/mistake calls"), Some(Ok(Parsed::Calls)));
-        assert_eq!(parse("/mistake list"), Some(Ok(Parsed::List(Filter::Open))));
-        assert_eq!(parse("/mistake list waiting"), Some(Ok(Parsed::List(Filter::Waiting))));
-        assert_eq!(parse("/mistake list open"), Some(Ok(Parsed::List(Filter::Open))));
-        assert_eq!(parse("/mistake list all"), Some(Ok(Parsed::List(Filter::All))));
-        assert_eq!(parse("/mistake view"), Some(Ok(Parsed::View(None))));
-        assert_eq!(parse("/mistake view 12"), Some(Ok(Parsed::View(Some(12)))));
-        assert_eq!(parse("/mistake reopen #12"), Some(Ok(Parsed::Reopen(12))));
-        // Anything else is a note.
-        assert_eq!(parse("/mistake list the files before deleting them"), flag(None, None, "list the files before deleting them"));
-        assert_eq!(parse("/mistake calls the wrong endpoint"), flag(None, None, "calls the wrong endpoint"));
-        assert_eq!(parse("/mistake view of the log was wrong"), flag(None, None, "view of the log was wrong"));
-        assert_eq!(
-            parse("/mistake @3 --weakness wk-0027 said it  started ten minutes ago"),
-            flag(Some(3), Some("wk-0027"), "said it  started ten minutes ago")
-        );
-        assert_eq!(parse("/mistake --weakness=wk-0001 read the wrong log"), flag(None, Some("wk-0001"), "read the wrong log"));
-        // Mistyped subcommands and fragments are refused, not logged.
-        for typo in ["/mistake list edited", "/mistake lsit", "/mistake view12", "/mistake reopen 12 please", "/mistake calls 3", "/mistake wrong"] {
-            assert!(matches!(parse(typo), Some(Err(_))), "{typo}");
-        }
-        assert!(matches!(parse("/mistake"), Some(Err(_))));
-        assert!(matches!(parse("/mistake @3"), Some(Err(_))));
-        assert!(matches!(parse("/mistake @x note"), Some(Err(_))));
-        assert!(matches!(parse("/mistake @0 note"), Some(Err(_))));
-        assert!(matches!(parse("/mistake --weakness 27 note"), Some(Err(_))));
-        assert_eq!(parse("/mistakes are fine"), None);
-        assert_eq!(parse("hello /mistake"), None);
-    }
-
-    #[test]
-    fn canonical_json_is_sorted_compact_utf8() {
-        let value = json!({"b": 1, "a": "é\u{1b}\n", "c": [{"z": null, "y": true}]});
-        assert_eq!(canonical_json(&value), "{\"a\":\"é\\u001b\\n\",\"b\":1,\"c\":[{\"y\":true,\"z\":null}]}");
-    }
-
-    #[test]
-    fn the_whole_flow_runs_without_executing_a_corrected_tool_call() {
-        let (dir, _recorder, call) = with_call("r2");
-        let sentinel = dir.join("SENTINEL-EXECUTED");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&sentinel))), "0"));
-        let (record, launch) = book.log(&call, "said the build started ten minutes ago; it started at 09:02", None).unwrap();
-        assert!(matches!(launch, Launch::Started));
-        let record = settled(&book, record.mistake);
-        assert_eq!(record.state, State::Ready, "{record:?}");
-        assert_eq!(book.status_line(&record), format!(
-            "[mistake] #{0}: rewrite ready (2 spans, 41 of 812 tokens) — /mistake view {0}", record.mistake
-        ));
-        // Edit the proposal by hand through the form, then approve it.
-        let shown = book.shown(&record).unwrap();
-        let form = crate::mistake_view::to_form(&shown.response).replace("three hours ago.", "about three hours ago.");
-        let edited = crate::mistake_view::from_form(&form, |_| "call_fresh".into()).unwrap();
-        let rel = book.save_edit(record.mistake, &edited, &shown.file, &shown.target).unwrap();
-        let approved = book.approve(record.mistake, None).unwrap();
-        assert_eq!(approved.state, State::Edited);
-        let final_ = approved.final_.unwrap();
-        assert_eq!((final_.source.as_str(), final_.file.as_str()), ("manual", rel.as_str()));
-        assert_eq!(final_.corrected_sha256, response_sha256(&read_edit(&dir.join("mistakes").join(&rel)).unwrap()));
-        // The corrected call that would have touched the sentinel never ran.
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!sentinel.exists(), "a corrected tool call was executed");
-    }
-
-    #[test]
-    fn the_note_stays_in_the_mistake_files() {
-        let (dir, _recorder, call) = with_call("r3");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"));
-        let note = "SENTINEL-NOTE-7f3a: it started at 09:02";
-        let (record, _) = book.log(&call, note, None).unwrap();
-        settled(&book, record.mistake);
-        book.approve(record.mistake, None).unwrap();
-        // The rewriter gets it as its note file, and only there outside the record.
-        assert_eq!(fs::read_to_string(dir.join(format!("mistakes/notes/{}-1.txt", record.mistake))).unwrap(), note);
-        fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-            for entry in fs::read_dir(dir).unwrap().flatten() {
-                if entry.path().is_dir() { files(&entry.path(), out) } else { out.push(entry.path()) }
-            }
-        }
-        let mut all = Vec::new();
-        files(&dir, &mut all);
-        for path in all.iter().filter(|p| !p.starts_with(dir.join("mistakes"))) {
-            let mut bytes = fs::read(path).unwrap();
-            if path.extension().is_some_and(|e| e == "zst") {
-                bytes = zstd::decode_all(bytes.as_slice()).unwrap();
-            }
-            assert!(!String::from_utf8_lossy(&bytes).contains("SENTINEL-NOTE"), "the note leaked into {}", path.display());
-        }
-    }
-
-    #[test]
     fn every_transition_is_recorded_and_approval_needs_a_real_change() {
         let (dir, _recorder, call) = with_call("states");
         let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"));
@@ -2742,105 +2612,6 @@ mod tests {
     }
 
     #[test]
-    fn a_rewriter_that_fails_without_a_proposal_is_reported_with_its_output() {
-        let (dir, _recorder, call) = with_call("fail");
-        let book = Book::with_rewriter(&dir, "echo 'engine unreachable: 127.0.0.1:8001' >&2; exit 2".into());
-        let n = book.log(&call, "x", None).unwrap().0.mistake;
-        let record = settled(&book, n);
-        assert_eq!(record.state, State::Failed);
-        let error = record.error.unwrap();
-        assert!(error.contains("exited with status 2") && error.contains("engine unreachable"), "{error}");
-        // A failed one is edited from the original.
-        assert_eq!(book.shown(&book.load(n).unwrap()).unwrap().file, "original");
-        assert!(book.approve(n, None).unwrap_err().contains("nothing to approve yet"));
-    }
-
-    #[test]
-    fn a_result_that_arrives_after_it_was_superseded_changes_nothing() {
-        let (dir, _recorder, call) = with_call("superseded");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0.6"));
-        let n = book.log(&call, "x", None).unwrap().0.mistake;
-        // Regenerated while attempt 1 still runs.
-        book.regenerate(n, None).unwrap();
-        let record = settled(&book, n);
-        assert_eq!((record.state, record.proposal.as_deref()), (State::Ready, Some(format!("proposals/{n}-2.json").as_str())));
-        // Attempt 1 finished first and was recorded as superseded.
-        let lines = history(&dir);
-        assert!(lines.iter().any(|l| l["detail"].as_str().is_some_and(|d| d.starts_with("rewrite 1 finished after it was superseded"))));
-        // A late result never overrides an operator's decision either.
-        book.approve(n, None).unwrap();
-        assert_eq!(book.finish_rewrite(n, 2, Some(0)), None);
-        assert_eq!(book.load(n).unwrap().state, State::Approved);
-    }
-
-    #[test]
-    fn a_restart_picks_up_rewrites_it_did_not_launch() {
-        let (dir, _recorder, call) = with_call("restart");
-        let book = Book::with_rewriter(&dir, "true".into());
-        let mut dead = Command::new("true").spawn().unwrap();
-        let dead_pid = dead.id();
-        dead.wait().unwrap();
-        let pending = |n: u64, pid: u32| Record {
-            mistake: n,
-            logged_at: now(),
-            call_id: call.call_id.clone(),
-            turn_id: call.turn_id.clone(),
-            call_in_turn: 1,
-            note: "x".into(),
-            notes: Vec::new(),
-            split: Split::Train,
-            split_key: call.turn_id.clone(),
-            weakness: None,
-            state: State::Pending,
-            attempts: 1,
-            proposal: None,
-            current: None,
-            final_: None,
-            before: None,
-            rewrite: Some(Rewrite { attempt: 1, launched_at: now(), pid: Some(pid), log: String::new(), exit_file: String::new() }),
-            error: None,
-            discard_reason: None,
-            stretch: Vec::new(),
-            target: None,
-            target_by: None,
-            flagged_by: None,
-            flagged_in: None,
-            pointed_at: None,
-        };
-        // Finished while s0ma was down: proposal and exit status on disk.
-        book.save(&pending(1, dead_pid)).unwrap();
-        let mut ready = proposal("ready", Some(corrected(&dir.join("x"))));
-        ready["mistake"] = json!(1);
-        ready["attempt"] = json!(1);
-        write_atomic(&dir.join("mistakes/proposals/1-1.json"), ready.to_string().as_bytes()).unwrap();
-        write_atomic(&dir.join("mistakes/logs/1-1.exit"), b"0\n").unwrap();
-        // Its process is gone and it left nothing.
-        book.save(&pending(2, dead_pid)).unwrap();
-        // Still running (this test's own pid stands in for it).
-        book.save(&pending(3, std::process::id())).unwrap();
-
-        let lines = book.reconcile();
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(book.load(1).unwrap().state, State::Ready);
-        let lost = book.load(2).unwrap();
-        assert_eq!(lost.state, State::Failed);
-        assert!(lost.error.unwrap().starts_with("rewrite lost"));
-        assert_eq!(book.load(3).unwrap().state, State::Pending);
-        assert_eq!(history(&dir).iter().filter(|l| l["by"] == "harness").count(), 1);
-    }
-
-    #[test]
-    fn flagging_returns_at_once_while_the_rewriter_runs() {
-        let (dir, _recorder, call) = with_call("fast");
-        let book = Book::with_rewriter(&dir, "sleep 3".into());
-        let started = Instant::now();
-        let (record, _) = book.log(&call, "x", None).unwrap();
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(250), "logging took {took:?}");
-        assert_eq!(record.state, State::Pending);
-    }
-
-    #[test]
     fn the_approval_hash_is_of_the_object_as_the_file_holds_it() {
         let (dir, _recorder, call) = with_call("hash");
         // A proposal whose `corrected` leaves out an empty tool_calls list.
@@ -2866,108 +2637,6 @@ mod tests {
         assert!(error.contains("changed since it was shown"), "{error}");
         assert_eq!(book.load(n).unwrap().state, State::Ready);
         assert_eq!(book.approve(n, Some(&format!("proposals/{n}-1.json"))).unwrap().state, State::Approved);
-    }
-
-    #[test]
-    fn a_failed_proposal_with_exit_one_is_failed_with_its_error() {
-        let (dir, _recorder, call) = with_call("exit1");
-        let mut failed = proposal("failed", None);
-        failed["error"] = json!("the engine refused the request: context too long");
-        let template = format!("{}; exit 1", stub(&dir, &failed, "0"));
-        let book = Book::with_rewriter(&dir, template);
-        let n = book.log(&call, "wrong elapsed time", None).unwrap().0.mistake;
-        let record = settled(&book, n);
-        assert_eq!((record.state, record.error.as_deref()), (State::Failed, Some("the engine refused the request: context too long")));
-        assert_eq!(record.proposal.as_deref(), Some(format!("proposals/{n}-1.json").as_str()));
-    }
-
-    #[test]
-    fn the_rewriter_runs_once_per_attempt_after_its_record_is_on_disk() {
-        let (dir, _recorder, call) = with_call("once");
-        let count = dir.join("launches");
-        // The rewriter reads its record first, as qref does: it must already
-        // say pending at this attempt.
-        let template = format!(
-            "echo x >> {}; grep -q '\"state\": \"pending\"' {{data}}/mistakes/{{mistake}}.json && \
-             grep -q '\"attempts\": {{attempt}}' {{data}}/mistakes/{{mistake}}.json && {}",
-            crate::util::shell_quote(&count.to_string_lossy()),
-            stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0")
-        );
-        let book = Book::with_rewriter(&dir, template);
-        let n = book.log(&call, "wrong elapsed time", None).unwrap().0.mistake;
-        assert_eq!(settled(&book, n).state, State::Ready);
-        book.regenerate(n, None).unwrap();
-        assert_eq!(settled(&book, n).state, State::Ready);
-        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
-    }
-
-    #[test]
-    fn discarding_waits_for_the_rewrite_and_a_result_is_applied_once() {
-        let (dir, _recorder, call) = with_call("once-applied");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0.5"));
-        let n = book.log(&call, "wrong elapsed time", None).unwrap().0.mistake;
-        assert!(book.discard(n, None).unwrap_err().contains("still running"));
-        settled(&book, n);
-        // The record is saved before its history line, both under the lock:
-        // wait for the waiter to let go of it before counting.
-        drop(book.lock().unwrap());
-        // Applied again by another watcher: nothing changes, nothing is written.
-        let before = history(&dir).len();
-        assert_eq!(book.finish_rewrite(n, 1, Some(0)), None);
-        assert_eq!(history(&dir).len(), before);
-        assert_eq!(book.discard(n, Some("dup")).unwrap().state, State::Discarded);
-    }
-
-    #[test]
-    fn a_hung_rewrite_is_given_up_after_twelve_hours() {
-        let (dir, _recorder, call) = with_call("hung");
-        let book = Book::with_rewriter(&dir, "sleep 30".into());
-        let n = book.log(&call, "wrong elapsed time", None).unwrap().0.mistake;
-        // Still running, launched by this process: left alone…
-        assert!(book.reconcile().is_empty());
-        // …until it is twelve hours old.
-        let mut record = book.load(n).unwrap();
-        record.rewrite.as_mut().unwrap().launched_at =
-            (chrono::Local::now() - chrono::Duration::hours(13)).to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
-        book.save(&record).unwrap();
-        let lines = book.reconcile();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let record = book.load(n).unwrap();
-        assert_eq!(record.state, State::Failed);
-        assert!(record.error.unwrap().contains("12 hours"));
-        if let Some(pid) = record.rewrite.and_then(|r| r.pid) {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-        }
-    }
-
-    #[test]
-    fn the_keyboard_path_answers_at_once_even_while_the_lock_is_held() {
-        let (dir, recorder, _call) = with_call("keyboard");
-        let book: &'static Book =
-            Box::leak(Box::new(Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"))));
-        let recorder: &'static calls::Recorder = Box::leak(Box::new(recorder));
-        let lock = lock_mistakes(&dir, Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
-        let Ok(command) = parse("/mistake KEYBOARD-PATH said the build started ten minutes ago").unwrap() else { panic!() };
-        let reply = dispatch(book, Some(recorder), command, Place::Turn);
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(50), "the keyboard thread waited {took:?}");
-        assert!(matches!(&reply, Reply::Text(t) if t.contains("— logging")), "{reply:?}");
-        assert!(book.all().unwrap().is_empty(), "nothing can be logged while the lock is held");
-        drop(lock);
-        let record = wait_logged(book);
-        assert!(record.note.starts_with("KEYBOARD-PATH"));
-    }
-
-    fn wait_logged(book: &Book) -> Record {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Some(record) = book.all().unwrap().into_iter().next() {
-                return record;
-            }
-            assert!(Instant::now() < deadline, "never logged");
-            std::thread::sleep(Duration::from_millis(20));
-        }
     }
 
     /// A data folder with one turn of four calls, the operator steering after the
@@ -3005,68 +2674,6 @@ mod tests {
     }
 
     #[test]
-    fn a_mistake_covers_the_calls_since_the_operator_last_spoke() {
-        let (dir, _recorder, refs) = with_stretch("stretch");
-        assert_eq!(refs.iter().map(|r| (r.call_in_turn, r.stretch)).collect::<Vec<_>>(), [(1, 0), (2, 0), (3, 1), (4, 1)]);
-        let book = Book::with_rewriter(&dir, "exit 2".into());
-        let (record, _) = book.log(&refs[3], "misread the log two steps back", None).unwrap();
-        let steps: Vec<&str> = record.stretch.iter().map(|s| s.call_id.as_str()).collect();
-        assert_eq!(steps, [refs[2].call_id.as_str(), refs[3].call_id.as_str()], "since the operator steered");
-        assert_eq!(record.step_of(&refs[3].call_id), Some((2, 2)));
-        // Flagged before the steer: the turn's start to that call.
-        let (earlier, _) = book.log(&refs[1], "the first step was already wrong", None).unwrap();
-        assert_eq!(earlier.stretch.iter().map(|s| s.call_in_turn).collect::<Vec<_>>(), [1, 2]);
-        // The store keeps every step for retention.
-        let kept = calls::referenced_calls_for_test(&dir);
-        assert!(refs.iter().all(|r| kept.contains(&r.call_id)), "{kept:?}");
-        // Update lines sit between the turn's calls; the scan goes past them.
-        let index = fs::read_to_string(Store::at(&dir).index_path()).unwrap();
-        assert!(index.lines().filter(|l| l.contains("\"update\":true")).count() >= 3, "{index}");
-    }
-
-    #[test]
-    fn a_flag_right_after_a_steer_reaches_the_steps_before_it() {
-        let (dir, _recorder, refs) = with_stretch("after-steer");
-        // Step three is the first call after the operator steered: the steer was
-        // about the steps before it.
-        let steps: Vec<u32> = Store::at(&dir).stretch_of(&refs[2]).unwrap().iter().map(|s| s.call_in_turn).collect();
-        assert_eq!(steps, [1, 2, 3]);
-    }
-
-    #[test]
-    fn a_call_saved_before_stretches_is_its_own_only_step() {
-        let (dir, _recorder, refs) = with_stretch("legacy");
-        let index = Store::at(&dir).index_path();
-        let old: String = fs::read_to_string(&index)
-            .unwrap()
-            .lines()
-            .map(|line| {
-                let mut value: Value = serde_json::from_str(line).unwrap();
-                value.as_object_mut().unwrap().remove("stretch");
-                format!("{value}\n")
-            })
-            .collect();
-        fs::write(&index, old).unwrap();
-        let steps: Vec<String> = Store::at(&dir).stretch_of(&refs[3]).unwrap().into_iter().map(|s| s.call_id).collect();
-        assert_eq!(steps, [refs[3].call_id.clone()], "no stretch recorded: nothing to go by");
-    }
-
-    #[test]
-    fn a_record_and_proposal_from_before_steps_behave_as_before() {
-        let (dir, _recorder, call) = with_call("old-shapes");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"));
-        let (record, _) = book.log(&call, "wrong elapsed time", None).unwrap();
-        let mut old: Value = serde_json::to_value(settled(&book, record.mistake)).unwrap();
-        for field in ["stretch", "target", "target_by"] {
-            old.as_object_mut().unwrap().remove(field);
-        }
-        let old: Record = serde_json::from_value(old).unwrap();
-        assert_eq!((old.target_id(), old.step_of(&call.call_id)), (call.call_id.as_str(), Some((1, 1))));
-        let shown = book.shown(&old).unwrap();
-        assert_eq!(shown.target, call.call_id, "a proposal without target_call_id corrects the call flagged");
-    }
-
-    #[test]
     fn a_step_the_operator_chose_survives_a_rewrite_that_honours_it() {
         let (dir, _recorder, refs) = with_stretch("chosen");
         let first = &refs[2];
@@ -3084,59 +2691,6 @@ mod tests {
         book.regenerate(record.mistake, None).unwrap();
         let record = settled(&book, record.mistake);
         assert_eq!((record.target_id(), record.target_by.as_deref()), (first.call_id.as_str(), Some("operator")));
-    }
-
-    #[test]
-    fn a_rewrite_that_ignores_the_chosen_step_says_so() {
-        let (dir, _recorder, refs) = with_stretch("ignored");
-        // An old qref: no target_call_id, so it corrects the call flagged.
-        let template = format!("if [ {{attempt}} = 1 ]; then exit 2; fi; {}", stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"));
-        let book = Book::with_rewriter(&dir, template);
-        let (record, _) = book.log(&refs[3], "misread the log a step back", None).unwrap();
-        settled(&book, record.mistake);
-        book.retarget(record.mistake, &refs[2].call_id).unwrap();
-        book.regenerate(record.mistake, None).unwrap();
-        // Applied here rather than by the waiter, to see its status line.
-        wait_until(&book, record.mistake, |_| dir.join("mistakes/logs/1-2.exit").exists());
-        let line = book.finish_rewrite(record.mistake, 2, Some(0));
-        let record = settled(&book, record.mistake);
-        assert_eq!((record.target_id(), record.target_by.as_deref()), (refs[3].call_id.as_str(), Some("rewriter")));
-        let said = line.unwrap_or_else(|| history(&dir).last().unwrap()["detail"].as_str().unwrap().to_owned());
-        assert!(said.contains("another step than the one you chose (step 1; t goes back to it)"), "{said}");
-    }
-
-    #[test]
-    fn an_edit_is_saved_only_against_the_version_and_step_shown() {
-        let (dir, _recorder, refs) = with_stretch("stale-edit");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"));
-        let (record, _) = book.log(&refs[3], "misread the log a step back", None).unwrap();
-        let record = settled(&book, record.mistake);
-        let shown = book.shown(&record).unwrap();
-        let edited = Response { content: "Fixed.".into(), ..shown.response.clone() };
-        // Shown the original of step one, but the record has moved on.
-        assert!(book.save_edit(record.mistake, &edited, "original", &refs[2].call_id).unwrap_err().contains("changed since"));
-        // Approved meanwhile: nothing saved.
-        book.approve(record.mistake, Some(&shown.file)).unwrap();
-        assert!(book.save_edit(record.mistake, &edited, &shown.file, &shown.target).unwrap_err().contains("approved now"));
-    }
-
-    #[test]
-    fn going_back_to_a_step_shows_its_newest_version() {
-        let (dir, _recorder, refs) = with_stretch("newest");
-        let first = &refs[2];
-        let mut targeted = proposal("ready", Some(json!({"content": "Checked first.", "reasoning_content": "", "tool_calls": []})));
-        targeted["target_call_id"] = json!(first.call_id);
-        let book = Book::with_rewriter(&dir, stub(&dir, &targeted, "0"));
-        let (record, _) = book.log(&refs[3], "misread the log a step back", None).unwrap();
-        let n = settled(&book, record.mistake).mistake;
-        // An edit of step one, then a newer proposal for it.
-        let shown = book.shown(&book.load(n).unwrap()).unwrap();
-        book.save_edit(n, &Response { content: "Mine.".into(), ..shown.response.clone() }, &shown.file, &shown.target).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        book.regenerate(n, None).unwrap();
-        assert_eq!(settled(&book, n).current.as_deref(), Some("proposals/1-2.json"));
-        book.retarget(n, &refs[3].call_id).unwrap();
-        assert_eq!(book.retarget(n, &first.call_id).unwrap().current.as_deref(), Some("proposals/1-2.json"), "the newer one");
     }
 
     #[test]
@@ -3189,9 +2743,9 @@ mod tests {
         assert!(record.error.unwrap().contains("not a step of this mistake's stretch"));
     }
 
-    // ---- s0ma's own flags ----
+    // ---- the agent's own flags ----
 
-    /// A turn left open, as while s0ma's tools run. An earlier turn has one
+    /// A turn left open, as while the agent's tools run. An earlier turn has one
     /// call (event 101). Then each step is saved in order with one archive
     /// event each (102, 103, …): "steer" marks the operator's message joining the
     /// turn, and a step's tools are the tool calls it made. The last step is
@@ -3244,70 +2798,6 @@ mod tests {
     }
 
     #[test]
-    fn s0ma_flags_its_latest_step_before_the_call_that_flags() {
-        let (dir, recorder, refs, _turn) =
-            live_turn("own-default", &[("one", &[]), ("two", &[]), ("steer", &[]), ("three", &[]), ("flag", &[TOOL])]);
-        let book = Book::with_rewriter(&dir, "exit 2".into());
-        let result = flag_as_s0ma(&book, &recorder, "I misread the log at step three", None).unwrap();
-        assert_eq!(result["flagged"], true, "{result}");
-        assert!(result["step"].as_str().unwrap().starts_with("call 3 of this turn (“reply: three”)"), "{result}");
-        let record = book.load(result["mistake"].as_u64().unwrap()).unwrap();
-        assert_eq!(record.call_id, refs[2].call_id);
-        assert_eq!((record.flagged_by.as_deref(), record.flagged_in.as_deref()), (Some("s0ma"), Some(refs[3].turn_id.as_str())));
-        // The first step after the operator's message: the steps before it too.
-        assert_eq!(record.steps().iter().map(|s| s.call_in_turn).collect::<Vec<_>>(), [1, 2, 3]);
-        assert_eq!(history(&dir)[0]["by"], "s0ma", "history says who flagged it");
-        let statuses = take_statuses();
-        assert!(statuses.iter().any(|s| s.starts_with(&format!("[mistake] s0ma flagged #{} (call 3 of turn ", record.mistake))), "{statuses:?}");
-        // The same reason again: nothing new.
-        let again = flag_as_s0ma(&book, &recorder, "I  misread the LOG at step three", None).unwrap();
-        assert_eq!(again["already_flagged"].as_u64(), Some(record.mistake), "{again}");
-        // Another reason for that step: added to the same mistake, and since
-        // nothing of the operator's is in it yet, drafted again with both.
-        settled(&book, record.mistake);
-        let more = flag_as_s0ma(&book, &recorder, "and I skipped checking the exit status", None).unwrap();
-        assert_eq!(more["added_to"].as_u64(), Some(record.mistake), "{more}");
-        let record = book.load(record.mistake).unwrap();
-        assert!(record.note.contains("Also, from s0ma: and I skipped checking the exit status"), "{}", record.note);
-        assert_eq!(record.attempts, 2, "rewritten with both reasons");
-        assert_eq!(book.all().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn pointing_at_an_event_covers_the_step_that_made_it_and_the_ones_after() {
-        // Step one ran a command; the operator wrote twice; steps two and three acted
-        // on its result. The event of step one's result reaches all three.
-        let (dir, recorder, refs, _turn) = live_turn(
-            "own-event",
-            &[("one", &["vm_exec"]), ("steer", &[]), ("two", &[]), ("steer", &[]), ("three", &[]), ("flag", &[TOOL])],
-        );
-        let book = Book::with_rewriter(&dir, "exit 2".into());
-        let result = flag_as_s0ma(&book, &recorder, "I misread the command's output", Some(102)).unwrap();
-        let record = book.load(result["mistake"].as_u64().unwrap()).unwrap();
-        assert_eq!(record.call_id, refs[2].call_id, "the newest step after it");
-        assert_eq!(record.steps().iter().map(|s| s.call_in_turn).collect::<Vec<_>>(), [1, 2, 3]);
-        assert_eq!(record.pointed_at, Some(102));
-        assert!(record.note.ends_with("(s0ma pointed at archive event 102, from step 1 of 3.)"), "{}", record.note);
-        // The flagging call's own event is not in the store yet: its latest step, as without one.
-        assert_eq!(flag_as_s0ma(&book, &recorder, "I misread the command's output", Some(105)).unwrap()["already_flagged"].as_u64(), Some(record.mistake));
-        // Not one of s0ma's steps, or too old.
-        for missing in [999, 50] {
-            let error = flag_as_s0ma(&book, &recorder, "something went wrong there", Some(missing)).unwrap_err();
-            assert!(error.contains("isn't one of your steps"), "{missing}: {error}");
-        }
-    }
-
-    #[test]
-    fn an_earlier_turns_event_flags_that_turn() {
-        let (dir, recorder, _refs, _turn) = live_turn("own-earlier", &[("one", &[]), ("flag", &[TOOL])]);
-        let book = Book::with_rewriter(&dir, "exit 2".into());
-        let result = flag_as_s0ma(&book, &recorder, "my last answer was wrong", Some(101)).unwrap();
-        let record = book.load(result["mistake"].as_u64().unwrap()).unwrap();
-        assert_ne!(record.turn_id, record.flagged_in.clone().unwrap(), "the mistake's turn, not this one");
-        assert!(result["step"].as_str().unwrap().contains("of turn t-"), "{result}");
-    }
-
-    #[test]
     fn a_flag_or_report_is_never_taken_for_the_mistake() {
         // A refused flag and a weakness report came first: the step before
         // them is the one meant.
@@ -3324,178 +2814,5 @@ mod tests {
         let result = flag_as_s0ma(&book, &recorder, "my last answer was wrong", None).unwrap();
         assert!(result["step"].as_str().unwrap().contains("(“reply: earlier turn”)"), "{result}");
     }
-
-    #[test]
-    fn the_limits_count_where_s0ma_flagged_from() {
-        let (dir, recorder, refs, _turn) = live_turn("own-limits", &[("one", &[]), ("flag", &[TOOL])]);
-        let book = Book::with_rewriter(&dir, "exit 2".into());
-        assert!(prepare_own(&book, &recorder, "wrong".into(), None, None).unwrap_err().contains("in a sentence"));
-        // Three flags from this turn, on mistakes in other turns.
-        for n in 1..=SELF_FLAGS_PER_TURN {
-            let options = LogOptions {
-                by: Some("s0ma".into()),
-                flagged_in: Some(refs[0].turn_id.clone()),
-                ..LogOptions::default()
-            };
-            let mut record = book.log_with(&refs[0], &format!("earlier flag number {n}"), None, options).unwrap().0;
-            record.turn_id = format!("t-other-{n}");
-            record.state = State::Discarded;
-            book.save(&record).unwrap();
-        }
-        let refused = flag_as_s0ma(&book, &recorder, "one more mistake this turn", None).unwrap_err();
-        assert!(refused.contains("this turn already"), "{refused}");
-    }
-
-    #[test]
-    fn a_slow_flag_finishes_in_the_background_and_its_result_is_not_lost() {
-        let fast = bounded(Duration::from_secs(5), || Ok(serde_json::json!({"ok": true})), |_| panic!("not late"));
-        assert_eq!(fast, Some(Ok(serde_json::json!({"ok": true}))));
-        let (sender, late) = std::sync::mpsc::channel();
-        let slow = bounded(
-            Duration::from_millis(50),
-            || {
-                std::thread::sleep(Duration::from_millis(300));
-                Err("the lock was held".into())
-            },
-            move |result| sender.send(result).unwrap(),
-        );
-        assert_eq!(slow, None, "s0ma isn't kept waiting");
-        assert_eq!(late.recv_timeout(Duration::from_secs(5)).unwrap(), Err("the lock was held".into()));
-        // Through the tool's entry point: a refusal is a result, not an error.
-        let call = ToolCall {
-            id: "t".into(),
-            kind: "function".into(),
-            function: FunctionCall { name: TOOL.into(), arguments: "{\"why\": \"x\"}".into() },
-        };
-        let result: Value = serde_json::from_str(&execute_tool(&call)).unwrap();
-        assert_eq!((result["ok"].as_bool(), result["error"].as_str().map(|e| e.starts_with("bad arguments"))), (Some(false), Some(true)));
-    }
-
-    #[test]
-    fn a_mistake_being_rewritten_is_listed() {
-        let (dir, recorder, _) = with_call("listed-pending");
-        // A rewrite that won't finish during the test.
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "30"));
-        let Reply::Text(_) = run_for_test(&book, Some(&recorder), "/mistake wrong elapsed time here", Place::Turn) else {
-            panic!()
-        };
-        assert_eq!(book.load(1).unwrap().state, State::Pending);
-        let Reply::Text(list) = run_for_test(&book, Some(&recorder), "/mistake list", Place::Turn) else { panic!() };
-        assert!(list.starts_with("[mistake] open (rewriting or waiting for review) (1):"), "{list}");
-        assert!(list.contains("#1") && list.contains("pending") && list.contains("rewriting (attempt 1, started "), "{list}");
-        // Waiting for review means a version to look at: not this one yet.
-        let Reply::Text(waiting) = run_for_test(&book, Some(&recorder), "/mistake list waiting", Place::Turn) else { panic!() };
-        assert!(waiting.contains("none waiting for review"), "{waiting}");
-        if let Some(pid) = book.load(1).unwrap().rewrite.and_then(|rewrite| rewrite.pid) {
-            // Its own process group (setsid): stop the sleep with it.
-            let _ = std::process::Command::new("kill").args(["-TERM", "--", &format!("-{pid}")]).status();
-        }
-    }
-
-    #[test]
-    fn the_commands_list_flag_and_point_at_the_window() {
-        let (dir, recorder, first) = with_call("commands");
-        let book = Book::with_rewriter(&dir, stub(&dir, &proposal("ready", Some(corrected(&dir.join("x")))), "0"));
-        // /mistake calls, then @1 refers to that list even after newer calls.
-        let Reply::Text(listing) = run_for_test(&book, Some(&recorder), "/mistake calls", Place::Turn) else { panic!() };
-        assert!(listing.contains("@1") && listing.contains("“The build started ten minutes ago.”"), "{listing}");
-        let body = crate::llm::main_request_body_for_test(&[Message::user("later".into())], &[]);
-        let ticket = recorder.begin();
-        recorder.finish(ticket, Some(body), Outcome::Response(&original()), Usage::default());
-        calls::wait_written(&recorder);
-        let Reply::Text(logged) = run_for_test(&book, Some(&recorder), "/mistake @1 wrong elapsed time", Place::Turn) else {
-            panic!()
-        };
-        assert!(logged.starts_with("[mistake] #1 logged (call 1 of turn ") && logged.ends_with("— rewriting"), "{logged}");
-        assert_eq!(book.load(1).unwrap().call_id, first.call_id);
-        assert!(matches!(run_for_test(&book, Some(&recorder), "/mistake @9 x", Place::Turn), Reply::Error(_)));
-        // Without @k: the newest saved call.
-        let Reply::Text(_) = run_for_test(&book, Some(&recorder), "/mistake also wrong here", Place::Turn) else { panic!() };
-        assert_ne!(book.load(2).unwrap().call_id, first.call_id);
-        settled(&book, 1);
-        settled(&book, 2);
-        let Reply::Text(list) = run_for_test(&book, Some(&recorder), "/mistake list", Place::Turn) else { panic!() };
-        assert!(list.contains("#1") && list.contains("#2") && list.contains("ready"), "{list}");
-        assert_eq!(run_for_test(&book, Some(&recorder), "/mistake view 1", Place::Idle), Reply::View(Some(1)));
-        assert!(matches!(run_for_test(&book, Some(&recorder), "/mistake view 1", Place::Turn), Reply::Text(t) if t.contains("s0ma --mistake-view 1")));
-        // From the steering pane mid-turn it opens there, over the paused transcript.
-        assert_eq!(run_for_test(&book, Some(&recorder), "/mistake view 1", Place::Steering), Reply::View(Some(1)));
-        set_listing_for_test(Vec::new());
-    }
 }
 
-#[cfg(test)]
-mod demo {
-    use super::*;
-    use crate::calls::{Outcome, Recorder, Usage};
-    use crate::llm::{S0maResponse, ToolDefinition};
-    use crate::types::{FunctionCall, Message};
-    use serde_json::json;
-
-    /// Seeds `$S0MA_DEMO_DATA` with a saved call and a mistake whose rewrite
-    /// is ready, for driving the review window by hand or in a PTY:
-    /// `S0MA_DEMO_DATA=$PWD/data cargo test demo_data -- --ignored`.
-    #[test]
-    #[ignore]
-    fn demo_data() {
-        let dir = PathBuf::from(std::env::var("S0MA_DEMO_DATA").expect("S0MA_DEMO_DATA"));
-        let recorder = Recorder::start(&dir, "http://127.0.0.1:9".into(), "qwen38-nvfp4".into(), Box::new(|_| {})).unwrap();
-        let messages = vec![
-            Message::system("You are s0ma.".into()),
-            Message::user("How long has the parser build been running? The log's first line is `09:02 build started`.".into()),
-        ];
-        let tools = vec![ToolDefinition::function("run_command", "Run a command.", json!({"type": "object"}))];
-        let body = crate::llm::main_request_body_for_test(&messages, &tools);
-        let original = S0maResponse {
-            content: "The build started about ten minutes ago, so it should finish soon.\nI'll check the tests next.".into(),
-            reasoning_content: "The operator asks how long the build has run.\nThe log says it started ten minutes ago.\nSo it is early; the tests come after.".into(),
-            tool_calls: vec![ToolCall {
-                id: "call_8f2".into(),
-                kind: "function".into(),
-                function: FunctionCall { name: "run_command".into(), arguments: "{\"command\": \"cargo test -p parser\"}".into() },
-            }],
-            finish_reason: Some("tool_calls".into()),
-        };
-        let _turn = calls::begin_turn();
-        // A step before the flagged one, so the window has a stretch to pick from.
-        let looked = S0maResponse {
-            content: String::new(),
-            reasoning_content: "Read the log's first line.".into(),
-            tool_calls: vec![ToolCall {
-                id: "call_1a0".into(),
-                kind: "function".into(),
-                function: FunctionCall { name: "run_command".into(), arguments: "{\"command\": \"head -1 build.log\"}".into() },
-            }],
-            finish_reason: Some("tool_calls".into()),
-        };
-        let ticket = recorder.begin();
-        recorder.finish(ticket, Some(body.clone()), Outcome::Response(&looked), Usage::default());
-        let ticket = recorder.begin();
-        recorder.finish(ticket, Some(body), Outcome::Response(&original), Usage::default());
-        calls::wait_written(&recorder);
-        recorder.end_turn();
-        let call = calls::call_ref(&Store::at(&dir).recent(1).unwrap()[0]).unwrap();
-        let corrected = json!({
-            "content": "The build started at 09:02, about three hours ago, so it is taking far longer than usual.\nI'll check the tests next.",
-            "reasoning_content": "The operator asks how long the build has run.\nThe log says it started at 09:02, and it is now 12:04.\nSo it has run three hours; the tests come after.",
-            "tool_calls": [{"id": "call_8f2", "type": "function",
-                            "function": {"name": "run_command", "arguments": "{\"command\": \"tail -n 50 /var/log/parser-build.log\"}"}}]
-        });
-        let proposal = json!({"mistake": "@M@", "attempt": "@A@", "status": "ready", "error": null, "corrected": corrected,
-            "edits": [{}, {}, {}], "summary": "elapsed time read from the wrong timestamp", "changed_tokens": 41, "total_tokens": 812});
-        let canned = dir.join("canned.json");
-        fs::write(&canned, proposal.to_string()).unwrap();
-        let rewriter = format!(
-            "sed -e 's/\"@M@\"/{{mistake}}/; s/\"@A@\"/{{attempt}}/' {} > {{data}}/mistakes/proposals/{{mistake}}-{{attempt}}.json",
-            crate::util::shell_quote(&canned.to_string_lossy())
-        );
-        let book = Book::with_rewriter(&dir, rewriter);
-        let (record, _) = book.log(&call, "said the build started ten minutes ago; the log says 09:02, three hours earlier", None).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while book.load(record.mistake).unwrap().state == State::Pending {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        println!("mistake #{} is {}", record.mistake, book.load(record.mistake).unwrap().state.label());
-    }
-}

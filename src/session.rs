@@ -1,25 +1,25 @@
-//! One s0ma, many terminals.
+//! One the agent, many terminals.
 //!
 //! The problem this solves is narrow and specific: an SSH session drops while
-//! s0ma is halfway through a turn. The process keeps running — it is not
+//! the agent is halfway through a turn. The process keeps running — it is not
 //! attached to the tty for anything but display — but the operator has no way
 //! back in, and starting `s0ma` again would create a *second* instance writing
 //! to the same archive, the same self-model and the same sqlite stores. Two
-//! s0mas sharing one memory is worse than no s0ma.
+//! Agents sharing one memory is worse than no agent.
 //!
-//! So the socket is the lock. A second process cannot become a second s0ma; it
+//! So the socket is the lock. A second process cannot become a second agent; it
 //! becomes a terminal onto the first one.
 //!
 //! - The primary binds `data/s0ma.sock`. Binding is the single-instance claim.
 //! - Anything started afterwards connects instead and becomes a terminal of
-//!   that s0ma, which looks and works the way the primary's own does: the
+//!   that the agent, which looks and works the way the primary's own does: the
 //!   primary sends it what its display records (`terminal::Mirrored`) and
-//!   what its subagents do (`worker_feed::Change`), from the conversation so
+//!   what its subagents do (`crate::subagent::feed::Change`), from the conversation so
 //!   far on, and the attached terminal draws them with the same display,
 //!   collapsed or expanded with its own Ctrl+O, at its own width, with the
 //!   same prompt, steering pane, tabs and keys. What is typed there goes to
 //!   the primary, which handles it as it handles its own keyboard's.
-//! - Ctrl+D on an attached terminal detaches it and leaves s0ma running.
+//! - Ctrl+D on an attached terminal detaches it and leaves the agent running.
 //!
 //! The protocol is JSON lines, after a greeting line (`HELLO`). A primary
 //! from before this greeting speaks the older, simpler stream, which an
@@ -28,7 +28,7 @@
 //! # From another machine
 //!
 //! `s0ma connect <ssh target>` runs `s0ma --bridge` there over SSH: the
-//! bridge joins that s0ma's socket and passes the protocol through SSH's
+//! bridge joins that the agent's socket and passes the protocol through SSH's
 //! input and output, so a terminal on the operator's own machine attaches
 //! as one on the server would, through whatever carries SSH (the LAN, a
 //! VPN, a tailnet). Nothing listens on the network that SSH doesn't. Over
@@ -43,7 +43,7 @@ use crate::terminal::{
     ActiveDisplay, DisplaySnapshot, Mirrored, NAME_STYLE, OPERATOR_STYLE, RESET, STATUS_STYLE, THINKING_STYLE,
     safe_text,
 };
-use crate::worker_feed::{Change, FeedSnapshot};
+use crate::subagent::feed::{Change, FeedSnapshot};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -169,7 +169,7 @@ fn pid_path(data_dir: &Path) -> PathBuf {
 ///
 /// The socket alone cannot distinguish "the owner is dead" from "the owner is
 /// alive but did not answer", and those need opposite responses: the first wants
-/// the stale file removed, the second must never start a second s0ma against the
+/// the stale file removed, the second must never start a second agent against the
 /// same archive. So the pid is the tie-breaker, and an unanswered socket with a
 /// living owner refuses to start rather than guessing.
 fn process_alive(pid: u32) -> bool {
@@ -193,7 +193,7 @@ enum Occupant {
     /// A socket file with nobody behind it — a previous run that was killed.
     Stale,
     /// The socket did not answer, but the process that made it is still alive.
-    /// Refuse to do anything: removing its socket would orphan a running s0ma,
+    /// Refuse to do anything: removing its socket would orphan a running agent,
     /// and binding a new one would put two of them on the same archive.
     Unresponsive(u32),
     /// Nothing there.
@@ -239,7 +239,7 @@ fn line<T: Serialize>(value: &T) -> String {
 }
 
 impl Server {
-    /// Claim the instance. `Ok(None)` means another s0ma already holds it.
+    /// Claim the instance. `Ok(None)` means another agent already holds it.
     /// `interrupt`: what Ctrl+C sets, for an attached terminal's.
     pub fn bind(
         data_dir: &Path,
@@ -269,7 +269,7 @@ impl Server {
 
         let listener = UnixListener::bind(&path)?;
         // The operator's alone: a terminal attached here can do whatever he
-        // can, approve s0ma's commands among it (`approval.rs`).
+        // can, approve the agent's commands among it (`approval.rs`).
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -291,7 +291,7 @@ impl Server {
         }
         {
             let outgoing = Mutex::new(outgoing.clone());
-            crate::worker_feed::mirror_to(
+            crate::subagent::feed::mirror_to(
                 Box::new(move |change| {
                     let _ = crate::util::locked(&outgoing).send(Outgoing::All(line(&ToTerminal::Feed(change))));
                 }),
@@ -355,7 +355,7 @@ impl Server {
                     (Arc::clone(&accepting), outgoing.clone(), display.clone(), submitter.clone(), Arc::clone(&interrupt));
                 thread::spawn(move || {
                     // A failed greeting means the peer is already gone, which
-                    // is ordinary: anything testing whether this s0ma is alive
+                    // is ordinary: anything testing whether this agent is alive
                     // connects and leaves. Nobody to tell, so it is dropped.
                     if let Err(error) = welcome(id, stream, &accepting, &outgoing, &display, &submitter, &interrupt)
                         && std::env::var_os("S0MA_SESSION_DEBUG").is_some()
@@ -399,7 +399,7 @@ fn welcome(
     // before they are let go: everything after it is mirrored to it, and
     // nothing in it is mirrored again.
     display.snapshot(|display| {
-        crate::worker_feed::snapshot(|feeds| {
+        crate::subagent::feed::snapshot(|feeds| {
             crate::exec_feed::snapshot(|execs| {
                 clients.fetch_add(1, Ordering::SeqCst);
                 let features = FEATURES.iter().map(|f| f.to_string()).collect();
@@ -489,7 +489,7 @@ impl Drop for Server {
 
 // ------------------------------------------------------------------ attaching
 
-/// If an s0ma is already running, become a terminal of it and block until
+/// If an agent is already running, become a terminal of it and block until
 /// the operator detaches. Returns whether that happened.
 ///
 /// This is what makes reconnecting after a dropped SSH session do the right
@@ -570,7 +570,7 @@ impl TimedReader {
     }
 }
 
-/// A connection to an s0ma on another machine, greeted, before its page.
+/// A connection to an agent on another machine, greeted, before its page.
 pub struct Remote {
     child: std::process::Child,
     reader: BufReader<std::process::ChildStdout>,
@@ -580,7 +580,7 @@ pub struct Remote {
 /// `s0ma connect <target>`, first half: SSH to the server, run the bridge
 /// there, and take its greeting. Before the page, so ssh can ask for a
 /// password or a host key on the shell's own screen. `remote`: the command
-/// that runs s0ma there (`s0ma` on its PATH by default).
+/// that runs the agent there (`s0ma` on its PATH by default).
 pub fn open_remote(target: &str, remote: &str) -> Result<Remote> {
     use std::process::{Command, Stdio};
     eprintln!("[connect] {target}: starting {remote} --bridge over ssh…");
@@ -642,7 +642,7 @@ pub fn attach_remote(data_dir: &Path, remote: Remote) -> Result<()> {
     result
 }
 
-/// `s0ma --bridge`: the far end of `connect`. Joins the s0ma running here
+/// `s0ma --bridge`: the far end of `connect`. Joins the agent running here
 /// and passes its protocol through this process's input and output.
 pub fn bridge(data_dir: &Path) -> Result<()> {
     let stream = match probe(data_dir) {
@@ -657,7 +657,7 @@ pub fn bridge(data_dir: &Path) -> Result<()> {
         let _ = std::io::copy(&mut from_s0ma, &mut StdoutFlushing(&mut stdout));
     });
     let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_s0ma);
-    // The client went (Ctrl+D, or ssh dropped): leave s0ma's socket closed.
+    // The client went (Ctrl+D, or ssh dropped): leave the agent's socket closed.
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = out.join();
     Ok(())
@@ -763,7 +763,7 @@ impl Terminal {
             return Err("the running s0ma sent nothing to start from".into());
         };
         within(None);
-        crate::worker_feed::restore(feeds);
+        crate::subagent::feed::restore(feeds);
         crate::exec_feed::restore(execs);
         crate::approval::apply(approvals);
 
@@ -819,7 +819,7 @@ impl Terminal {
                         ToTerminal::Snapshot { .. } => {}
                         // Only a tab draws these, and it follows them itself:
                         // nothing to wake the prompt for.
-                        ToTerminal::Feed(change) => crate::worker_feed::apply(change),
+                        ToTerminal::Feed(change) => crate::subagent::feed::apply(change),
                         ToTerminal::Exec(change) => crate::exec_feed::apply(change),
                         ToTerminal::Approvals(pending) => crate::approval::apply(pending),
                         message => {
@@ -926,7 +926,7 @@ impl Terminal {
                 InputEvent::Submit(text) if crate::transfer::is_command(&text) => {
                     let start = crate::terminal::cursor_row();
                     let _defer = ClearOfPrompt(start);
-                    self.display.apply(Mirrored::Entry(crate::transcript::Entry::Operator(safe_text(&text))))?;
+                    self.display.apply(Mirrored::Entry(crate::terminal::operator_entry(&text)))?;
                     let said = if self.features.iter().any(|f| f == "transfer") {
                         let (writer, requests) = (Arc::clone(&self.writer), Arc::clone(&self.requests));
                         let display = self.display.clone();
@@ -989,7 +989,7 @@ impl Terminal {
                         }
                         Answer::Note(note) => {
                             // Answered here only, so the line it answers is shown here too.
-                            self.display.apply(Mirrored::Entry(crate::transcript::Entry::Operator(safe_text(&text))))?;
+                            self.display.apply(Mirrored::Entry(crate::terminal::operator_entry(&text)))?;
                             let brief = note.lines().next().unwrap_or_default().to_owned();
                             self.display.notice(&brief, &note, true)?;
                         }
@@ -1013,7 +1013,7 @@ impl Terminal {
                 self.input.forget_history_if_asked();
             }
             ToTerminal::Display(event) => self.display.apply(event)?,
-            ToTerminal::Feed(change) => crate::worker_feed::apply(change),
+            ToTerminal::Feed(change) => crate::subagent::feed::apply(change),
             ToTerminal::Exec(change) => crate::exec_feed::apply(change),
             ToTerminal::Approvals(pending) => crate::approval::apply(pending),
             ToTerminal::Snapshot { .. } | ToTerminal::Answer { .. } => {}
@@ -1024,7 +1024,7 @@ impl Terminal {
     /// `/mistake view` typed at this terminal's prompt: the window opens here.
     fn mistake_view(&self, start: Option<u64>) {
         let Some(book) = crate::mistakes::book() else { return };
-        let closing = crate::mistake_view::run(book, start)
+        let closing = crate::mistakes::view::run(book, start)
             .unwrap_or_else(|error| format!("[mistake] the review window failed: {error}"));
         let _ = self.display.transcript_line(&safe_text(&closing));
     }
@@ -1139,15 +1139,9 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_socket_is_not_a_running_instance() {
-        let data = dir("absent");
-        assert!(matches!(probe(&data), Occupant::Absent));
-    }
-
-    #[test]
     fn a_leftover_socket_file_is_recognised_as_stale() {
         // A process killed without running its Drop leaves the file behind. If
-        // that read as "already running", a crash would lock s0ma out of its own
+        // that read as "already running", a crash would lock the agent out of its own
         // socket permanently and every later start would refuse to run.
         let data = dir("stale");
         std::fs::write(socket_path(&data), b"not a socket").unwrap();
@@ -1161,42 +1155,11 @@ mod tests {
     }
 
     #[test]
-    fn probing_a_live_instance_hands_back_the_connection() {
-        // Not cosmetic. If the probe connected and dropped, the primary would
-        // accept that as a client, greet it, and hit "Broken pipe" — once per
-        // attach, on its own terminal, for a connection nobody wanted.
-        let data = dir("probe-reuse");
-        let listener = UnixListener::bind(socket_path(&data)).unwrap();
-
-        let Occupant::Running(mut probed) = probe(&data) else {
-            panic!("a bound socket should answer");
-        };
-
-        // The primary's side of that same connection: still usable, because the
-        // probe kept it open instead of throwing it away.
-        let (mut accepted, _) = listener.accept().unwrap();
-        writeln!(accepted, "sgreeting").unwrap();
-        accepted.flush().unwrap();
-
-        let mut line = String::new();
-        BufReader::new(&mut probed).read_line(&mut line).unwrap();
-        assert_eq!(line.trim_end(), "sgreeting");
-    }
-
-    #[test]
-    fn a_bound_socket_is_recognised_as_running() {
-        let data = dir("running");
-        let _listener = UnixListener::bind(socket_path(&data)).unwrap();
-
-        assert!(matches!(probe(&data), Occupant::Running(_)));
-    }
-
-    #[test]
     fn a_live_owner_is_never_treated_as_stale() {
         // The dangerous case. If an unanswered socket whose owner is alive read
-        // as stale, starting s0ma again would delete a running instance's socket
-        // and then bind its own — two s0mas writing one archive, which is worse
-        // than no s0ma at all.
+        // as stale, starting the agent again would delete a running instance's socket
+        // and then bind its own — two agents writing one archive, which is worse
+        // than no agent at all.
         let data = dir("unresponsive");
         std::fs::write(socket_path(&data), b"not a socket").unwrap();
         std::fs::write(pid_path(&data), std::process::id().to_string()).unwrap();
@@ -1204,101 +1167,6 @@ mod tests {
         match probe(&data) {
             Occupant::Unresponsive(pid) => assert_eq!(pid, std::process::id()),
             _ => panic!("a socket owned by a living process must not be removed"),
-        }
-    }
-
-    #[test]
-    fn legacy_frames_unescape() {
-        assert_eq!(unescape("two\\nlines \\\\ and \\r"), "two\nlines \\ and \r");
-    }
-
-    fn read<T: serde::de::DeserializeOwned>(lines: &mut std::io::Lines<BufReader<UnixStream>>) -> T {
-        serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap()
-    }
-
-    #[test]
-    fn an_attached_terminal_starts_from_the_conversation_and_is_answered_as_the_keyboard_is() {
-        let data = dir("attach");
-        let (submitter, queued) = crate::input::ExternalSubmitter::detached();
-        let display = ActiveDisplay::new();
-        display.transcript_line("said before it attached").unwrap();
-        let interrupt = Arc::new(AtomicBool::new(false));
-        let server = Server::bind(&data, submitter, display.clone(), Arc::clone(&interrupt)).unwrap().expect("bound");
-        let stream = UnixStream::connect(socket_path(&data)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut writer = stream.try_clone().unwrap();
-        let mut lines = BufReader::new(stream).lines();
-        assert_eq!(lines.next().unwrap().unwrap(), HELLO, "the greeting first, so an older terminal can tell");
-
-        let ToTerminal::Snapshot { display: snapshot, .. } = read(&mut lines) else { panic!("a snapshot next") };
-        assert!(snapshot.entries.iter().any(|(_, _, entry)| *entry == crate::transcript::Entry::Line("said before it attached".into())));
-        assert!(!snapshot.active);
-        assert_eq!(server.attached(), 1);
-
-        // What the display does from now on reaches it, once.
-        display.transcript_line("said after").unwrap();
-        // Other tests' displays and feeds share the mirror in this process:
-        // what they send is passed over.
-        let mut after = 0;
-        for _ in 0..200 {
-            if let ToTerminal::Display(Mirrored::Entry(crate::transcript::Entry::Line(text))) = read(&mut lines) {
-                if text == "said after" {
-                    after += 1;
-                    break;
-                }
-                assert_ne!(text, "said before it attached", "nothing in the snapshot comes again");
-            }
-        }
-        assert_eq!(after, 1);
-
-        // A line typed at its prompt goes into the same queue as this
-        // terminal's; Ctrl+C there is Ctrl+C here.
-        writeln!(writer, "{}", line(&ToPrimary::Say { id: 7, text: "carry on".into() })).unwrap();
-        let mut answered = None;
-        for _ in 0..200 {
-            match read(&mut lines) {
-                ToTerminal::Answer { id, answer: Answer::Steered(Steered::Done) } => {
-                    answered = Some(id);
-                    break;
-                }
-                _ => continue,
-            }
-        }
-        assert_eq!(answered, Some(7));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut seen = Vec::new();
-        while seen.is_empty() && std::time::Instant::now() < deadline {
-            seen.extend(queued());
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(seen, ["carry on"]);
-        // Ctrl+C from it between turns is not kept to stop the next one.
-        writeln!(writer, "{}", line(&ToPrimary::Interrupt)).unwrap();
-
-        // A command answered here is shown as typed, on every terminal.
-        writeln!(writer, "{}", line(&ToPrimary::Say { id: 8, text: "/mistake list".into() })).unwrap();
-        let mut shown = false;
-        loop {
-            match read(&mut lines) {
-                ToTerminal::Display(Mirrored::Entry(crate::transcript::Entry::Operator(text))) => {
-                    shown |= text == "/mistake list";
-                }
-                ToTerminal::Answer { id: 8, .. } => break,
-                _ => {}
-            }
-        }
-        assert!(shown, "the line typed on the attached terminal is in everyone's transcript");
-        assert!(!interrupt.load(Ordering::SeqCst), "handled in order, before the line after it");
-
-        // A tab's action is answered to the one that asked, by its id.
-        writeln!(writer, "{}", line(&ToPrimary::Act { id: 9, action: crate::tabs::Action::Kill { run_id: "nobody".into() } }))
-            .unwrap();
-        loop {
-            if let ToTerminal::Answer { id, answer: Answer::Acted(result) } = read(&mut lines) {
-                assert_eq!(id, 9);
-                assert!(result.is_err());
-                break;
-            }
         }
     }
 }

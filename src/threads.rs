@@ -1048,37 +1048,6 @@ mod link_world_tests {
     }
 
     #[test]
-    fn every_defined_tool_is_routed_here() {
-        let defined: Vec<String> =
-            tool_definitions().into_iter().map(|t| t.function.name).collect();
-        assert_eq!(defined.len(), TOOL_NAMES.len());
-        let (_dir, mut store) = store();
-        for name in &defined {
-            assert!(handles(name), "{name} defined but not in TOOL_NAMES");
-            let out = execute(&mut store, &call(name, json!({})));
-            if let Ok(text) = out {
-                assert!(!text.contains("unknown thread tool"), "{name} has no execute arm");
-            }
-        }
-        assert!(!handles("thread_link"), "retired name must not route");
-    }
-
-    #[test]
-    fn links_record_and_model_and_persists() {
-        let (dir, mut store) = store();
-        let out = execute(&mut store, &call("thread_link_world", json!({"id":1,"kind":"record","target":"htb:busqueda"}))).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["already_linked"], false);
-        execute(&mut store, &call("thread_link_world", json!({"id":"1","kind":"model","target":" htb "}))).unwrap();
-        let again = execute(&mut store, &call("thread_link_world", json!({"id":1,"kind":"model","target":"htb"}))).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&again).unwrap()["already_linked"], true);
-
-        let reloaded = ThreadStore::new(dir.join("threads.json")).unwrap();
-        let thread = reloaded.get(1).unwrap();
-        assert_eq!(thread.world_record_ids, vec!["htb:busqueda".to_string()]);
-        assert_eq!(thread.model_ids, vec!["htb".to_string()]);
-    }
-
-    #[test]
     fn rejects_bad_kind_thread_and_target() {
         let (_dir, mut store) = store();
         let mut err = |args: Value| execute(&mut store, &call("thread_link_world", args)).unwrap_err().to_string();

@@ -1,3 +1,11 @@
+pub(crate) mod access;
+pub(crate) mod image;
+pub(crate) mod machine;
+pub(crate) mod netbox_run;
+pub(crate) mod netboxes;
+pub(crate) mod terms;
+pub(crate) mod wake;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,7 +28,7 @@ use crate::types::ToolCall;
 /// live on another machine (`qemu+ssh://operator@legion/system`) without a rebuild.
 const DEFAULT_LIBVIRT_URI: &str = "qemu:///system";
 
-/// The libvirt domain s0ma works in, as `virsh list` names it.
+/// The libvirt domain the agent works in, as `virsh list` names it.
 const DEFAULT_VM_NAME: &str = "s0ma";
 
 /// `DEFAULT_VM_NAME`, or `S0MA_VM_NAME` when the operator sets it.
@@ -116,21 +124,21 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 
 // ------------------------------------------------------------------ the netboxes
 
-/// The first netbox, the shell s0ma and the operator share (`netboxes.rs` has the rest).
-pub const NETBOX: &str = crate::netboxes::DEFAULT;
+/// The first netbox, the shell the agent and the operator share (`vm/netboxes.rs` has the rest).
+pub const NETBOX: &str = crate::vm::netboxes::DEFAULT;
 
-/// What s0ma is told about the netboxes, in its system context.
-pub const NETBOX_CONTEXT: &str = crate::netboxes::CONTEXT;
+/// What the agent is told about the netboxes, in its system context.
+pub const NETBOX_CONTEXT: &str = crate::vm::netboxes::CONTEXT;
 
-/// The netboxes' tools: s0ma's only, never a worker's.
+/// The netboxes' tools: the agent's only, never a worker's.
 pub fn netbox_tool_definitions() -> Vec<ToolDefinition> {
-    crate::netboxes::tool_definitions()
+    crate::vm::netboxes::tool_definitions()
 }
 
 /// A guest script that opens the first netbox when it is not open (exit 0
 /// either way), or restarts an old one in place when it is idle.
 pub(crate) fn netbox_open_script() -> String {
-    crate::netboxes::open_script(&crate::netboxes::Spec::default_netbox())
+    crate::vm::netboxes::open_script(&crate::vm::netboxes::Spec::default_netbox())
 }
 
 fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
@@ -141,33 +149,33 @@ fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
     let worker = crate::exec_feed::owner();
     // A subagent's are its own shell's, whatever it names.
     let name = match &worker {
-        Some(run_id) => crate::netboxes::worker_name(run_id),
-        None => crate::netboxes::canonical(named.as_ref().and_then(Value::as_str).unwrap_or(NETBOX)),
+        Some(run_id) => crate::vm::netboxes::worker_name(run_id),
+        None => crate::vm::netboxes::canonical(named.as_ref().and_then(Value::as_str).unwrap_or(NETBOX)),
     };
-    if let Err(error) = crate::netboxes::valid_name(&name) {
+    if let Err(error) = crate::vm::netboxes::valid_name(&name) {
         return Ok(json!({"ok": false, "error": error}).to_string());
     }
-    let session = crate::netboxes::session_of(&name);
+    let session = crate::vm::netboxes::session_of(&name);
     let tmux_session = tmux_session_name(&session)?;
     if name == NETBOX {
         let opened = run_shell_helper(&netbox_open_script())?;
         if opened.exit_code != Some(0) {
             return Ok(shell_helper_error(NETBOX, &opened));
         }
-        crate::vm_terms::touch();
+        crate::vm::terms::touch();
     }
     if let Some(run_id) = &worker {
-        let user = crate::netboxes::acting_worker();
+        let user = crate::vm::netboxes::acting_worker();
         if let Some(user) = &user
-            && let Err(error) = crate::netboxes::ensure_worker_account(&mut crate::netboxes::machine, user)
+            && let Err(error) = crate::vm::netboxes::ensure_worker_account(&mut crate::vm::netboxes::machine, user)
         {
             return Ok(json!({"ok": false, "error": error}).to_string());
         }
-        let spec = crate::netbox_run::worker_spec(run_id, user);
-        if let Err(error) = crate::netboxes::open(&mut crate::netboxes::machine, &spec) {
+        let spec = crate::vm::netbox_run::worker_spec(run_id, user);
+        if let Err(error) = crate::vm::netboxes::open(&mut crate::vm::netboxes::machine, &spec) {
             return Ok(json!({"ok": false, "error": format!("your shell could not be opened: {error}")}).to_string());
         }
-        crate::vm_terms::touch();
+        crate::vm::terms::touch();
     }
     let read = matches!(call.function.name.as_str(), "shell_read" | "netbox_read");
     // Typing: not while the operator has taken control.
@@ -181,12 +189,12 @@ fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
         if wheel.stdout.trim() == "1" {
             let after = if worker.is_some() { "" } else { " vm_exec still works: it runs in your lane beside it." };
             return Ok(json!({"ok": false, "shell": name, "error": format!(
-                "The operator has taken control of {}: you cannot type there until it is handed back.{after}", crate::netboxes::display(&name))}).to_string());
+                "The operator has taken control of {}: you cannot type there until it is handed back.{after}", crate::vm::netboxes::display(&name))}).to_string());
         }
     }
     // Approval mode: what would be typed or pressed waits for the operator.
     if !read {
-        let shown = crate::netboxes::display(&name);
+        let shown = crate::vm::netboxes::display(&name);
         let (what, detail) = match call.function.name.as_str() {
             "shell_key" | "netbox_key" => {
                 let key = object.get("key").and_then(Value::as_str).unwrap_or("a key");
@@ -205,7 +213,7 @@ fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
         }
     }
     if worker.is_none() {
-        crate::netboxes::set_working(&name);
+        crate::vm::netboxes::set_working(&name);
     }
     object.insert("session".into(), json!(session));
     if read && !object.contains_key("lines") {
@@ -226,7 +234,7 @@ fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
         "shell_key" | "netbox_key" => execute_shell_key(&scoped)?,
         _ => execute_shell_read(&scoped)?,
     };
-    // Whose is whose: what s0ma typed is marked, and a read says what the operator
+    // Whose is whose: what the agent typed is marked, and a read says what the operator
     // typed since the last one.
     let mut value: Value = serde_json::from_str(&result).unwrap_or(json!({"output": result}));
     if let Some(object) = value.as_object_mut() {
@@ -242,7 +250,7 @@ fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
             output.truncate(kept);
         }
         if read {
-            let typed = crate::vm_terms::take_netbox_typing(&session);
+            let typed = crate::vm::terms::take_netbox_typing(&session);
             object.insert(
                 "operator_typed_since_you_last_looked".into(),
                 if typed.is_empty() { json!("nothing") } else { json!(typed) },
@@ -289,7 +297,7 @@ struct VmAuditEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     netbox: Option<&'a str>,
 
-    /// The account it ran as, when not s0ma's (a subagent's).
+    /// The account it ran as, when not the agent's (a subagent's).
     #[serde(skip_serializing_if = "Option::is_none")]
     account: Option<&'a str>,
 }
@@ -386,16 +394,16 @@ fn default_true() -> bool {
 }
 
 pub fn execute(call: &ToolCall) -> Result<String, Box<dyn Error>> {
-    // Every command and shell, s0ma's and its subagents', stops here while
+    // Every command and shell, the agent's and its subagents', stops here while
     // the operator has the machine off limits.
-    if !crate::vm_access::allowed() {
-        return Ok(crate::vm_access::refusal(&call.function.name));
+    if !crate::vm::access::allowed() {
+        return Ok(crate::vm::access::refusal(&call.function.name));
     }
     match call.function.name.as_str() {
         "vm_exec" => execute_vm_exec(call),
         // `netbox_*`: the same tools, as calls made before the rename name them.
         "shell_type" | "shell_key" | "shell_read" | "netbox_type" | "netbox_key" | "netbox_read" => execute_netbox(call),
-        "shell_open" | "shell_close" | "netbox_open" | "netbox_close" => Ok(crate::netboxes::execute(call)),
+        "shell_open" | "shell_close" | "netbox_open" | "netbox_close" => Ok(crate::vm::netboxes::execute(call)),
         // The private shells there were before every shell was shared.
         "vm_shell_open" | "vm_shell_input" | "vm_shell_key" | "vm_shell_read" | "vm_shell_close" => Ok(json!({
             "ok": false,
@@ -423,7 +431,7 @@ pub fn execute(call: &ToolCall) -> Result<String, Box<dyn Error>> {
 /// mislead is by looking like a command that finished, so it does not: it
 /// names the job, says where the log is, and says whether an event is coming.
 fn start_background_command(command_id: &str, command: &str) -> Result<String, Box<dyn Error>> {
-    let name = crate::vm_wake::background_name();
+    let name = crate::vm::wake::background_name();
 
     // Fail closed, as the foreground path does: no audit record, nothing runs.
     append_audit(&VmAuditEvent {
@@ -442,7 +450,7 @@ fn start_background_command(command_id: &str, command: &str) -> Result<String, B
         account: None,
     })?;
 
-    let job = match crate::vm_wake::start_background(&name, command) {
+    let job = match crate::vm::wake::start_background(&name, command) {
         Ok(job) => job,
         Err(error) => {
             let error_message = error.to_string();
@@ -565,7 +573,7 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
         } else if worker_run.is_some() {
             "its shell".to_string()
         } else {
-            crate::netboxes::display(&args.netbox.clone().map(|name| crate::netboxes::canonical(&name)).unwrap_or_else(crate::netboxes::working))
+            crate::vm::netboxes::display(&args.netbox.clone().map(|name| crate::vm::netboxes::canonical(&name)).unwrap_or_else(crate::vm::netboxes::working))
         };
         let why = args.why.as_deref().map(str::trim).filter(|why| !why.is_empty()).map(|why| format!("# {why}\n")).unwrap_or_default();
         if let Err(refused) = crate::approval::ask(&format!("run in {place}: {}", crate::approval::one_line(&args.command)), &format!("{why}{}", args.command)) {
@@ -575,9 +583,9 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
     let command_id = new_command_id();
     let started = Instant::now();
     // A subagent's call runs as the subagents' account (when there is one).
-    let account = crate::netboxes::acting_worker();
+    let account = crate::vm::netboxes::acting_worker();
     if let Some(user) = &account
-        && let Err(error) = crate::netboxes::ensure_worker_account(&mut crate::netboxes::machine, user)
+        && let Err(error) = crate::vm::netboxes::ensure_worker_account(&mut crate::vm::netboxes::machine, user)
     {
         return Ok(json!({"ok": false, "error": error}).to_string());
     }
@@ -600,7 +608,7 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
     }
 
     let requested = args.netbox.clone().unwrap_or_else(|| {
-        if worker_run.is_some() { "own".into() } else { crate::netboxes::working() }
+        if worker_run.is_some() { "own".into() } else { crate::vm::netboxes::working() }
     });
     // Fail closed: if we cannot create the audit record, do not execute
     // anything in the VM.
@@ -613,7 +621,7 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
     // outside a shell, and the overview says when it is set.
     let mut elsewhere: Option<String> = None;
     if in_netbox() {
-        let ask = crate::netbox_run::Ask {
+        let ask = crate::vm::netbox_run::Ask {
             command: args.command.clone(),
             why: args.why.clone().unwrap_or_default(),
             persist: args.persist,
@@ -621,15 +629,17 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
             netbox: if worker_run.is_some() { None } else { args.netbox.clone() },
             worker: worker_run.clone().map(|run_id| (run_id, account.clone())),
             approved,
+            label: None,
+            no_lane: false,
         };
-        match crate::netbox_run::start(&ask, &mut crate::netboxes::machine) {
-            Ok(crate::netbox_run::Started::Typed(typed)) => {
+        match crate::vm::netbox_run::start(&ask, &mut crate::vm::netboxes::machine) {
+            Ok(crate::vm::netbox_run::Started::Typed(typed)) => {
                 if worker_run.is_none() {
-                    crate::netboxes::set_working(if crate::netboxes::is_lane(&typed.netbox) { &requested } else { &typed.netbox });
+                    crate::vm::netboxes::set_working(if crate::vm::netboxes::is_lane(&typed.netbox) { &requested } else { &typed.netbox });
                 }
                 return in_netbox_finish(&args.command, &command_id, typed, worker_run.is_some(), account.as_deref());
             }
-            Ok(crate::netbox_run::Started::Elsewhere(why)) => elsewhere = Some(why),
+            Ok(crate::vm::netbox_run::Started::Elsewhere(why)) => elsewhere = Some(why),
             Err(error) if args.netbox.is_some() => {
                 Audit { command_id: &command_id, command: &args.command, timeout_secs: args.timeout_secs, netbox: Some(&requested), account: account.as_deref() }
                     .record("failed", None, None, Some(&error))?;
@@ -654,7 +664,7 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
     let audit = Audit { command_id: &command_id, command: &args.command, timeout_secs: args.timeout_secs, netbox: None, account: account.as_deref() };
 
     let guest_command = match &account {
-        Some(user) => crate::netboxes::as_user(user, &format!("cd /workspace 2>/dev/null || cd; {}", args.command)),
+        Some(user) => crate::vm::netboxes::as_user(user, &format!("cd /workspace 2>/dev/null || cd; {}", args.command)),
         None => args.command.clone(),
     };
     let outcome = match run_guest_command(&guest_command, args.timeout_secs) {
@@ -725,7 +735,7 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
 
 /// The result of a command that ran in a netbox, as vm_exec gives it: the
 /// guest runner's shape, its output as the terminal showed it.
-fn netbox_result(typed: &crate::netbox_run::Typed, done: &crate::netbox_run::Finished, command_id: &str) -> Value {
+fn netbox_result(typed: &crate::vm::netbox_run::Typed, done: &crate::vm::netbox_run::Finished, command_id: &str) -> Value {
     let mut value = json!({
         "exit_code": done.exit_code,
         "signal": null,
@@ -757,24 +767,24 @@ fn netbox_result(typed: &crate::netbox_run::Typed, done: &crate::netbox_run::Fin
 }
 
 /// Wait for a command typed into a netbox and give its result: at once when
-/// it ends; early when it waits for input or for the operator's Enter (s0ma's: the
+/// it ends; early when it waits for input or for the operator's Enter (the agent's: the
 /// rest comes as an event; a subagent's is stopped instead, it cannot be
 /// answered); stopped by a timeout or /kill.
 fn in_netbox_finish(
     command: &str,
     command_id: &str,
-    typed: crate::netbox_run::Typed,
+    typed: crate::vm::netbox_run::Typed,
     worker: bool,
     account: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
-    use crate::netbox_run::Waited;
+    use crate::vm::netbox_run::Waited;
     let audit = Audit { command_id, command, timeout_secs: typed.timeout_secs, netbox: Some(&typed.netbox), account };
-    let waited = crate::netbox_run::wait(&typed, &mut crate::netboxes::machine, true, crate::netbox_run::CONFIRM_SECS);
+    let waited = crate::vm::netbox_run::wait(&typed, &mut crate::vm::netboxes::machine, true, crate::vm::netbox_run::CONFIRM_SECS);
     let waited = match waited {
         Err(error) if crate::kill::requested() => {
             let _cleanup = crate::kill::suspend();
-            let stopped = crate::netbox_run::interrupt(&typed, &mut crate::netboxes::machine);
-            let mut killed = crate::kill::Killed::new(format!("the command in {} was stopped", crate::netboxes::display(&typed.netbox)));
+            let stopped = crate::vm::netbox_run::interrupt(&typed, &mut crate::vm::netboxes::machine);
+            let mut killed = crate::kill::Killed::new(format!("the command in {} was stopped", crate::vm::netboxes::display(&typed.netbox)));
             if let Ok(Waited::Done(done)) = &stopped {
                 killed = killed.with_partial(netbox_result(&typed, done, command_id).to_string());
             }
@@ -802,7 +812,7 @@ fn in_netbox_finish(
             Ok(value.to_string())
         }
         Waited::TimedOut => {
-            let stopped = crate::netbox_run::interrupt(&typed, &mut crate::netboxes::machine);
+            let stopped = crate::vm::netbox_run::interrupt(&typed, &mut crate::vm::netboxes::machine);
             let mut value = json!({"ok": false, "status": "timeout", "shell": typed.netbox, "command_id": command_id,
                 "timeout_seconds": typed.timeout_secs, "error": format!("stopped after {} seconds", typed.timeout_secs)});
             if let Ok(Waited::Done(done)) = stopped {
@@ -815,10 +825,10 @@ fn in_netbox_finish(
         Waited::Gone => {
             audit.record("failed", None, None, Some("the shell closed"))?;
             Ok(json!({"ok": false, "status": "shell_closed", "shell": typed.netbox,
-                "error": format!("{}'s shell went away (closed, or exited) before the command finished; its output is lost", crate::netboxes::display(&typed.netbox))}).to_string())
+                "error": format!("{}'s shell went away (closed, or exited) before the command finished; its output is lost", crate::vm::netboxes::display(&typed.netbox))}).to_string())
         }
         Waited::Input(so_far) if worker => {
-            let _ = crate::netbox_run::interrupt(&typed, &mut crate::netboxes::machine);
+            let _ = crate::vm::netbox_run::interrupt(&typed, &mut crate::vm::netboxes::machine);
             audit.record("stopped", None, None, Some("waited for keyboard input"))?;
             Ok(json!({"ok": false, "status": "waiting_for_input", "shell": typed.netbox, "output_so_far": so_far,
                 "note": "It sat waiting for keyboard input, so it was stopped: run it so it needs none (a flag, a file, yes |, </dev/null)."}).to_string())
@@ -827,14 +837,14 @@ fn in_netbox_finish(
             let value = json!({"ok": true, "status": "waiting_for_input", "shell": typed.netbox, "command_id": command_id, "output_so_far": so_far,
                 "note": format!("It is waiting for keyboard input (a prompt, a password, a y/n). The operator sees it in {0} and may answer; \
                     you can with shell_type (shell={1}). Its result comes as an event when it ends: don't wait for it here.",
-                    crate::netboxes::display(&typed.netbox), typed.netbox)});
+                    crate::vm::netboxes::display(&typed.netbox), typed.netbox)});
             follow_later(command.to_string(), command_id.to_string(), typed, account.map(str::to_string));
             Ok(value.to_string())
         }
         Waited::StillWaiting => {
             let value = json!({"ok": true, "status": "still_waiting", "shell": typed.netbox, "command_id": command_id,
                 "note": format!("The operator has not answered in {} minutes: your command still waits at his prompt in {} for his Enter. \
-                    Its result comes as an event if he runs it or declines it.", crate::netbox_run::CONFIRM_SECS / 60, crate::netboxes::display(&typed.netbox))});
+                    Its result comes as an event if he runs it or declines it.", crate::vm::netbox_run::CONFIRM_SECS / 60, crate::vm::netboxes::display(&typed.netbox))});
             follow_later(command.to_string(), command_id.to_string(), typed, account.map(str::to_string));
             Ok(value.to_string())
         }
@@ -842,15 +852,15 @@ fn in_netbox_finish(
 }
 
 /// A command whose call returned before it ended: waited for away from the
-/// turn, and its result made an event for s0ma.
-fn follow_later(command: String, command_id: String, typed: crate::netbox_run::Typed, account: Option<String>) {
+/// turn, and its result made an event for the agent.
+fn follow_later(command: String, command_id: String, typed: crate::vm::netbox_run::Typed, account: Option<String>) {
     let spawned = thread::Builder::new().name("netbox-follow".into()).spawn(move || {
-        use crate::netbox_run::Waited;
+        use crate::vm::netbox_run::Waited;
         let audit = Audit { command_id: &command_id, command: &command, timeout_secs: typed.timeout_secs, netbox: Some(&typed.netbox), account: account.as_deref() };
         let mut failures = 0;
         let waited = loop {
-            match crate::netbox_run::wait(&typed, &mut crate::netboxes::machine, false, 12 * 3600) {
-                Ok(Waited::TimedOut) => break crate::netbox_run::interrupt(&typed, &mut crate::netboxes::machine).map(|waited| (waited, true)),
+            match crate::vm::netbox_run::wait(&typed, &mut crate::vm::netboxes::machine, false, 12 * 3600) {
+                Ok(Waited::TimedOut) => break crate::vm::netbox_run::interrupt(&typed, &mut crate::vm::netboxes::machine).map(|waited| (waited, true)),
                 Ok(waited) => break Ok((waited, false)),
                 Err(_) if failures < 20 => {
                     failures += 1;
@@ -860,7 +870,7 @@ fn follow_later(command: String, command_id: String, typed: crate::netbox_run::T
             }
         };
         let label = crate::mistakes::one_line(&command, 120);
-        let place = crate::netboxes::display(&typed.netbox);
+        let place = crate::vm::netboxes::display(&typed.netbox);
         let text = match waited {
             Ok((Waited::Done(done), timed_out)) => {
                 let _ = audit.record(if done.declined { "declined" } else if timed_out { "timeout" } else { "finished" }, done.exit_code, Some(done.duration_ms), None);
@@ -895,19 +905,19 @@ fn follow_later(command: String, command_id: String, typed: crate::netbox_run::T
                 format!("- {place}: `{label}` (command {command_id}): its end could not be read ({error}); shell_read shell={} shows where it is.", typed.netbox)
             }
         };
-        crate::netboxes::push_event(text);
+        crate::vm::netboxes::push_event(text);
     });
     if spawned.is_err() {
-        crate::netboxes::push_event("- a command that went on after its call returned could not be followed: read its shell to see how it went".into());
+        crate::vm::netboxes::push_event("- a command that went on after its call returned could not be followed: read its shell to see how it went".into());
     }
 }
 
 /// A background job's netbox: its output as it comes, then an hour's
 /// grace (Enter opens a shell there) before it closes.
 fn open_job_netbox(job: &str, command: &str, why: &str) -> Result<String, String> {
-    let name = crate::netboxes::job_name(job);
+    let name = crate::vm::netboxes::job_name(job);
     let label = crate::mistakes::one_line(command, 200);
-    let shown = crate::netboxes::display(&name);
+    let shown = crate::vm::netboxes::display(&name);
     let program = format!(
         "f=\"$HOME/.s0ma-bg/{job}\"\n\
          [ -n {why} ] && printf '\\033[3;90m# \\033[0;38;2;51;255;51ms0ma\\033[0;3;90m: %s\\033[0m\\n' {why}\n\
@@ -924,9 +934,9 @@ fn open_job_netbox(job: &str, command: &str, why: &str) -> Result<String, String
         label = crate::util::shell_quote(&label),
         shown_q = crate::util::shell_quote(&shown),
     );
-    let spec = crate::netboxes::Spec { name: name.clone(), purpose: label, by: format!("job:{job}"), program: Some(program), ..Default::default() };
-    crate::netboxes::open(&mut crate::netboxes::machine, &spec)?;
-    crate::vm_terms::touch();
+    let spec = crate::vm::netboxes::Spec { name: name.clone(), purpose: label, by: format!("job:{job}"), program: Some(program), ..Default::default() };
+    crate::vm::netboxes::open(&mut crate::vm::netboxes::machine, &spec)?;
+    crate::vm::terms::touch();
     Ok(name)
 }
 
@@ -1172,7 +1182,6 @@ fn run_guest_command(
     run_guest_command_with_capture_limit(command, timeout_secs, MAX_CAPTURE_CHARS)
 }
 
-#[cfg_attr(test, allow(dead_code))] // tests stand the local machine in for the guest
 /// Run a short harness-owned helper in the guest (not a model tool call), such
 /// as starting an MCP server that lives in the VM.
 pub(crate) fn run_helper_command(
@@ -1182,7 +1191,7 @@ pub(crate) fn run_helper_command(
     run_guest_command(command, timeout_secs)
 }
 
-/// Run a harness-owned helper through the s0ma runner (so as the s0ma user)
+/// Run a harness-owned helper through the agent runner (so as the agent user)
 /// and wait for it the way a long poll needs: status checked every
 /// `status_poll` instead of every 100 ms, since each check spawns a `virsh`,
 /// and a failed check retried rather than ending the wait, since the helper
@@ -1366,14 +1375,14 @@ fn guest_exec_status(pid: i64) -> Result<Option<Value>, Box<dyn Error>> {
     Ok(exited.then(|| status.clone()))
 }
 
-/// How long a stopped command gets to exit before s0ma stops waiting for it.
+/// How long a stopped command gets to exit before the agent stops waiting for it.
 const STOP_GRACE: Duration = Duration::from_secs(4);
 
 /// The shell run (through the same runner, so as the same user) to stop guest
 /// process `pid` and everything under it: TERM for the whole tree, collected
 /// first because children of an exited parent are reparented out of reach,
 /// then KILL for whatever is still there a second later. A subagent's
-/// command runs as its own account (under sudo), which s0ma stops with sudo.
+/// command runs as its own account (under sudo), which the agent stops with sudo.
 pub(crate) fn stop_tree_script(pid: i64) -> String {
     format!(
         "tree() {{ echo \"$1\"; for child in $(ps -o pid= --ppid \"$1\" 2>/dev/null); do tree \"$child\"; done; }}\n\
@@ -1421,6 +1430,10 @@ fn stop_guest_process(pid: i64, started: Instant, max_capture_chars: usize) -> c
 }
 
 fn qga_command(request: &Value) -> Result<Value, Box<dyn Error>> {
+    // Host mode: the agent works on this computer, and this one answers.
+    if crate::vm::machine::on_host() {
+        return crate::vm::machine::agent_command(request);
+    }
     let request = serde_json::to_string(request)?;
 
     let output = Command::new("virsh")
@@ -1453,8 +1466,10 @@ fn qga_command(request: &Value) -> Result<Value, Box<dyn Error>> {
 
 /// The VM's libvirt definition (`virsh dumpxml`): the live one while it runs,
 /// so paths libvirt fills in at start are there.
-#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn domain_xml() -> Result<String, Box<dyn Error>> {
+    if crate::vm::machine::on_host() {
+        return Err("host mode: the agent works on this computer, with no VM".into());
+    }
     let output = Command::new("virsh").args(["-c", libvirt_uri(), "dumpxml", vm_name()]).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1626,7 +1641,7 @@ fn new_command_id() -> String {
 // ------------------------------------------------------------------ goal tests
 
 /// Where a board's `command` goal test runs: inside the isolated analysis
-/// VM, as the unprivileged s0ma user, through the same guest runner `vm_exec`
+/// VM, as the unprivileged the agent user, through the same guest runner `vm_exec`
 /// uses. The call comes from the harness, never from the model — the model can
 /// only ask for the test, and the exit status is the verdict it does not get to
 /// author. A timeout is a failure, not an inconclusive result, because a goal
@@ -1639,8 +1654,12 @@ impl crate::board::TestRunner for GoalTest {
         command: &str,
         timeout_secs: u64,
     ) -> Result<crate::board::TestRun, Box<dyn Error>> {
-        if !crate::vm_access::allowed() {
+        if !crate::vm::access::allowed() {
             return Err("not run: the operator has turned off your access to your machine (/vm off), so the goal test cannot run until he turns it back on".into());
+        }
+        // `audit-run …` is the harness's own command (`crate::audit::run::command`).
+        if let Some(run) = crate::audit::run::command(command) {
+            return Ok(run);
         }
         crate::approval::ask(&format!("run the goal test: {}", crate::approval::one_line(command)), command)?;
         match run_guest_command(command, timeout_secs)? {
@@ -1698,7 +1717,7 @@ mod tests {
         assert!(!seen.contains("leftover-line"), "{seen}");
         assert!(!seen.contains(".s0ma-netbox-rc"), "nothing typed into it: {seen}");
         assert!(seen.contains("main"), "the first shell's prompt: {seen}");
-        assert!(seen.trim_end().ends_with(&format!("/tmp {}", crate::netboxes::VERSION)), "same folder, marked: {seen}");
+        assert!(seen.trim_end().ends_with(&format!("/tmp {}", crate::vm::netboxes::VERSION)), "same folder, marked: {seen}");
 
         // A netbox running something is not restarted under it.
         sh(&format!("tmux set-option -t s0ma-netbox @s0ma_netbox 1; tmux send-keys -t {pane} 'sleep 30' Enter; sleep 0.4"));
@@ -1708,43 +1727,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// End-to-end over the Legion transport: the real guest-command path, with
-    /// the `virsh` shim and `s0ma-exec-agent` standing in for libvirt and the
-    /// QEMU guest agent. Run with --ignored once the shim is on PATH.
-    #[test]
-    #[ignore]
-    fn a_physical_machine_answers_the_guest_command_path() {
-        let outcome = super::run_helper_command("echo hello from $(id -un) in $(pwd); exit 7", 20)
-            .expect("the transport carried the command");
-        match outcome {
-            super::GuestCommandOutcome::Exited(result) => {
-                println!("exit={:?} signal={:?}", result.exit_code, result.signal);
-                println!("stdout={:?}", result.stdout.trim());
-                println!("stderr={:?}", result.stderr.trim());
-                assert_eq!(result.exit_code, Some(7), "the command's own status came back");
-                assert!(result.stdout.contains("hello from s0ma in /workspace"), "{:?}", result.stdout);
-            }
-            super::GuestCommandOutcome::HostTimeout { .. } => panic!("unexpected timeout"),
-        }
-    }
-
-    /// `background` is off unless asked for, and asking for it does not need a
-    /// timeout: one is meaningless for a command meant to outlive the call.
-    #[test]
-    fn background_is_opt_in_and_needs_nothing_else() {
-        let plain: super::VmExecArgs = serde_json::from_str(r#"{"command":"ls"}"#).unwrap();
-        assert!(!plain.background, "a command is in the foreground unless it says otherwise");
-        let asked: super::VmExecArgs =
-            serde_json::from_str(r#"{"command":"make -j8","background":true}"#).unwrap();
-        assert!(asked.background);
-        assert_eq!(asked.timeout_secs, super::default_timeout_secs(), "the default stands in for one");
-    }
-
     /// The one way a background start could mislead is by reading as a command
     /// that finished, so the result says nothing that could be taken for an
     /// outcome -- no exit code, no stdout -- and says plainly that it is not
     /// one. The schema offers it, and the description says where the output
-    /// goes, or s0ma would have no way to find it.
+    /// goes, or the agent would have no way to find it.
     #[test]
     fn a_background_result_cannot_be_read_as_a_finished_command() {
         let tools = super::tool_definitions();
@@ -1769,111 +1756,5 @@ mod tests {
         assert!(value.get("exit_code").is_none(), "an exit code here would be a lie: {value}");
         assert!(value.get("stdout").is_none(), "{value}");
         assert_eq!(value["background"], true, "and it says what it is");
-    }
-
-    /// The domain every virsh call and audit record names. A blank override is
-    /// ignored rather than sending virsh an empty domain name.
-    #[test]
-    fn the_vm_domain_defaults_to_s0ma_and_an_override_must_say_something() {
-        use super::{chosen, chosen_setting, DEFAULT_LIBVIRT_URI, DEFAULT_VM_NAME};
-        assert_eq!((DEFAULT_VM_NAME, DEFAULT_LIBVIRT_URI), ("s0ma", "qemu:///system"));
-        // An unset or empty override leaves the default alone. (The values
-        // are passed in, not set in the environment, which every test thread
-        // reads at once.)
-        for blank in ["", "   ", "\t"] {
-            assert_eq!(chosen(Some(blank.into()), "fallback"), "fallback", "{blank:?}");
-        }
-        assert_eq!(chosen(None, "fallback"), "fallback");
-        assert_eq!(chosen_setting("S0MA_TEST_SETTING_NEVER_SET", "fallback"), "fallback");
-        // A real one is taken, trimmed: a VM on another machine needs no rebuild.
-        assert_eq!(chosen(Some("  qemu+ssh://operator@legion/system \n".into()), "fallback"), "qemu+ssh://operator@legion/system");
-        // Read once, so one run never names two domains or two connections.
-        assert_eq!(super::vm_name(), super::vm_name());
-        assert_eq!(super::libvirt_uri(), super::libvirt_uri());
-    }
-
-    /// H52: a result past the old 64,000-character clip is kept whole, so a
-    /// handle to it can return all of it; past the new bound the cut is still
-    /// made here, and said so with how much was dropped.
-    #[test]
-    fn output_past_the_old_clip_is_kept_and_a_cut_says_how_much() {
-        use base64::Engine;
-        let status = |stdout: &str| serde_json::json!({
-            "exited": true, "exitcode": 0,
-            "out-data": base64::engine::general_purpose::STANDARD.encode(stdout),
-        });
-        let produced: String = (0..1_500).map(|n| format!("L{n:04}-ALPHA {}\n", "x".repeat(36))).collect();
-        assert!(produced.chars().count() > 70_000);
-        let kept = super::parse_guest_result(&status(&produced), 1, super::MAX_CAPTURE_CHARS).unwrap();
-        assert!(!kept.stdout_truncated);
-        assert!(kept.stdout.contains("L1499-ALPHA"));
-        // Over the bound: cut, flagged, and the marker says what was kept of what.
-        let huge = "y".repeat(super::MAX_CAPTURE_CHARS + 10);
-        let cut = super::parse_guest_result(&status(&huge), 1, super::MAX_CAPTURE_CHARS).unwrap();
-        assert!(cut.stdout_truncated);
-        assert!(cut.stdout.ends_with(&format!("kept the first {} of {} characters; the rest was not captured]",
-            super::MAX_CAPTURE_CHARS, super::MAX_CAPTURE_CHARS + 10)));
-    }
-
-    /// The diagnostics go first in the result, so a preview that keeps the
-    /// head of a long result keeps them.
-    #[test]
-    fn diagnostics_come_first_in_the_result() {
-        let result = super::GuestCommandResult {
-            exit_code: Some(0), signal: None, stdout: "x".repeat(50_000), stderr: String::new(),
-            stdout_truncated: false, stderr_truncated: false, duration_ms: 1,
-        };
-        let mut value: serde_json::Value = serde_json::from_str(&super::format_guest_result(&result)).unwrap();
-        value["diagnostics"] = serde_json::json!([{"path": "/workspace/a.sh", "ok": false}]);
-        assert!(value.to_string().starts_with("{\"diagnostics\":"), "{}", &value.to_string()[..60]);
-    }
-
-    #[test]
-    fn a_quick_status_poll_backs_off_and_a_long_one_stays() {
-        use std::time::Duration;
-        let ms = Duration::from_millis;
-        let pauses = |poll: Duration| {
-            let mut pause = poll;
-            (0..6).map(|_| { pause = super::next_status_pause(pause, poll); pause.as_millis() }).collect::<Vec<_>>()
-        };
-        assert_eq!(pauses(ms(50)), vec![100, 200, 400, 500, 500, 500]);
-        assert_eq!(pauses(ms(500)), vec![500; 6], "a long poll is unchanged");
-    }
-
-    use super::*;
-    use std::process::Stdio;
-
-    /// Alive and not a zombie waiting to be reaped.
-    fn alive(pid: u32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit(')').next().map(|rest| rest.trim_start().chars().next() != Some('Z')))
-            .unwrap_or(false)
-    }
-
-    // The same script the guest runs, against a real local process tree: a
-    // parent, its children, and a grandchild that ignores TERM.
-    #[test]
-    fn the_stop_script_takes_down_the_whole_tree() {
-        let mut parent = Command::new("sh")
-            .args(["-c", "sleep 300 & sh -c 'trap \"\" TERM; sleep 300 & wait' & wait"])
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = parent.id();
-        thread::sleep(Duration::from_millis(300));
-        let tree = Command::new("sh")
-            .args(["-c", &format!("tree() {{ echo \"$1\"; for c in $(ps -o pid= --ppid \"$1\"); do tree \"$c\"; done; }}; tree {pid}")])
-            .output()
-            .unwrap();
-        let pids: Vec<u32> = String::from_utf8_lossy(&tree.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect();
-        assert!(pids.len() >= 4, "parent, two children and a grandchild: {pids:?}");
-
-        let stop = Command::new("sh").args(["-c", &stop_tree_script(pid as i64)]).status().unwrap();
-        assert!(stop.success());
-        let _ = parent.wait();
-        thread::sleep(Duration::from_millis(200));
-        let survivors: Vec<u32> = pids.iter().copied().filter(|p| alive(*p)).collect();
-        assert!(survivors.is_empty(), "still running: {survivors:?}");
     }
 }

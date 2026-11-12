@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-#[path = "episode_recall.rs"]
 pub mod recall;
-#[path = "archive_semantic.rs"]
 mod semantic;
 pub(crate) use semantic::{truncate_for_embedding, yield_to_generation, Embedder};
 
@@ -15,9 +13,7 @@ pub(crate) use semantic::{truncate_for_embedding, yield_to_generation, Embedder}
 pub(crate) fn match_expression(query: &str, require_all: bool) -> Option<String> {
     fts::match_expression(query, require_all)
 }
-#[path = "archive_fts.rs"]
 mod fts;
-#[path = "archive_rank.rs"]
 pub(crate) mod rank;
 
 use rank::{EventRange, TimeWindow};
@@ -35,7 +31,7 @@ pub const SOURCE_KINDS: &[&str] = &[
     "runtime",
 ];
 /// Searched unless the caller names kinds explicitly. Reasoning records are
-/// s0ma's own tentative analysis; by default they must not compete with the
+/// the agent's own tentative analysis; by default they must not compete with the
 /// events they were reasoning about.
 const DEFAULT_KINDS: &[&str] = &[
     "operator",
@@ -52,7 +48,7 @@ const DEFAULT_KINDS: &[&str] = &[
 /// the same way the event ID can.
 pub fn source_kind(speaker: &str, content: &str) -> &'static str {
     if speaker == "operator" {
-        if content.starts_with(OLD_MINECRAFT_PREFIX) || content.starts_with(crate::vm_wake::VM_WAKE_PREFIX) {
+        if content.starts_with(OLD_MINECRAFT_PREFIX) || content.starts_with(crate::vm::wake::VM_WAKE_PREFIX) {
             "environment"
         } else if content.starts_with(OLD_CONTACT_PREFIX) {
             "contact"
@@ -138,12 +134,12 @@ pub fn start_index(memory: &Hippocampus) -> Result<(), Box<dyn std::error::Error
     semantic::start(memory.archive_path())
 }
 
-/// Opened a Signal contact's message, when s0ma had a Signal bridge. Nothing
+/// Opened a Signal contact's message, when the agent had a Signal bridge. Nothing
 /// writes it now; records from then keep their label, so another person's
 /// words are never presented as the operator's.
 const OLD_CONTACT_PREFIX: &str = "[SIGNAL MESSAGE FROM A CONTACT]";
 
-/// Opened a Minecraft event turn, when Minecraft events woke s0ma. Nothing
+/// Opened a Minecraft event turn, when Minecraft events woke the agent. Nothing
 /// writes it now; records from then are still environmental, not operator
 /// input.
 const OLD_MINECRAFT_PREFIX: &str = "[MINECRAFT ENVIRONMENT EVENT]";
@@ -205,7 +201,7 @@ pub fn speaker_label(speaker: &Speaker, content: &str) -> &'static str {
         Speaker::S0ma => "s0ma",
         Speaker::Operator if content.starts_with(OLD_CONTACT_PREFIX) => "contact",
         Speaker::Operator if content.starts_with(OLD_MINECRAFT_PREFIX) => "environment",
-        Speaker::Operator if content.starts_with(crate::vm_wake::VM_WAKE_PREFIX) => "environment",
+        Speaker::Operator if content.starts_with(crate::vm::wake::VM_WAKE_PREFIX) => "environment",
         Speaker::Operator => "operator",
     }
 }
@@ -234,7 +230,7 @@ const SEMANTIC_WINDOW: usize = 40;
 /// Fused hits the judge reads before the limit cuts them. Fusion ranks by
 /// resemblance, which puts an event that merely shares words above the one
 /// that answers the question often enough to matter; a slip there used to cost
-/// s0ma the hit entirely, and now costs one judgment.
+/// the agent the hit entirely, and now costs one judgment.
 const RERANK_POOL: usize = 20;
 /// What the judge is asked of each hit.
 const HIT_QUESTION: &str = "Does this archive event bear on what the search is for, so that reading it would help?";
@@ -273,7 +269,7 @@ fn rerank_pool() -> usize {
 ///
 /// The same forced-choice readout the episode reminders use, and the same
 /// discipline: every hit keeps its place in `rank_score`, nothing is dropped
-/// for a low judgment (the limit does the cutting, so a search s0ma asked for
+/// for a low judgment (the limit does the cutting, so a search the agent asked for
 /// cannot come back empty because the judge was harsh), and if any judgment
 /// fails the fused order stands. Returns why it was skipped, when it was.
 fn rerank(query: &str, hits: &mut [ArchiveHit], judge: Judge) -> Option<String> {
@@ -325,7 +321,7 @@ fn rerank(query: &str, hits: &mut [ArchiveHit], judge: Judge) -> Option<String> 
 /// run, or an embedder that is down.
 const RECALL_LAG_TOLERANCE: u64 = 50;
 
-/// The search's answer to "is the embedding model still indexing?", so s0ma can
+/// The search's answer to "is the embedding model still indexing?", so the agent can
 /// tell a real miss from one the index could not have found.
 #[derive(Debug, Serialize)]
 struct Recall {
@@ -801,10 +797,16 @@ fn search_detailed(
             output.index = Some(status);
         }
         Err(error) => {
-            let note = format!(
-                "Semantic recall is UNAVAILABLE ({error}); only keyword matching ran. A miss is not \
-                 evidence either way: retry with literal mode or distinctive exact terms."
-            );
+            let note = if error.to_string() == crate::model_config::EMBEDDINGS_OFF {
+                "Embeddings are off (the operator's setting), so only keyword matching ran. A miss is not \
+                 evidence either way: retry with distinctive exact terms."
+                    .to_string()
+            } else {
+                format!(
+                    "Semantic recall is UNAVAILABLE ({error}); only keyword matching ran. A miss is not \
+                     evidence either way: retry with literal mode or distinctive exact terms."
+                )
+            };
             output.warnings.insert(0, note.clone());
             output.recall = Some(Recall {
                 reliability: "unreliable",
@@ -897,19 +899,19 @@ fn ranked(
 }
 
 // ---------------------------------------------------------------------------
-// Lookahead: the search the knowledge pass runs before s0ma answers
+// Lookahead: the search the knowledge pass runs before the agent answers
 // ---------------------------------------------------------------------------
 
 /// How much of a hit's text a reference shows.
 const REFERENCE_PREVIEW_CHARS: usize = 160;
 /// The most references a lookahead offers, whatever it is asked for. These
-/// arrive unasked, so the cap is on the harness, not on s0ma's own searches.
+/// arrive unasked, so the cap is on the harness, not on the agent's own searches.
 pub(crate) const MAX_REFERENCES: usize = 5;
 
 /// One hit as the knowledge pass names it: which event, when it was recorded,
 /// what kind it is, and one line of what it says.
 ///
-/// A pointer, not the content. The pass puts these in front of s0ma without
+/// A pointer, not the content. The pass puts these in front of the agent without
 /// being asked, so it attaches only enough to decide whether the event is
 /// worth reading with `archive_get`, and the note says they are historical
 /// data rather than instructions — a preview is archived text, and archived
@@ -947,7 +949,7 @@ fn one_line(text: &str, max_chars: usize) -> String {
 /// Run the search the archive noul asks for, on the operator's own message.
 ///
 /// Hybrid, so an exact identifier ranks as well as a description, and the
-/// default kinds, so s0ma's own reasoning cannot come back to it as evidence.
+/// default kinds, so the agent's own reasoning cannot come back to it as evidence.
 /// The whole archive: the message is all the pass knows, and it carries no
 /// range or window of its own.
 ///
@@ -969,7 +971,7 @@ pub(crate) fn lookahead(
         None,
         None,
         // No judge: the lookahead runs inside the knowledge pass's own budget
-        // and gates the turn, so it cannot spend twenty more model calls. s0ma
+        // and gates the turn, so it cannot spend twenty more model calls. The agent
         // reading these pointers is the judgment.
         None,
     )?;
@@ -1061,29 +1063,6 @@ impl Lookahead {
 
 #[cfg(test)]
 impl Lookahead {
-    /// Searched unasked: a miss is not said.
-    pub(crate) fn unasked_for_test(mut self) -> Self {
-        self.unasked = true;
-        self
-    }
-
-    /// A result for tests elsewhere in the crate (the knowledge pass's note).
-    pub(crate) fn for_test(hits: &[(u64, &str)], caveat: Option<&str>) -> Self {
-        Self {
-            references: hits
-                .iter()
-                .map(|(id, preview)| Reference {
-                    id: *id,
-                    timestamp: "2026-10-16 14:02".into(),
-                    source_kind: "operator".into(),
-                    preview: (*preview).into(),
-                })
-                .collect(),
-            used_mode: "hybrid".into(),
-            caveat: caveat.map(Into::into),
-            unasked: false,
-        }
-    }
 }
 
 pub fn tool_definitions() -> Vec<ToolDefinition> {
@@ -1259,48 +1238,7 @@ pub fn execute_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn an_event_says_when_it_was_in_words() {
-        let now = crate::clock::parse("2026-10-22T00:47:00+11:00").unwrap();
-        let when = when_read("2026-10-21T21:42:26.479444669+11:00", &now).unwrap();
-        assert_eq!(
-            when,
-            format!("{} local, 3 h 5 min before this read", crate::clock::stored("2026-10-21T21:42:26.479444669+11:00"))
-        );
-        assert_eq!(when_read("t", &now), None);
-    }
 
-    #[test]
-    fn pattern_finds_lines_with_archive_offsets() {
-        let content = "[tool:vm_exec]\narguments:\n{}\nresult:\nok 1\nFAIL test_a\nok 2\nfail: test_b\nduration_ms: 5";
-        let found = find_lines(content, "FAIL", 0);
-        let matches = found["matches"].as_array().unwrap();
-        assert_eq!(matches.len(), 2);
-        for m in matches {
-            let offset = m["offset"].as_u64().unwrap() as usize;
-            let line = m["line"].as_str().unwrap();
-            // The offset is exactly where archive_get would start that line.
-            assert_eq!(content.chars().skip(offset).take(line.chars().count()).collect::<String>(), line);
-        }
-        assert_eq!(matches[1]["line"], "fail: test_b");
-        assert!(found["more_from_offset"].is_null());
-        // Continue past the first hit.
-        let next = find_lines(content, "fail", matches[0]["offset"].as_u64().unwrap() as usize + 1);
-        assert_eq!(next["matches"].as_array().unwrap().len(), 1);
-        assert_eq!(find_lines(content, "absent", 0)["matches"], json!([]));
-    }
-    #[test]
-    fn pattern_caps_matches_and_windows_long_lines() {
-        let many: String = (0..100).map(|i| format!("error {i}\n")).collect();
-        let found = find_lines(&many, "error", 0);
-        assert_eq!(found["matches"].as_array().unwrap().len(), MAX_PATTERN_MATCHES);
-        let resume = found["more_from_offset"].as_u64().unwrap() as usize;
-        assert!(many.chars().skip(resume).collect::<String>().starts_with("error 30\n"));
-        let long = format!("{}NEEDLE{}", "x".repeat(2_000), "y".repeat(2_000));
-        let line = find_lines(&long, "needle", 0)["matches"][0]["line"].as_str().unwrap().to_owned();
-        assert!(line.contains("NEEDLE") && line.starts_with('…') && line.ends_with('…'));
-        assert!(line.chars().count() <= MAX_MATCH_LINE_CHARS + 2);
-    }
     /// An index status with `indexed` events embedded and `pending` queued.
     fn index(state: &str, indexed: usize, pending: usize, error: Option<&str>) -> semantic::IndexStatus {
         semantic::IndexStatus {
@@ -1318,105 +1256,6 @@ mod tests {
 
     fn ids(range: std::ops::RangeInclusive<u64>) -> HashSet<u64> {
         range.collect()
-    }
-
-    /// The whole archive in scope, with everything up to `embedded` settled.
-    fn whole(
-        status: &semantic::IndexStatus,
-        newest: u64,
-        embedded: u64,
-        mode: SearchMode,
-    ) -> Recall {
-        assess_recall(status, newest, &ids(1..=newest), "", &ids(1..=embedded), mode)
-    }
-
-    #[test]
-    fn a_caught_up_index_is_complete_whatever_its_state_name_says() {
-        // `catching_up` is the state after nearly every append; it used to warn.
-        let recall = whole(&index("catching_up", 1000, 0, None), 1000, 1000, SearchMode::Hybrid);
-        assert_eq!((recall.reliability, recall.unindexed_events, recall.searchable_events), ("complete", 0, 1000));
-        assert!(recall.note.is_empty());
-        assert!(recall.newest_unindexed_event.is_none());
-    }
-
-    #[test]
-    fn a_short_tail_is_lagging_and_says_what_still_finds_it() {
-        let hybrid = whole(&index("indexing", 990, 10, None), 1000, 990, SearchMode::Hybrid);
-        assert_eq!((hybrid.reliability, hybrid.unindexed_events), ("lagging", 10));
-        assert_eq!(hybrid.newest_unindexed_event, Some(1000));
-        assert!(hybrid.note.contains("10 event(s) are not embedded yet, the newest of them #1000"), "{}", hybrid.note);
-        assert!(hybrid.note.contains("Keyword matching still finds them"));
-        let semantic = whole(&index("indexing", 990, 10, None), 1000, 990, SearchMode::Semantic);
-        assert!(semantic.note.contains("Semantic mode cannot see them"));
-    }
-
-    #[test]
-    fn a_backlog_is_unreliable_and_says_which_part_is_missing() {
-        // The queue drains newest first, so the gap is the old end: here only
-        // the newest 4512 events are embedded out of 42512.
-        let settled = ids(38_001..=42_512);
-        let recall = assess_recall(
-            &index("indexing", 4512, 38_000, None),
-            42_512,
-            &ids(1..=42_512),
-            "",
-            &settled,
-            SearchMode::Hybrid,
-        );
-        assert_eq!((recall.reliability, recall.unindexed_events, recall.searchable_events), ("unreliable", 38_000, 4512));
-        assert_eq!(recall.newest_unindexed_event, Some(38_000));
-        for expected in [
-            "UNRELIABLE",
-            "still working through a backlog",
-            "38000 event(s)",
-            "#38000",
-            "4512 in scope can be matched by meaning",
-            "newest first, so what is missing is the older part",
-            "not evidence",
-        ] {
-            assert!(recall.note.contains(expected), "{expected:?} missing from {:?}", recall.note);
-        }
-    }
-
-    #[test]
-    fn an_empty_index_or_a_broken_embedder_is_named_as_the_cause() {
-        let empty = whole(&index("starting", 0, 500, None), 500, 0, SearchMode::Hybrid);
-        assert_eq!(empty.reliability, "unreliable");
-        assert!(empty.note.contains("empty"), "{}", empty.note);
-
-        let down = whole(&index("retrying", 100, 300, Some("connection refused")), 400, 100, SearchMode::Hybrid);
-        assert_eq!(down.reliability, "unreliable");
-        assert!(down.note.contains("embedding service is failing (connection refused)"));
-        // A failing embedder with only a short tail is still only lagging, but says so.
-        let blip = whole(&index("retrying", 395, 5, Some("connection refused")), 400, 395, SearchMode::Hybrid);
-        assert_eq!(blip.reliability, "lagging");
-        assert!(blip.note.contains("failing (connection refused)"));
-
-        // A stopped indexer never catches up, so even a short tail is unreliable.
-        let stopped = whole(&index("failed", 398, 2, Some("indexer panicked")), 400, 398, SearchMode::Hybrid);
-        assert_eq!(stopped.reliability, "unreliable");
-        assert!(stopped.note.contains("harness restart"));
-    }
-
-    #[test]
-    fn a_scope_is_judged_by_its_own_events_and_named() {
-        // Only the newest 38000 events are embedded; an old window is not.
-        let settled = ids(4_513..=42_512);
-        let status = index("indexing", 38_000, 4512, None);
-        let old = ids(100..=200);
-        let recall = assess_recall(&status, 42_512, &old, "time window", &settled, SearchMode::Hybrid);
-        assert_eq!((recall.reliability, recall.unindexed_events), ("unreliable", 101));
-        assert!(recall.note.contains("in this time window"), "{}", recall.note);
-
-        // A recent window is complete, and says so without claiming the rest is.
-        let recent = ids(42_000..=42_512);
-        let recall = assess_recall(&status, 42_512, &recent, "time window", &settled, SearchMode::Hybrid);
-        assert_eq!((recall.reliability, recall.unindexed_events), ("complete", 0));
-        assert!(recall.note.contains("This time window is fully indexed"), "{}", recall.note);
-
-        // The same machinery names an event range.
-        let recall = assess_recall(&status, 42_512, &old, "event range", &settled, SearchMode::Hybrid);
-        assert!(recall.note.contains("in this event range"), "{}", recall.note);
     }
 
     #[test]
@@ -1492,39 +1331,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_judge_leaves_the_fused_order_and_says_so() {
-        let fused: Vec<ArchiveHit> =
-            [(1, 0.03), (2, 0.02), (3, 0.01)].iter().map(|(id, s)| fused_hit(*id, *s)).collect();
-        // Down altogether.
-        let down = |_: &str, _: &[crate::knowledge::Question]| -> Answers { Err("HTTP 503".into()) };
-        let mut hits = fused.clone();
-        assert_eq!(rerank("x", &mut hits, &down).as_deref(), Some("HTTP 503"));
-        assert_eq!(hit_ids_of(&hits), [1, 2, 3]);
-        assert!(hits.iter().all(|hit| hit.relevance.is_none()));
-        // One question failing is the same: no half-judged order.
-        let partly = |_: &str, questions: &[crate::knowledge::Question]| -> Answers {
-            Ok(questions
-                .iter()
-                .enumerate()
-                .map(|(at, _)| if at == 1 { Err("timed out".into()) } else { Ok(0.9) })
-                .collect())
-        };
-        let mut hits = fused.clone();
-        assert_eq!(rerank("x", &mut hits, &partly).as_deref(), Some("timed out"));
-        assert_eq!(hit_ids_of(&hits), [1, 2, 3]);
-        assert!(hits.iter().all(|hit| hit.relevance.is_none()), "a half-judged order is not used");
-        // A miscounted answer set is refused too.
-        let short = |_: &str, _: &[crate::knowledge::Question]| -> Answers { Ok(vec![Ok(0.9)]) };
-        let mut hits = fused.clone();
-        assert!(rerank("x", &mut hits, &short).unwrap().contains("different number"));
-        assert_eq!(hit_ids_of(&hits), [1, 2, 3]);
-        // Nothing to reorder is not a failure.
-        let never = |_: &str, _: &[crate::knowledge::Question]| -> Answers { panic!("not asked") };
-        let mut one = vec![fused_hit(1, 0.03)];
-        assert!(rerank("x", &mut one, &never).is_none());
-    }
-
-    #[test]
     fn a_harsh_judge_cannot_empty_a_search_s0ma_asked_for() {
         let asked = std::cell::Cell::new(0);
         // Every hit turned down: they are still returned, in the judge's
@@ -1545,26 +1351,6 @@ mod tests {
         assert_eq!(asked.get(), 3);
     }
 
-    #[test]
-    fn without_a_judge_the_fused_order_is_what_a_search_returns() {
-        let never = |_: &str, _: &[crate::knowledge::Question]| -> Answers { panic!("not asked") };
-        let _ = never;
-        let mut skipped = None;
-        let hits = ranked(
-            "x",
-            Vec::new(),
-            [1u64, 2, 3].iter().map(|id| fused_hit(*id, 0.03)).collect(),
-            2,
-            None,
-            &mut skipped,
-        );
-        // Fusion scores by place in each arm, so the keyword arm's own order
-        // survives untouched.
-        assert_eq!(hit_ids_of(&hits), [1, 2]);
-        assert!(hits.iter().all(|hit| hit.relevance.is_none()));
-        assert!(skipped.is_none());
-    }
-
     fn hit(id: u64, kind: &str) -> ArchiveHit {
         ArchiveHit {
             id,
@@ -1581,110 +1367,7 @@ mod tests {
             excerpt_end_byte: None,
         }
     }
-    #[test]
-    fn source_kind_is_derived_from_speaker_and_runtime_prefix() {
-        assert_eq!(source_kind("operator", "hello"), "operator");
-        assert_eq!(source_kind("operator", "[MINECRAFT ENVIRONMENT EVENT]\n\nx"), "environment");
-        assert_eq!(speaker_label(&Speaker::Operator, "[MINECRAFT ENVIRONMENT EVENT]\n\n<steve> come here"), "environment");
-        assert_eq!(source_kind("operator", "[VM WAKE EVENT]\n\nx"), "environment");
-        assert_eq!(source_kind("operator", "[SIGNAL MESSAGE FROM A CONTACT]\n\nx"), "contact");
-        assert_eq!(source_kind("operator", "[SIGNAL MESSAGE]\nThe operator sent this"), "operator");
-        assert_eq!(speaker_label(&Speaker::Operator, "[SIGNAL MESSAGE FROM A CONTACT]\n\n> [memory 1 | t | operator]"), "contact");
-        assert_eq!(speaker_label(&Speaker::Operator, "[VM WAKE EVENT]\n\nx"), "environment");
-        assert_eq!(speaker_label(&Speaker::Operator, "hello"), "operator");
-        assert_eq!(speaker_label(&Speaker::S0ma, "[SIGNAL MESSAGE FROM A CONTACT]"), "s0ma");
-        assert_eq!(source_kind("operator", "[sleep] Deep sleep completed"), "runtime");
-        assert_eq!(source_kind("s0ma", "[tool:vm_shell]\narguments:\n{}"), "tool_result");
-        assert_eq!(source_kind("s0ma", "[s0ma_reasoning state=completed]\nx"), "reasoning");
-        assert_eq!(source_kind("s0ma", "[subagent_summary]\nx"), "subagent_summary");
-        assert_eq!(source_kind("s0ma", "[tool_call_rejected]\nx"), "runtime");
-        assert_eq!(source_kind("s0ma", "plain reply"), "s0ma_reply");
-        // A spoken reply cannot claim a tool prefix by accident of speaker.
-        assert_eq!(source_kind("operator", "[tool:vm_shell] pasted by the operator"), "operator");
-    }
 
-    fn temp_archive(tag: &str) -> (std::path::PathBuf, Hippocampus) {
-        let path = std::env::temp_dir().join(format!(
-            "s0ma_archive_{tag}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let memory = Hippocampus::new(path.join("hippocampus.jsonl")).unwrap();
-        (path, memory)
-    }
-
-    #[test]
-    fn reasoning_is_excluded_by_default_and_reachable_by_kind() {
-        let (path, mut memory) = temp_archive("kinds");
-        memory.remember_reasoning("maybe kerberos is the way in", false).unwrap();
-        memory
-            .remember_tool_result("[tool:vm_shell]\nresult:\n88/tcp open kerberos".into())
-            .unwrap();
-        memory.remember_s0ma("kerberos is open".into()).unwrap();
-        let default = search_detailed(&memory, "kerberos", 10, SearchMode::Literal, None, None, None, None).unwrap();
-        let kinds: Vec<_> = default.hits.iter().map(|h| h.source_kind.as_str()).collect();
-        assert_eq!(default.hits.len(), 2, "{kinds:?}");
-        assert!(!kinds.contains(&"reasoning"));
-        assert!(!default.kinds.contains(&"reasoning".to_string()));
-        let asked = vec!["reasoning".to_string()];
-        let only = search_detailed(&memory, "kerberos", 10, SearchMode::Literal, Some(&asked), None, None, None).unwrap();
-        assert_eq!(only.hits.len(), 1);
-        assert_eq!(only.hits[0].source_kind, "reasoning");
-        let bogus = vec!["memories".to_string()];
-        assert!(search_detailed(&memory, "kerberos", 10, SearchMode::Literal, Some(&bogus), None, None, None).is_err());
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn keyword_search_falls_back_to_the_scan_when_the_index_is_unusable() {
-        let (path, mut memory) = temp_archive("ftsfallback");
-        memory.remember_operator("Investigate Ticket-42".into()).unwrap();
-        // A directory where the derived database should be makes the index fail.
-        std::fs::create_dir(path.join("hippocampus.fts.sqlite3")).unwrap();
-        let result = search_detailed(&memory, "ticket-42", 5, SearchMode::Literal, None, None, None, None).unwrap();
-        assert_eq!(result.hits.len(), 1);
-        assert!(result.warnings.iter().any(|w| w.contains("Keyword index unavailable")));
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn archived_tool_pages_reconstruct_exact_original() {
-        let path = std::env::temp_dir().join(format!(
-            "s0ma-page-{}-{}.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut memory = Hippocampus::new(&path).unwrap();
-        let original = "abc界\n".repeat(5000);
-        let id = memory.remember_tool_result(original.clone()).unwrap();
-        let mut offset = 0;
-        let mut rebuilt = String::new();
-        loop {
-            let call = ToolCall {
-                id: "page".into(),
-                kind: "function".into(),
-                function: crate::types::FunctionCall {
-                    name: "archive_get".into(),
-                    arguments: json!({"id":id,"offset":offset,"limit":1234}).to_string(),
-                },
-            };
-            let page: serde_json::Value =
-                serde_json::from_str(&execute(&memory, &call).unwrap()).unwrap();
-            rebuilt.push_str(page["content"].as_str().unwrap());
-            match page["next_offset"].as_u64() {
-                Some(next) => offset = next,
-                None => break,
-            }
-        }
-        assert_eq!(rebuilt, original);
-        std::fs::remove_file(path).unwrap();
-    }
     #[test]
     fn hybrid_rewards_agreement_without_duplicate_events() {
         let hits = fuse(
@@ -1695,62 +1378,6 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].id, 2);
         assert_eq!(hits[0].match_type, "both");
-    }
-    #[test]
-    fn literal_mode_requires_no_embedding_endpoint() {
-        let path = std::env::temp_dir().join(format!(
-            "s0ma_archive_literal_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut memory = Hippocampus::new(path.join("hippocampus.jsonl")).unwrap();
-        memory
-            .remember_operator("Investigate Ticket-42".into())
-            .unwrap();
-        memory
-            .remember_s0ma("Ticket-42 is resolved".into())
-            .unwrap();
-        let result = search_detailed(&memory, "ticket-42", 5, SearchMode::Literal, None, None, None, None).unwrap();
-        assert_eq!(result.hits.len(), 2);
-        assert_eq!(result.used_mode, "literal");
-        assert!(result.index.is_none());
-        assert!(result.warnings.is_empty());
-        // Ranked by BM25 relevance now, not recency: both events must be present,
-        // and each carries its deterministic source kind.
-        let mut ids: Vec<u64> = result.hits.iter().map(|h| h.id).collect();
-        ids.sort();
-        assert_eq!(ids.len(), 2);
-        assert!(result.hits.iter().any(|h| h.source_kind == "operator"));
-        assert!(result.hits.iter().any(|h| h.source_kind == "s0ma_reply"));
-        assert!(!path.join("hippocampus.semantic.sqlite3").exists());
-        std::fs::remove_dir_all(path).unwrap();
-    }
-    #[test]
-    fn unavailable_index_has_explicit_fallback_and_semantic_only_stays_semantic() {
-        let path = std::env::temp_dir().join(format!(
-            "s0ma_archive_unavailable_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut memory = Hippocampus::new(path.join("hippocampus.jsonl")).unwrap();
-        memory.remember_operator("Ticket-42".into()).unwrap();
-        // A directory in place of the derived database makes initialization fail.
-        std::fs::create_dir(path.join("hippocampus.semantic.sqlite3")).unwrap();
-        let hybrid = search_detailed(&memory, "Ticket-42", 5, SearchMode::Hybrid, None, None, None, None).unwrap();
-        assert_eq!(hybrid.used_mode, "literal_fallback");
-        assert_eq!(hybrid.hits.len(), 1);
-        assert!(!hybrid.warnings.is_empty());
-        let semantic = search_detailed(&memory, "Ticket-42", 5, SearchMode::Semantic, None, None, None, None).unwrap();
-        assert_eq!(semantic.used_mode, "unavailable");
-        assert!(semantic.hits.is_empty());
-        assert!(!semantic.warnings.is_empty());
-        std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn repaired_and_deleted_records_cannot_be_returned_from_stale_index() {

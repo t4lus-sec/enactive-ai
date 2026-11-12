@@ -1,15 +1,15 @@
 //! Files between the two machines, both ways.
 //!
 //! - `/share` (the operator): copy files from the operator's machine into
-//!   `/share` on s0ma's.
-//! - `send_to_operator` (a tool, s0ma): copy a file from s0ma's machine into the
+//!   `/share` on the agent's.
+//! - `send_to_operator` (a tool, the agent): copy a file from the agent's machine into the
 //!   operator's receive folder, `~/s0ma-share` unless `S0MA_RECEIVE_DIR` says
 //!   otherwise.
 //!
 //! ## /share
 //!
 //! `@path` puts a file's text into a message; this puts the file itself where
-//! s0ma can run, edit or keep it. The only way onto s0ma's machine is the guest
+//! the agent can run, edit or keep it. The only way onto the agent's machine is the guest
 //! command path (exec and status, through `virsh`), which has no file
 //! transfer, so the file goes over in pieces: each piece base64-encoded inside
 //! a command and appended to a hidden temp file beside its destination. Every
@@ -19,10 +19,14 @@
 //! checked against the original's, and it is renamed into place without
 //! replacing anything: a second `notes.md` arrives as `notes (2).md`.
 //!
-//! Nothing here starts a turn. The next message the operator sends tells s0ma
+//! Nothing here starts a turn. The next message the operator sends tells the agent
 //! what arrived (`arrival_note`, appended the way the knowledge check's note
 //! is), so a file landing is news exactly when the operator has something to
 //! say about it.
+
+pub(crate) mod backup;
+pub(crate) mod files;
+pub(crate) mod sync;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
@@ -30,7 +34,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Where sent files land, unless `S0MA_SHARE_DIR` names another directory.
-/// Created, owned by s0ma, by `setup-legion.sh` and `bootstrap-guest.sh`.
+/// Created, owned by the agent, by `setup-legion.sh` and `bootstrap-guest.sh`.
 pub const DEFAULT_SHARE_DIR: &str = "/share";
 
 /// File bytes per guest command. Base64 twice makes it ~87 KiB of argument,
@@ -64,7 +68,7 @@ pub struct Sent {
 }
 
 impl Sent {
-    /// One line for the operator and for s0ma: `/share/run.sh (2.1 KB, executable)`.
+    /// One line for the operator and for the agent: `/share/run.sh (2.1 KB, executable)`.
     pub fn describe(&self) -> String {
         let executable = if self.executable { ", executable" } else { "" };
         format!("{} ({}{executable})", self.destination, human_size(self.bytes))
@@ -76,7 +80,14 @@ pub fn share_dir() -> String {
         .ok()
         .map(|dir| dir.trim().trim_end_matches('/').to_string())
         .filter(|dir| !dir.is_empty())
-        .unwrap_or_else(|| DEFAULT_SHARE_DIR.to_string())
+        .unwrap_or_else(|| {
+            // Host mode: the folder on this computer is the shared one itself.
+            if crate::vm::machine::on_host() {
+                receive_dir().display().to_string().trim_end_matches('/').to_string()
+            } else {
+                DEFAULT_SHARE_DIR.to_string()
+            }
+        })
 }
 
 /// The paths after `/share`, separated by spaces. A backslash or quotes keep a
@@ -126,7 +137,7 @@ pub fn parse_paths(rest: &str) -> Result<Vec<PathBuf>, String> {
     Ok(words.iter().map(|word| crate::completion::resolve_path(word)).collect())
 }
 
-/// Copy `path` into `dir` on s0ma's machine, through `run` (a guest command
+/// Copy `path` into `dir` on the agent's machine, through `run` (a guest command
 /// and its timeout). Nothing is left behind when it fails.
 pub fn send(path: &Path, dir: &str, run: &mut dyn FnMut(&str, u64) -> Result<Ran, String>) -> Result<Sent, String> {
     let metadata = std::fs::metadata(path).map_err(|error| format!("cannot open it: {error}"))?;
@@ -206,7 +217,7 @@ pub fn send(path: &Path, dir: &str, run: &mut dyn FnMut(&str, u64) -> Result<Ran
 }
 
 // ------------------------------------------------------------------
-// send_to_operator: s0ma's machine to the operator's
+// send_to_operator: the agent's machine to the operator's
 // ------------------------------------------------------------------
 //
 // The other direction has a much larger budget: file bytes come back as a
@@ -214,7 +225,7 @@ pub fn send(path: &Path, dir: &str, run: &mut dyn FnMut(&str, u64) -> Result<Ran
 // the harness's capture of a helper's output (1,000,000 characters) and the
 // exec agent's (24 MiB), so a piece is 512 KiB, base64 699,052 characters.
 //
-// The file is first copied to a temp file on s0ma's machine, so a file still
+// The file is first copied to a temp file on the agent's machine, so a file still
 // being written arrives as one consistent version that its checksum describes.
 // On the operator's machine it is written beside its destination and hard-linked
 // into place, which fails rather than replaces when the name is taken, so no
@@ -228,7 +239,7 @@ pub(crate) const RECEIVE_CHUNK_BYTES: usize = 512 * 1024;
 const MAX_PATH_CHARS: usize = 4096;
 const MAX_NAME_BYTES: usize = 255;
 
-/// Where files s0ma sends land on the operator's machine.
+/// Where files the agent sends land on the operator's machine.
 pub fn receive_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("S0MA_RECEIVE_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
@@ -296,7 +307,7 @@ pub fn execute(call: &crate::types::ToolCall) -> Result<String, Box<dyn std::err
 /// A file that reached the operator.
 #[derive(Debug)]
 pub struct Received {
-    /// The path on s0ma's machine, as resolved there.
+    /// The path on the agent's machine, as resolved there.
     pub source: String,
     pub destination: String,
     pub bytes: u64,
@@ -325,7 +336,7 @@ fn arrival_name(name: &str) -> Result<String, String> {
     Ok(cleaned.to_string())
 }
 
-/// Copy `path` on s0ma's machine into `dir` on this one, through `run`.
+/// Copy `path` on the agent's machine into `dir` on this one, through `run`.
 pub fn receive(
     path: &str,
     name: Option<&str>,
@@ -451,7 +462,7 @@ fn fetch(
     outcome
 }
 
-/// The note s0ma gets with the operator's next message./// The note s0ma gets with the operator's next message.
+/// The note the agent gets with the operator's next message./// The note the agent gets with the operator's next message.
 pub fn arrival_note(arrived: &[String]) -> Option<String> {
     if arrived.is_empty() {
         return None;
@@ -464,7 +475,7 @@ pub fn arrival_note(arrived: &[String]) -> Option<String> {
     Some(note)
 }
 
-/// Production: the guest command path, as the s0ma user. Each step takes
+/// Production: the guest command path, as the agent user. Each step takes
 /// milliseconds, so its status is asked for after 10 ms and then less and less
 /// often, rather than every 100 ms: measured through the shim, a 145 KB file
 /// took 1.04 s at the default pace.
@@ -481,7 +492,7 @@ pub fn run_on_machine(command: &str, timeout_secs: u64) -> Result<Ran, String> {
     }
 }
 
-/// Tests stand the local machine in for s0ma's, as `mcp_guest` does.
+/// Tests stand the local machine in for the agent's, as `mcp_guest` does.
 #[cfg(test)]
 pub fn run_on_machine(command: &str, timeout_secs: u64) -> Result<Ran, String> {
     tests::local(command, timeout_secs)
@@ -509,7 +520,6 @@ pub(crate) fn split_name(name: &str) -> (&str, &str) {
     }
 }
 
-
 #[cfg(unix)]
 fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
@@ -536,7 +546,7 @@ pub fn human_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The local machine standing in for s0ma's, the way other guest modules'
+    /// The local machine standing in for the agent's, the way other guest modules'
     /// tests do it: each command run by bash, as this user.
     pub(super) fn local(command: &str, _timeout: u64) -> Result<Ran, String> {
         let output = std::process::Command::new("bash")
@@ -563,20 +573,6 @@ mod tests {
         fn share(&self) -> String {
             self.0.join("share").display().to_string()
         }
-        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
-            let path = self.0.join(name);
-            std::fs::write(&path, bytes).unwrap();
-            path
-        }
-        /// Everything in the share directory, hidden temp files included.
-        fn listing(&self) -> Vec<String> {
-            let mut names: Vec<String> = std::fs::read_dir(self.0.join("share"))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            names
-        }
     }
 
     impl Drop for Scratch {
@@ -589,112 +585,6 @@ mod tests {
     /// included, over several pieces.
     fn awkward(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
-    }
-
-    /// Through the real guest command path: virsh (the Legion shim, or
-    /// libvirt), the exec agent, s0ma-run, as the s0ma user. Run by hand:
-    ///   PATH=legion-shim-dir:$PATH S0MA_LEGION_LOCAL=1 S0MA_SHARE_DIR=/share \
-    ///     cargo test a_file_reaches_s0mas_machine -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn a_file_reaches_s0mas_machine_through_the_real_guest_command_path() {
-        let scratch = Scratch::new("real");
-        let original = awkward(CHUNK_BYTES * 3 + 777);
-        let source = scratch.file("through the shim.bin", &original);
-        let mut real = |command: &str, timeout: u64| match crate::vm::run_helper_waiting(command, timeout, QUICK_STATUS_POLL) {
-            Ok(crate::vm::GuestCommandOutcome::Exited(result)) => {
-                Ok(Ran { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr })
-            }
-            Ok(other) => Err(format!("{other:?}")),
-            Err(error) => Err(error.to_string()),
-        };
-        let started = std::time::Instant::now();
-        let sent = send(&source, &share_dir(), &mut real).unwrap();
-        let elapsed = started.elapsed();
-        let check = real(&format!("sha256sum {} | cut -d' ' -f1; stat -c '%U %a' {}", crate::util::shell_quote(&sent.destination), crate::util::shell_quote(&sent.destination)), 30).unwrap();
-        let expected = format!("{:x}", Sha256::digest(&original));
-        println!("sent {} in {:.2}s; on the machine: {}", sent.describe(), elapsed.as_secs_f64(), check.stdout.trim().replace('\n', " | "));
-        assert!(check.stdout.starts_with(&expected), "{}", check.stdout);
-        assert!(check.stdout.contains("s0ma 644"), "owned by s0ma, readable: {}", check.stdout);
-        real(&format!("rm -f {}", crate::util::shell_quote(&sent.destination)), 30).unwrap();
-    }
-
-    #[test]
-    fn a_file_of_several_pieces_arrives_byte_for_byte_and_leaves_nothing_else() {
-        let scratch = Scratch::new("pieces");
-        let original = awkward(CHUNK_BYTES * 3 + 1234);
-        let source = scratch.file("data.bin", &original);
-        let mut commands = Vec::new();
-        let mut run = |command: &str, timeout: u64| {
-            commands.push(command.len());
-            local(command, timeout)
-        };
-        let sent = send(&source, &scratch.share(), &mut run).unwrap();
-
-        assert_eq!(sent.destination, format!("{}/data.bin", scratch.share()));
-        assert_eq!(std::fs::read(&sent.destination).unwrap(), original);
-        assert_eq!(scratch.listing(), ["data.bin"], "no temp file left behind");
-        // Prepare, four pieces, finish.
-        assert_eq!(commands.len(), 6);
-        // What production does to each command before it reaches a process's
-        // argument list: base64 it once more. Every one stays under the
-        // 128 KiB a single argument may be, with room to spare.
-        let largest = commands.iter().max().unwrap();
-        assert!(largest * 4 / 3 + 4 < 120_000, "{largest} bytes of command");
-    }
-
-    #[test]
-    fn a_second_file_of_the_same_name_does_not_replace_the_first() {
-        let scratch = Scratch::new("names");
-        let first = send(&scratch.file("notes.md", b"first\n"), &scratch.share(), &mut local).unwrap();
-        let second = send(&scratch.file("notes.md", b"second\n"), &scratch.share(), &mut local).unwrap();
-        let third = send(&scratch.file("notes.md", b"third\n"), &scratch.share(), &mut local).unwrap();
-        assert!(first.destination.ends_with("/notes.md"));
-        assert!(second.destination.ends_with("/notes (2).md"), "{}", second.destination);
-        assert!(third.destination.ends_with("/notes (3).md"), "{}", third.destination);
-        assert_eq!(std::fs::read_to_string(&first.destination).unwrap(), "first\n", "untouched");
-        // A name without an extension, and a quote in a name, get the same care.
-        let makefile = scratch.file("Makefile", b"all:\n");
-        send(&makefile, &scratch.share(), &mut local).unwrap();
-        let again = send(&makefile, &scratch.share(), &mut local).unwrap();
-        assert!(again.destination.ends_with("/Makefile (2)"), "{}", again.destination);
-        let quoted = send(&scratch.file("it's here.txt", b"x"), &scratch.share(), &mut local).unwrap();
-        assert!(quoted.destination.ends_with("/it's here.txt"), "{}", quoted.destination);
-    }
-
-    #[test]
-    fn the_executable_bit_comes_along_and_everything_else_is_readable() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let scratch = Scratch::new("modes");
-        let script = scratch.file("run.sh", b"#!/bin/sh\necho hi\n");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let sent = send(&script, &scratch.share(), &mut local).unwrap();
-        assert!(sent.executable && sent.describe().ends_with("(18 B, executable)"), "{}", sent.describe());
-        let mode = std::fs::metadata(&sent.destination).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755);
-        let plain = send(&scratch.file("plain.txt", b"x"), &scratch.share(), &mut local).unwrap();
-        let mode = std::fs::metadata(&plain.destination).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "not mktemp's 0600");
-    }
-
-    #[test]
-    fn a_damaged_transfer_is_caught_and_cleaned_up() {
-        let scratch = Scratch::new("damage");
-        let source = scratch.file("big.bin", &awkward(CHUNK_BYTES * 2 + 10));
-        // A transport that drops the second piece on the floor.
-        let mut pieces = 0;
-        let mut lossy = |command: &str, timeout: u64| {
-            if command.contains("base64 -d") {
-                pieces += 1;
-                if pieces == 2 {
-                    return Ok(Ran { exit_code: Some(0), stdout: String::new(), stderr: String::new() });
-                }
-            }
-            local(command, timeout)
-        };
-        let error = send(&source, &scratch.share(), &mut lossy).unwrap_err();
-        assert!(error.contains("arrived damaged"), "{error}");
-        assert!(scratch.listing().is_empty(), "nothing half-written: {:?}", scratch.listing());
     }
 
     #[test]
@@ -713,35 +603,9 @@ mod tests {
         assert_eq!(calls, 0, "not one guest command for a file that was never going");
     }
 
-    #[test]
-    fn a_missing_share_directory_says_who_makes_it() {
-        let scratch = Scratch::new("nodir");
-        let source = scratch.file("a.txt", b"x");
-        let error = send(&source, &scratch.0.join("nowhere").display().to_string(), &mut local).unwrap_err();
-        assert!(error.contains("does not exist") && error.contains("setup-legion.sh"), "{error}");
-    }
-
-    #[test]
-    fn an_empty_file_arrives_empty() {
-        let scratch = Scratch::new("empty");
-        let sent = send(&scratch.file("empty", b""), &scratch.share(), &mut local).unwrap();
-        assert_eq!(std::fs::read(&sent.destination).unwrap(), b"");
-        assert_eq!(scratch.listing(), ["empty"]);
-    }
-
-    #[test]
-    fn paths_split_on_spaces_that_nothing_protects() {
-        let home = std::env::var("HOME").unwrap();
-        let paths = parse_paths(r#" a.txt my\ notes.md "two words.pdf" 'it''s' ~/x.sh "#).unwrap();
-        let shown: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
-        assert_eq!(shown, ["a.txt", "my notes.md", "two words.pdf", "its", &format!("{home}/x.sh")]);
-        assert!(parse_paths("  ").unwrap_err().starts_with("usage: /share"));
-        assert!(parse_paths(r#""unclosed"#).unwrap_err().contains("not closed"));
-    }
-
     // ---- send_to_operator ----
 
-    /// s0ma's machine, standing in: bash with its own temp directory, home and
+    /// The agent's machine, standing in: bash with its own temp directory, home and
     /// working directory, so what the snapshot leaves behind can be checked.
     fn machine(scratch: &Scratch) -> impl FnMut(&str, u64) -> Result<Ran, String> + '_ {
         for dir in ["tmp", "home", "workspace", "received"] {
@@ -801,66 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_on_the_operators_machine_is_ever_replaced_not_even_through_a_link() {
-        let scratch = Scratch::new("noclobber");
-        let mut run = machine(&scratch);
-        let received_dir = scratch.0.join("received");
-        std::fs::write(scratch.0.join("workspace/report.pdf"), b"from s0ma").unwrap();
-        std::fs::write(received_dir.join("report.pdf"), b"the operator's own").unwrap();
-        // A link where the file would land must not be written through.
-        let elsewhere = scratch.0.join("precious");
-        std::fs::write(&elsewhere, b"precious").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, received_dir.join("report (2).pdf")).unwrap();
-
-        let first = receive("report.pdf", None, &received_dir, &mut run).unwrap();
-        assert!(first.destination.ends_with("/report (3).pdf"), "{}", first.destination);
-        assert_eq!(std::fs::read(received_dir.join("report.pdf")).unwrap(), b"the operator's own");
-        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"precious");
-        assert_eq!(std::fs::read(&first.destination).unwrap(), b"from s0ma");
-    }
-
-    #[test]
-    fn an_arrival_name_is_one_file_name_and_a_bad_one_costs_nothing() {
-        let scratch = Scratch::new("names-back");
-        let calls = std::cell::Cell::new(0);
-        let mut run = machine(&scratch);
-        let mut counting = |command: &str, timeout: u64| {
-            calls.set(calls.get() + 1);
-            run(command, timeout)
-        };
-        let received_dir = scratch.0.join("received");
-        for bad in ["../escape.txt", "a/b.txt", "", "..", "  "] {
-            assert!(receive("x", Some(bad), &received_dir, &mut counting).is_err(), "{bad:?}");
-        }
-        assert_eq!(calls.get(), 0, "refused before s0ma's machine was asked anything");
-        std::fs::write(scratch.0.join("workspace/out.txt"), b"x").unwrap();
-        let renamed = receive("out.txt", Some("summary\n.txt"), &received_dir, &mut counting).unwrap();
-        assert!(renamed.destination.ends_with("/summary_.txt"), "control characters made visible: {}", renamed.destination);
-    }
-
-    #[test]
-    fn a_damaged_piece_is_caught_and_leaves_nothing_on_either_machine() {
-        let scratch = Scratch::new("damage-back");
-        let mut run = machine(&scratch);
-        std::fs::write(scratch.0.join("workspace/data.bin"), awkward(RECEIVE_CHUNK_BYTES + 10)).unwrap();
-        // A transport that hands back the right number of the wrong bytes.
-        let mut tampering = |command: &str, timeout: u64| {
-            let mut ran = run(command, timeout)?;
-            if command.starts_with("dd if=") {
-                let mut bytes = STANDARD.decode(ran.stdout.trim()).unwrap();
-                bytes[0] ^= 0xff;
-                ran.stdout = STANDARD.encode(bytes);
-            }
-            Ok(ran)
-        };
-        let received_dir = scratch.0.join("received");
-        let error = receive("data.bin", None, &received_dir, &mut tampering).unwrap_err();
-        assert!(error.contains("arrived damaged"), "{error}");
-        assert!(entries(&received_dir).is_empty(), "{:?}", entries(&received_dir));
-        assert!(entries(&scratch.0.join("tmp")).is_empty());
-    }
-
-    #[test]
     fn a_file_still_being_written_arrives_as_one_consistent_version() {
         let scratch = Scratch::new("moving");
         let mut run = machine(&scratch);
@@ -892,60 +696,8 @@ mod tests {
         assert!(receive("missing.txt", None, &received_dir, &mut run).unwrap_err().contains("no such file"));
         assert!(receive("huge.img", None, &received_dir, &mut run).unwrap_err().contains("over the"));
         assert!(entries(&received_dir).is_empty() && entries(&scratch.0.join("tmp")).is_empty());
-        // And ~/ is s0ma's home.
+        // And ~/ is the agent's home.
         let home = receive("~/note.md", None, &received_dir, &mut run).unwrap();
         assert_eq!(std::fs::read(&home.destination).unwrap(), b"from home");
-    }
-
-    #[test]
-    fn the_tool_takes_a_path_and_nothing_unexpected() {
-        let definition = serde_json::to_value(&tool_definitions()[0]).unwrap();
-        assert_eq!(definition["function"]["name"], TOOL_NAME);
-        assert_eq!(definition["function"]["parameters"]["required"], serde_json::json!(["path"]));
-        assert_eq!(definition["function"]["parameters"]["additionalProperties"], false);
-        let description = definition["function"]["description"].as_str().unwrap();
-        assert!(description.contains("/share"), "says where files from the operator arrive");
-        assert!(handles(TOOL_NAME) && !handles("vm_exec"));
-    }
-
-    /// Through the real guest command path, as the /share one. Run by hand:
-    ///   PATH=legion-shim-dir:$PATH S0MA_LEGION_LOCAL=1 \
-    ///     cargo test a_file_comes_back_through -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn a_file_comes_back_through_the_real_guest_command_path() {
-        let scratch = Scratch::new("real-back");
-        let mut real = |command: &str, timeout: u64| match crate::vm::run_helper_waiting(command, timeout, QUICK_STATUS_POLL) {
-            Ok(crate::vm::GuestCommandOutcome::Exited(result)) => {
-                Ok(Ran { exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr })
-            }
-            Ok(other) => Err(format!("{other:?}")),
-            Err(error) => Err(error.to_string()),
-        };
-        // Made on s0ma's machine, as s0ma: 1.5 MiB of random bytes.
-        let made = real("head -c 1572864 /dev/urandom > /tmp/s0ma-back-test.bin && sha256sum /tmp/s0ma-back-test.bin | cut -d' ' -f1", 30).unwrap();
-        let started = std::time::Instant::now();
-        let received = receive("/tmp/s0ma-back-test.bin", None, &scratch.0, &mut real).unwrap();
-        let elapsed = started.elapsed();
-        println!("received {} in {:.2}s ({:.1} MB/s)", received.describe(), elapsed.as_secs_f64(),
-                 received.bytes as f64 / elapsed.as_secs_f64() / 1e6);
-        assert_eq!(received.sha256, made.stdout.trim());
-        assert_eq!(format!("{:x}", Sha256::digest(std::fs::read(&received.destination).unwrap())), made.stdout.trim());
-        real("rm -f /tmp/s0ma-back-test.bin", 30).unwrap();
-    }
-
-    #[test]
-    fn s0ma_hears_about_what_arrived_with_the_next_message() {
-        assert_eq!(arrival_note(&[]), None);
-        let note = arrival_note(&["/share/notes.md (1.2 KB)".into(), "/share/run.sh (18 B, executable)".into()]).unwrap();
-        assert!(note.starts_with("\n\n[FILES SENT]\n"), "{note:?}");
-        assert!(note.ends_with("- /share/run.sh (18 B, executable)"), "{note:?}");
-    }
-
-    #[test]
-    fn sizes_read_the_way_people_say_them() {
-        assert_eq!(human_size(18), "18 B");
-        assert_eq!(human_size(1_229), "1.2 KB");
-        assert_eq!(human_size(32 * 1024 * 1024), "32.0 MB");
     }
 }

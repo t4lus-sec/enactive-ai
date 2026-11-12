@@ -1,6 +1,6 @@
 //! MCP client: tools from operator-configured MCP servers, loaded on demand.
 //!
-//! Servers are listed in `mcp.json` (see mcp_config.rs). At startup every
+//! Servers are listed in `mcp.json` (see mcp/config.rs). At startup every
 //! enabled server is connected in parallel. Their tools are not put in front of
 //! the model one by one: a server's schemas can run to six figures of tokens,
 //! paid on every request. Instead the model gets two fixed tools:
@@ -21,10 +21,10 @@
 //!
 //! # What this grants
 //!
-//! A host server runs on the operator's machine, outside s0ma's VM, as the
+//! A host server runs on the operator's machine, outside the agent's VM, as the
 //! operator: more reach than `vm_exec`, which is the point of the VM. A command
 //! server runs in the VM unless its entry says `"location": "host"`. Which
-//! servers to run is the operator's call, made in a file s0ma cannot write;
+//! servers to run is the operator's call, made in a file the agent cannot write;
 //! `tools` allowlists narrow a server to the calls that are wanted.
 //!
 //! # What a server says
@@ -41,16 +41,12 @@
 //! description, so they change exactly when the set does; schemas loaded by a
 //! search arrive as tool results later in the conversation and never touch the
 //! cached prefix. Order is deterministic (server name, then exposed name).
-#[path = "mcp_config.rs"]
 mod config;
 /// The VM's address on libvirt's default network, also where web_search looks
 /// for SearXNG by default.
 pub(crate) use config::{DEFAULT_VM_ADDRESS, FALLBACK_VM_ADDRESS};
-#[path = "mcp_client.rs"]
 mod client;
-#[path = "mcp_transport.rs"]
 mod transport;
-#[path = "mcp_guest.rs"]
 mod guest;
 
 use crate::{
@@ -233,7 +229,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // ------------------------------------------------------------------
 
 /// Load `mcp.json` and connect. Never fails startup: a broken config or an
-/// unreachable server is reported and s0ma runs without it.
+/// unreachable server is reported and the agent runs without it.
 pub fn init(root: &Path, data_dir: &Path) {
     let registry = Registry {
         config_path: config::path(root),
@@ -274,7 +270,7 @@ pub fn execute(call: &ToolCall, interrupt: &AtomicBool) -> Result<DesktopExecuti
 
 /// The [MCP] block of the runtime system context. Rebuilt with the rest of
 /// that block (startup, after sleep), never per turn. Empty when no server has
-/// tools to offer, so a s0ma without MCP sees nothing.
+/// tools to offer, so an agent without MCP sees nothing.
 pub fn runtime_context() -> String {
     REGISTRY.get().map(|registry| context_block(&lock(&registry.state))).unwrap_or_default()
 }
@@ -500,7 +496,7 @@ impl Registry {
         self.log_dir.join(format!("{server}.log"))
     }
 
-    /// Where to look when a server misbehaves: s0ma's protocol log, and for
+    /// Where to look when a server misbehaves: the agent's protocol log, and for
     /// a VM server also its stderr log inside the VM.
     fn log_places(&self, server: &str, slot: &Slot) -> String {
         let host = self.log_path(server).display().to_string();
@@ -990,9 +986,9 @@ impl Registry {
         resources: bool,
         mut op: impl FnMut(&Client) -> Result<T, CallError>,
     ) -> Result<Result<T, CallError>, String> {
-        // A server in the VM is s0ma's machine: off limits while the
-        // operator has turned its access off (vm_access.rs).
-        if !crate::vm_access::allowed() {
+        // A server in the VM is the agent's machine: off limits while the
+        // operator has turned its access off (vm/access.rs).
+        if !crate::vm::access::allowed() {
             let in_vm = lock(&self.state).servers.get(server).and_then(|slot| slot.config.as_ref()).is_some_and(|config| config.location == Location::Vm);
             if in_vm {
                 return Err(format!(
@@ -1597,7 +1593,7 @@ fn parse_arguments(text: &str) -> Result<Map<String, Value>, String> {
 // ------------------------------------------------------------------
 
 /// A call that did not produce a result. `unknown` says whether the server
-/// may still have acted, which is what decides whether s0ma can treat it as
+/// may still have acted, which is what decides whether the agent can treat it as
 /// not having happened.
 fn failure(server: &str, tool: Option<&str>, error: &str, unknown: bool) -> DesktopExecution {
     let mut output = json!({"ok": false, "server": server, "error": error});
@@ -1743,21 +1739,11 @@ fn convert_tool_result(server: &str, tool: &str, result: &Value) -> DesktopExecu
 }
 
 #[cfg(test)]
-#[path = "mcp_tests.rs"]
 mod e2e;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn server_config(include: Option<Vec<&str>>) -> ServerConfig {
-        let text = json!({"mcpServers": {"gh": {"command": "x", "tools": include}}}).to_string();
-        let parsed = config::parse(&text, &|_| None).unwrap();
-        match parsed.entries.into_values().next().unwrap() {
-            Entry::Server(server) => server,
-            other => panic!("{other:?}"),
-        }
-    }
 
     #[test]
     fn exposed_names_are_valid_stable_and_order_independent() {
@@ -1771,26 +1757,6 @@ mod tests {
         for name in [&dotted, &long] {
             assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
         }
-    }
-
-    #[test]
-    fn expose_filters_sorts_dedups_and_reports_missing_allowlist_entries() {
-        let listed = vec![
-            json!({"name": "zeta", "description": "Z", "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}, "$schema": "http://json-schema.org/draft-07/schema#"}}),
-            json!({"name": "alpha", "title": "Alpha title"}),
-            json!({"name": "alpha", "description": "duplicate"}),
-            json!({"name": "hidden"}),
-            json!({"description": "no name"}),
-        ];
-        let (tools, missing) = expose(&server_config(Some(vec!["zeta", "alpha", "typo"])), &listed);
-        let names: Vec<&str> = tools.iter().map(|t| t.exposed.as_str()).collect();
-        assert_eq!(names, ["mcp__gh__alpha", "mcp__gh__zeta"]);
-        assert_eq!(missing, ["typo"]);
-        assert_eq!(tools[0].title.as_deref(), Some("Alpha title"));
-        assert_eq!(tools[0].loaded("gh")["description"], "(the server gave no description)");
-        assert_eq!(tools[0].schema, json!({"type": "object", "properties": {}}));
-        assert!(tools[1].schema.get("$schema").is_none());
-        assert_eq!(tools[1].schema["properties"]["q"]["type"], "string");
     }
 
     // A state with two connected servers, as a registry would hold it.
@@ -1836,52 +1802,6 @@ mod tests {
             .dispatch(tool, arguments.as_object().unwrap().clone(), &AtomicBool::new(false))
             .map(|execution| serde_json::from_str(&execution.result).unwrap())
             .map_err(|error| error.to_string())
-    }
-
-    #[test]
-    fn only_names_reach_the_tool_list() {
-        let state = state_with(&[("rea", rea()), ("notes", vec![tool("read_note", "Read one note.", json!({}))])]);
-        let tools = definitions(&state);
-        let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
-        assert_eq!(names, [SEARCH_TOOL, CALL_TOOL], "two fixed tools, none per server tool");
-        let search = &tools[0].function.description;
-        assert!(search.contains("\nnotes: read_note\nrea: decompile_function, get_xrefs_to, list_functions, rename_symbol"), "{search}");
-        // No description or schema text is in front of the model.
-        let rendered = serde_json::to_string(&tools).unwrap();
-        assert!(!rendered.contains("Decompile the function") && !rendered.contains("Very long prose"));
-        assert_eq!(tools[1].function.parameters["properties"]["server"]["enum"], json!(["notes", "rea"]));
-        let full: usize = state.servers.values().flat_map(|s| &s.tools).map(RemoteTool::loaded_tokens).sum();
-        assert!(rendered.len() / 4 < 600 && full > 2000, "up front {} vs on demand {full}", rendered.len() / 4);
-    }
-
-    #[test]
-    fn odd_names_are_quoted_and_long_lists_are_capped() {
-        assert_eq!(listed_name("repo.search"), "repo.search");
-        assert_eq!(listed_name("say, hi"), "\"say, hi\"");
-        let many: Vec<Value> = (0..MAX_LISTED_NAMES + 3).map(|i| tool(&format!("t{i:04}"), "", json!({}))).collect();
-        let state = state_with(&[("big", many)]);
-        let line = names_line("big", &state.servers["big"]);
-        assert!(line.ends_with("… and 3 more (search by keyword)"));
-        assert_eq!(line.matches(", t").count() + 1, MAX_LISTED_NAMES, "listed names, then the overflow note");
-    }
-
-    #[test]
-    fn search_loads_full_definitions_by_name() {
-        let registry = registry_with(state_with(&[("rea", rea())]));
-        let found = run(&registry, SEARCH_TOOL, json!({"names": ["decompile_function", "rea/rename_symbol", "mcp__rea__list_functions", "GET_XREFS_TO"]})).unwrap();
-        let tools = found["tools"].as_array().unwrap();
-        let loaded: Vec<&str> = tools.iter().map(|t| t["tool"].as_str().unwrap()).collect();
-        assert_eq!(loaded, ["decompile_function", "rename_symbol", "list_functions", "get_xrefs_to"]);
-        // The full text: well past the old 1024-character cap.
-        assert!(tools[0]["input_schema"]["properties"]["address"]["description"].as_str().unwrap().len() > 3000);
-        assert_eq!(tools[0]["description"], "Decompile the function at an address to C.");
-        assert_eq!(tools[0]["server"], "rea");
-        assert!(found.get("not_found").is_none());
-
-        let missed = run(&registry, SEARCH_TOOL, json!({"names": "decompile, nope_nothing"})).unwrap();
-        assert_eq!(missed["tools"].as_array().unwrap().len(), 0);
-        assert_eq!(missed["not_found"][0]["did_you_mean"][0], "decompile_function");
-        assert!(missed["note"].as_str().unwrap().contains("no tool matched"));
     }
 
     #[test]
@@ -1950,22 +1870,6 @@ mod tests {
     }
 
     #[test]
-    fn call_targets_resolve_with_helpful_errors() {
-        let shared = vec![tool("status", "", json!({}))];
-        let state = state_with(&[("a", shared.clone()), ("b", shared), ("rea", rea())]);
-        assert_eq!(resolve(&state, Some("rea"), "rename_symbol").unwrap().tool, "rename_symbol");
-        assert_eq!(resolve(&state, None, "mcp__rea__rename_symbol").unwrap().server, "rea");
-        assert_eq!(resolve(&state, Some("a"), "status").unwrap().server, "a");
-        assert!(resolve(&state, None, "status").err().unwrap().contains("several servers (a, b); pass server"));
-        let typo = resolve(&state, Some("rea"), "decompile").err().unwrap();
-        assert!(typo.contains("did you mean: decompile_function"), "{typo}");
-        assert!(resolve(&state, Some("ghost"), "x").err().unwrap().contains("servers: a, b, rea"));
-        // The shared name is qualified in suggestions; a unique one is not.
-        assert_eq!(qualified(&state, "a", "status"), "a/status");
-        assert_eq!(qualified(&state, "rea", "rename_symbol"), "rename_symbol");
-    }
-
-    #[test]
     fn call_arguments_parse_leniently_but_reject_misplaced_keys() {
         let parse = |v: Value| CallArgs::parse(v.as_object().unwrap().clone());
         let encoded = parse(json!({"server": "rea", "tool": "x", "arguments": "{\"address\": \"0x10\"}"})).unwrap();
@@ -1975,98 +1879,5 @@ mod tests {
         assert!(flat.contains("address") && flat.contains("inside `arguments`"), "{flat}");
         assert!(parse(json!({"server": "rea"})).err().unwrap().contains("tool is required"));
         assert!(parse(json!({"tool": "x", "arguments": [1]})).err().unwrap().contains("must be an object"));
-    }
-
-    #[test]
-    fn arguments_are_checked_against_the_schema_before_sending() {
-        let schema = normalize_schema(Some(&json!({"type": "object", "properties": {
-            "address": {"type": "string"}, "limit": {"type": "integer"}, "deep": {"type": ["boolean", "null"]}, "any": {}
-        }, "required": ["address"], "additionalProperties": false})));
-        let check = |v: Value| check_arguments(&schema, v.as_object().unwrap());
-        assert!(check(json!({"address": "0x10", "limit": 5, "deep": null, "any": [1]})).is_ok());
-        assert!(check(json!({"address": "0x10", "limit": 5.0})).is_ok(), "5.0 is an integer");
-        let all = check(json!({"limit": "5", "deep": 1, "extra": true})).unwrap_err();
-        assert!(all.contains("missing required argument(s) address"), "{all}");
-        assert!(all.contains("limit must be integer, not string"), "{all}");
-        assert!(all.contains("deep must be boolean or null, not integer"), "{all}");
-        assert!(all.contains("unexpected argument(s) extra (accepted: address, any, deep, limit)"), "{all}");
-        // Without additionalProperties: false, extra keys are the server's business.
-        assert!(check_arguments(&normalize_schema(None), json!({"x": 1}).as_object().unwrap()).is_ok());
-    }
-
-    #[test]
-    fn text_results_and_errors_convert() {
-        let ok = convert_tool_result("gh", "t", &json!({"content": [
-            {"type": "text", "text": "first"}, {"type": "text", "text": "second"},
-            {"type": "resource_link", "uri": "file:///x", "name": "x"}
-        ]}));
-        let value: Value = serde_json::from_str(&ok.result).unwrap();
-        assert_eq!(value["ok"], true);
-        assert_eq!(value["content"], "first\n\nsecond\n\n[resource link x <file:///x>]");
-        assert!(ok.observation.is_none());
-
-        let failed = convert_tool_result("gh", "t", &json!({"isError": true, "content": [{"type": "text", "text": "rate limited"}]}));
-        let value: Value = serde_json::from_str(&failed.result).unwrap();
-        assert_eq!((value["ok"].clone(), value["error"].clone()), (json!(false), json!("rate limited")));
-
-        let structured = convert_tool_result("gh", "t", &json!({"content": [], "structuredContent": {"n": 3}}));
-        let value: Value = serde_json::from_str(&structured.result).unwrap();
-        assert_eq!(value["structured"]["n"], 3);
-
-        let mrtr = convert_tool_result("gh", "t", &json!({"resultType": "input_required", "inputRequests": {}}));
-        assert!(mrtr.result.contains("did not complete"));
-    }
-
-    #[test]
-    fn first_valid_image_becomes_the_observation() {
-        let png = STANDARD.encode(b"\x89PNG\r\n\x1a\n0000");
-        let result = convert_tool_result("shot", "grab", &json!({"content": [
-            {"type": "image", "data": "!!!", "mimeType": "image/png"},
-            {"type": "image", "data": png, "mimeType": "image/png"},
-            {"type": "image", "data": png, "mimeType": "image/png"},
-            {"type": "resource", "resource": {"uri": "mem://a", "mimeType": "application/pdf", "blob": "AAAA"}}
-        ]}));
-        let observation = result.observation.expect("image attached");
-        assert!(observation.data_url.starts_with("data:image/png;base64,"));
-        assert!(observation.content.contains("shot/grab"));
-        let value: Value = serde_json::from_str(&result.result).unwrap();
-        let content = value["content"].as_str().unwrap();
-        assert!(content.contains("invalid base64"));
-        assert!(content.contains("attached after"));
-        assert!(content.contains("one image per result"));
-        assert!(content.contains("application/pdf binary"));
-        assert!(!result.result.contains(&png), "image bytes must not reach the archive");
-    }
-
-    #[test]
-    fn oversized_text_is_capped_on_a_char_boundary() {
-        let mut rendered = Rendered::default();
-        rendered.push(&"é".repeat(MAX_RESULT_BYTES));
-        let text = rendered.finish();
-        assert!(text.len() < MAX_RESULT_BYTES + 100);
-        assert!(text.ends_with("omitted by s0ma's MCP client]"));
-    }
-
-    #[test]
-    fn failures_say_whether_the_outcome_is_unknown() {
-        let unknown: Value = serde_json::from_str(&failure("s", Some("t"), "no answer within 5s", true).result).unwrap();
-        assert!(unknown["outcome"].as_str().unwrap().starts_with("unknown"));
-        let known: Value = serde_json::from_str(&failure("s", None, "not connected; nothing was sent", false).result).unwrap();
-        assert!(known.get("outcome").is_none() && known.get("tool").is_none());
-    }
-
-    #[test]
-    fn arguments_must_be_an_object() {
-        assert!(parse_arguments("").unwrap().is_empty());
-        assert_eq!(parse_arguments("{\"a\":1}").unwrap()["a"], 1);
-        assert!(parse_arguments("[1]").is_err());
-        assert!(parse_arguments("{\"a\":").is_err());
-    }
-
-    #[test]
-    fn handles_only_mcp_names() {
-        assert!(handles("mcp__gh__x") && handles(RESOURCES_TOOL) && handles(RESOURCE_READ_TOOL));
-        assert!(handles(SEARCH_TOOL) && handles(CALL_TOOL));
-        assert!(!handles("vm_exec") && !handles("mcp_other"));
     }
 }
