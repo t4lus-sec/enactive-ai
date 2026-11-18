@@ -6,7 +6,8 @@
 //! no scrollback of its own here: what went off the top is drawn again from
 //! the record (`terminal::TranscriptRecord`) when the page is (a resize, a
 //! tab closing, Ctrl+O), and PgUp or the wheel scroll back through it in a
-//! view of its own (`tabs::View::History`).
+//! view of its own (`tabs::View::History`). A drag on the page selects its
+//! text in that view, drawn where the page had it.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

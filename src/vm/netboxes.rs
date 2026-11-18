@@ -744,6 +744,9 @@ pub fn free_name(open: &[Netbox]) -> String {
 /// whatever runs in it (the tab asked first when something did).
 pub fn close_for_operator(session: &str) -> Result<String, String> {
     let name = name_of(session).ok_or("not a shell")?.to_string();
+    if crate::audit::run::shell_running(&name) {
+        return Err(crate::audit::run::SHELL_RUNNING.to_string());
+    }
     let spawned = std::thread::Builder::new().name("netbox-close".into()).spawn(move || {
         if let Err(error) = close(&mut machine, &name, true) {
             crate::vm::terms::set_error(format!("shell: {error}"));

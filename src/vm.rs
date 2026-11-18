@@ -205,10 +205,11 @@ fn execute_netbox(call: &ToolCall) -> Result<String, Box<dyn Error>> {
                 // Enter after it unless the call says not: then it runs.
                 let enter = object.get("enter").and_then(Value::as_bool).unwrap_or(true);
                 let then = if enter { ", then press enter" } else { " (no enter)" };
-                (format!("type into {shown}{then}: {}", crate::approval::one_line(text)), text.to_string())
+                (format!("type into {shown}{then}"), text.to_string())
             }
         };
-        if let Err(why) = crate::approval::ask(&what, &detail) {
+        let reason = object.get("why").and_then(Value::as_str).unwrap_or_default();
+        if let Err(why) = crate::approval::ask_why(&what, reason, &detail) {
             return Ok(json!({"ok": false, "shell": name, "error": why}).to_string());
         }
     }
@@ -575,8 +576,7 @@ fn execute_vm_exec(call: &ToolCall) -> Result<String, Box<dyn Error>> {
         } else {
             crate::vm::netboxes::display(&args.netbox.clone().map(|name| crate::vm::netboxes::canonical(&name)).unwrap_or_else(crate::vm::netboxes::working))
         };
-        let why = args.why.as_deref().map(str::trim).filter(|why| !why.is_empty()).map(|why| format!("# {why}\n")).unwrap_or_default();
-        if let Err(refused) = crate::approval::ask(&format!("run in {place}: {}", crate::approval::one_line(&args.command)), &format!("{why}{}", args.command)) {
+        if let Err(refused) = crate::approval::ask_why(&format!("run in {place}"), args.why.as_deref().unwrap_or_default(), &args.command) {
             return Ok(json!({"ok": false, "error": refused}).to_string());
         }
     }
@@ -1661,7 +1661,7 @@ impl crate::board::TestRunner for GoalTest {
         if let Some(run) = crate::audit::run::command(command) {
             return Ok(run);
         }
-        crate::approval::ask(&format!("run the goal test: {}", crate::approval::one_line(command)), command)?;
+        crate::approval::ask_why("run the goal test", "", command)?;
         match run_guest_command(command, timeout_secs)? {
             GuestCommandOutcome::Exited(result) => Ok(crate::board::TestRun {
                 exit_code: result.exit_code,

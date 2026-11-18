@@ -204,6 +204,7 @@ pub struct NewGist {
 /// is fine; the agent not knowing there's a hole is not — the stub names the range so
 /// the archive lookup is obvious, and every one of these is listed for the next
 /// deep sleep.
+#[allow(clippy::too_many_arguments)]
 pub fn mechanical_gist(
     level: Level,
     from_event_id: u64,

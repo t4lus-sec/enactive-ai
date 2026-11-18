@@ -233,14 +233,14 @@ fn rule_4_a_weaker_check_for_a_relied_on_claim_waits() {
     store.change_claim("share-slice", &c.id, |c| { c.verdict = Verdict::Holds; c.level = Level::Property; Ok(()) }).unwrap().unwrap();
     // The new one no longer catches m1.
     let _w = world(World { toml: "claim = \"c1\"\nkind = \"property\"\nrun = \"./CHECK\"".into(), mutants: vec!["m1.patch"], caught: vec![], ..World::default() });
-    submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-3").unwrap();
+    submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-3", None).unwrap();
     let after = store.claim("share-slice", &c.id).unwrap().unwrap();
     assert!(after.weaker.as_deref().is_some_and(|w| w.contains("m1.patch")), "{:?}", after.weaker);
     assert_eq!(after.verdict, Verdict::Holds, "the old verdict stands meanwhile");
     assert_eq!(store.current_check("share-slice", &c.id).unwrap().unwrap().version, first.version, "the old check stays current");
     // One that still catches it replaces it.
     let _w = world(World { toml: "claim = \"c1\"\nkind = \"property\"\nrun = \"./CHECK\"".into(), mutants: vec!["m1.patch"], caught: vec!["m1.patch"], ..World::default() });
-    submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-3").unwrap();
+    submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-3", None).unwrap();
     assert!(store.current_check("share-slice", &c.id).unwrap().unwrap().version > first.version);
 }
 
@@ -250,7 +250,7 @@ fn a_clause_without_an_anchor_is_refused() {
     running(&store, None, Mode::Assure, Gate::None, Post::Auto);
     let c = claim(&store, "share-slice", "Redaction never changes the line count; and it keeps every byte outside the ranges", Review::Accepted);
     let _w = world(World { toml: "kind = \"test\"\nrun = \"./CHECK\"".into(), anchors: "1".into(), ..World::default() });
-    let said = submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-3");
+    let said = submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-3", None);
     assert!(said.as_ref().is_err_and(|e| e.contains("anchor")), "{said:?}");
 }
 
@@ -296,7 +296,7 @@ fn a_claim_the_operator_took_is_never_formalized_by_s0ma() {
     running(&store, None, Mode::Assure, Gate::None, Post::Auto);
     let c = claim(&store, "share-slice", "x never y", Review::Accepted);
     crate::audit::ops::operator_claim(&store, "share-slice", &c.id, "take", "").unwrap();
-    let said = submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-2");
+    let said = submit_check(&store, "share-slice", &c.id, "checks/c1", "a1-2", None);
     assert!(said.is_err_and(|e| e.contains("operator's")));
     let call = crate::types::ToolCall { id: "1".into(), kind: "function".into(), function: crate::types::FunctionCall { name: "audit_take".into(), arguments: json!({"audit": "share-slice", "claim": c.id}).to_string() } };
     assert!(crate::audit::tools::execute(&call, "s0ma").contains("error") || crate::audit::tools::execute(&call, "s0ma").contains("operator"));
@@ -363,3 +363,389 @@ fn a_report_cites_only_what_it_names() {
     assert_eq!(crate::audit::report::cited_ids(&store, "share-slice", "share-edit-lost"), vec![a.id.clone()], "verification re-runs exactly the cited");
 }
 
+
+#[test]
+fn after_go_workers_write_the_checks_a_few_at_a_time() {
+    let (store, _) = fresh();
+    let audit = Audit {
+        name: "plan-workers".into(),
+        mode: Mode::Assure,
+        status: Status::Checking,
+        work: "/w/plan-workers/work".into(),
+        settings: Settings { gate: Gate::Plan, workers: 2, ..Settings::default() },
+        created_at: audit::now(),
+        ..Audit::default()
+    };
+    store.create(&audit).expect("created");
+    for text in ["a never b", "c never d", "e never f"] {
+        let c = store.add_claim("plan-workers", Claim { text: text.into(), source: "x.rs:1".into(), ..Claim::default() }).unwrap();
+        crate::audit::ops::operator_claim(&store, "plan-workers", &c.id, "accept", "").unwrap();
+    }
+    // Accepted is not enough under the plan gate, in assure mode too.
+    queue_workers(&store, &store.audit("plan-workers").unwrap().unwrap());
+    assert!(workers_of("plan-workers").is_empty(), "nothing before go");
+    assert!(!store.claim("plan-workers", "c1").unwrap().unwrap().checkable(&store.audit("plan-workers").unwrap().unwrap()));
+    crate::audit::ops::go(&store, "plan-workers").unwrap();
+    queue_workers(&store, &store.audit("plan-workers").unwrap().unwrap());
+    assert_eq!(workers_of("plan-workers").len(), 2, "at most the audit's workers");
+    let held = store.claims("plan-workers").unwrap().iter().filter(|c| c.held_by.is_some()).count();
+    assert_eq!(held, 2, "each one's claim held for it");
+    let task = crate::util::locked(&WANTED).iter().find(|(k, _, _)| k == "formalize:plan-workers/c1/k1").map(|(_, _, t)| t.clone()).expect("c1's worker");
+    assert!(task.contains("audit_check_submit") && task.contains("[1] a never b") && task.contains("mutants/*.patch"), "{task}");
+    // A taken claim gets no worker; run now on one with no check asks for one.
+    crate::audit::ops::operator_claim(&store, "plan-workers", "c3", "take", "").unwrap();
+    assert!(run_now(&store, "plan-workers", Some("c3")).is_err_and(|e| e.contains("yours")));
+    crate::util::locked(&WANTED).retain(|(_, job, _)| job.audit() != "plan-workers");
+}
+
+/// The tab reads the store every frame while the scheduler, the batch and
+/// the workers write it: a read takes no write lock, so a writer holding it
+/// never stalls the screen (it once did, for seconds, after go).
+#[test]
+fn a_read_waits_for_no_writer() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    claim(&store, "share-slice", "a download never replaces a file changed meanwhile", Review::Accepted);
+    let mut writer = crate::db::open(&store.path).expect("writer");
+    let held = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).expect("write lock");
+    let started = std::time::Instant::now();
+    assert_eq!(store.claims("share-slice").expect("read").len(), 1);
+    assert!(store.audit("share-slice").expect("read").is_some());
+    assert!(started.elapsed() < Duration::from_secs(1), "a read waited {:?} for the writer", started.elapsed());
+    drop(held);
+}
+
+/// Workers stop with the harness: on its next start, nothing they held is
+/// left waiting out its half-hour hold.
+#[test]
+fn a_restart_lets_go_of_what_stopped_workers_held() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "a download never replaces a file changed meanwhile", Review::Accepted);
+    let until = (chrono::Local::now() + chrono::Duration::seconds(audit::HOLD_SECS)).to_rfc3339();
+    store
+        .change_claim("share-slice", &c.id, |c| {
+            c.held_by = Some("w·b1-1".into());
+            c.held_until = Some(until.clone());
+            c.running = true;
+            Ok(())
+        })
+        .expect("held")
+        .expect("held");
+    recover(&store);
+    let after = store.claim("share-slice", &c.id).expect("read").expect("claim");
+    assert!(after.held_by.is_none() && after.held_until.is_none() && !after.running);
+}
+
+/// Threads opening and closing the store at once, as the tab, the scheduler
+/// and the workers do: none waits on another for good. (SQLite 3.51 could
+/// deadlock here: one connection's close took its file's lock and then the
+/// VFS's, while an open took them the other way round.)
+#[test]
+fn stores_opened_and_closed_at_once_never_deadlock() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "a download never replaces a file changed meanwhile", Review::Accepted);
+    let path = store.path.clone();
+    let (done, finished) = std::sync::mpsc::channel();
+    // Two: the race needs the closing connection to be the file's only one.
+    for n in 0..2 {
+        let (path, id, done) = (path.clone(), c.id.clone(), done.clone());
+        std::thread::spawn(move || {
+            let store = AuditStore::at(path);
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < until {
+                let _ = store.claims("share-slice");
+                if n % 2 == 0 {
+                    let _ = store.change_claim("share-slice", &id, |c| {
+                        c.priority = (c.priority + 1) % 10;
+                        Ok(())
+                    });
+                }
+            }
+            let _ = done.send(());
+        });
+    }
+    for _ in 0..2 {
+        finished.recv_timeout(Duration::from_secs(20)).expect("a thread stuck on the store's locks");
+    }
+}
+
+/// A failure is not the end of its claim: the audit stays open until a
+/// worker has reproduced it or said why it can't, even when every worker was
+/// busy as the check failed.
+#[test]
+fn a_failure_keeps_the_audit_open_for_its_repro() {
+    let (store, _) = fresh();
+    let audit = running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "a download never replaces a file changed meanwhile", Review::Accepted);
+    store
+        .change_claim("share-slice", &c.id, |c| {
+            c.verdict = Verdict::Fails;
+            Ok(())
+        })
+        .expect("failed")
+        .expect("failed");
+    maybe_done(&store, &audit);
+    assert_eq!(store.audit("share-slice").expect("read").expect("audit").status, Status::Checking);
+    store
+        .change_claim("share-slice", &c.id, |c| {
+            c.repro = Repro::Fails;
+            Ok(())
+        })
+        .expect("reproduced")
+        .expect("reproduced");
+    maybe_done(&store, &audit);
+    assert_eq!(store.audit("share-slice").expect("read").expect("audit").status, Status::Done);
+}
+
+/// A claim has several checks, each with its own result: one that fails
+/// makes the claim fail; the others keep theirs, and a new one beside a
+/// check that holds runs alone.
+#[test]
+fn a_claim_reads_from_all_its_checks() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "Redaction never changes the line count", Review::Accepted);
+    check(&store, "share-slice", &c.id, "test");
+    let _w = world(World { check_exit: 0, mutants: vec!["m1.patch"], caught: vec!["m1.patch"], ..World::default() });
+    batch(&store, &[&c.id]);
+    let after = store.claim("share-slice", &c.id).unwrap().unwrap();
+    assert_eq!((after.verdict, after.level), (Verdict::Holds, Level::Tested));
+    // k2, deeper, beside it: only k2 runs, and it fails.
+    store
+        .add_check("share-slice", Check { claim: c.id.clone(), slot: "k2".into(), dir: format!("checks/{}/k2", c.id), kind: "bounded".into(), run: "./CHECK".into(), timeout: 60, ..Check::default() })
+        .unwrap();
+    assert_eq!(ready_claims(&store, &store.audit("share-slice").unwrap().unwrap()), vec![c.id.clone()]);
+    let _w = world(World { check_exit: 1, ..World::default() });
+    batch(&store, &[&c.id]);
+    let checks = store.current_checks("share-slice", &c.id).unwrap();
+    assert_eq!(checks.iter().map(|k| (k.slot().to_string(), k.verdict)).collect::<Vec<_>>(), vec![("k1".into(), Verdict::Holds), ("k2".into(), Verdict::Fails)]);
+    assert_eq!(store.claim("share-slice", &c.id).unwrap().unwrap().verdict, Verdict::Fails);
+    assert!(ready_claims(&store, &store.audit("share-slice").unwrap().unwrap()).is_empty(), "both have run");
+}
+
+/// A batch that stops part way still closes its run: when it ended, why,
+/// and every command it ran with what it printed.
+#[test]
+fn a_batch_that_stops_still_closes_its_run() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c1 = claim(&store, "share-slice", "Redaction never changes the line count", Review::Accepted);
+    let c2 = claim(&store, "share-slice", "A download never replaces a file changed meanwhile", Review::Accepted);
+    check(&store, "share-slice", &c1.id, "test");
+    store
+        .add_check("share-slice", Check { claim: c2.id.clone(), dir: format!("checks/{}", c2.id), kind: "test".into(), run: "./GONE".into(), timeout: 60, ..Check::default() })
+        .unwrap();
+    FAKE.with(|fake| {
+        *fake.borrow_mut() = Some(Box::new(|script: &str| {
+            if script.contains("GONE") {
+                return (None, "__GONE__".into());
+            }
+            if script.contains("CHECK") {
+                return (Some(0), "1 passed".into());
+            }
+            (Some(0), String::new())
+        }));
+    });
+    let ids = vec![c1.id.clone(), c2.id.clone()];
+    let outcome = crate::approval::by_operator(|| run_batch(&store, "share-slice", &ids, false));
+    let error = outcome.expect_err("its shell went");
+    assert!(error.starts_with("batch ") && error.contains(&c2.id), "{error}");
+    let runs = store.runs("share-slice").unwrap();
+    let run = runs.last().expect("a run");
+    assert!(run.finished_at.is_some(), "closed");
+    assert!(run.note.starts_with("stopped:"), "{}", run.note);
+    let first = run.commands.iter().find(|k| k.claim == c1.id).expect("c1's command kept");
+    assert_eq!((first.command.as_str(), first.output.as_str()), ("./CHECK", "1 passed"));
+}
+
+/// A worker that ends without submitting, but left its check in its
+/// folder: the harness submits it, under the worker's full job id.
+#[test]
+fn a_check_left_on_disk_is_submitted_for_its_worker() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "Redaction never changes the line count", Review::Accepted);
+    let _w = world(World { toml: "claim = \"c1\"\nkind = \"test\"\nrun = \"./CHECK\"".into(), ..World::default() });
+    let probe_said = Rc::new(RefCell::new(false));
+    let inside = probe_said.clone();
+    let world_fake = FAKE.with(|fake| fake.borrow_mut().take()).expect("world");
+    let mut world_fake = world_fake;
+    FAKE.with(|fake| {
+        *fake.borrow_mut() = Some(Box::new(move |script: &str| {
+            if script.contains("check.toml\" ] && echo") {
+                *inside.borrow_mut() = true;
+                return (Some(0), "checks/c1\n".into());
+            }
+            world_fake(script)
+        }));
+    });
+    let id = "bg-0011aabb".to_string();
+    crate::util::locked(&STARTED).push((id.clone(), Job::Formalize { audit: "share-slice".into(), claim: c.id.clone(), slot: "k1".into() }));
+    let line = worker_finished(&id, "completed", "done", None).expect("ours");
+    assert!(line.contains("looks for a check"), "{line}");
+    assert!(*probe_said.borrow(), "its folder was looked in");
+    let checks = store.checks("share-slice", &c.id).unwrap();
+    assert_eq!(checks.len(), 1, "submitted for it");
+    assert_eq!(checks[0].by_job, id);
+    let after = store.claim("share-slice", &c.id).unwrap().unwrap();
+    assert!(!after.skipped && after.blocked.is_none() && after.held_by.is_none());
+}
+
+/// A check refused (here: a kind the harness doesn't take) and nothing
+/// else in: the claim is blocked with the reason, not skipped.
+#[test]
+fn a_refused_check_blocks_its_claim_rather_than_skipping_it() {
+    let (store, _) = fresh();
+    running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "Redaction never changes the line count", Review::Accepted);
+    let _w = world(World { toml: "claim = \"c1\"\nkind = \"vibes\"\nrun = \"./CHECK\"".into(), ..World::default() });
+    let id = "bg-0022ccdd".to_string();
+    crate::util::locked(&STARTED).push((id.clone(), Job::Formalize { audit: "share-slice".into(), claim: c.id.clone(), slot: "k1".into() }));
+    let label = crate::vm::netboxes::agent_label(&id);
+    assert!(submit_check(&store, "share-slice", &c.id, "checks/c1", &label, Some("k1")).is_err());
+    worker_finished(&id, "completed", "gave up", None).expect("ours");
+    let after = store.claim("share-slice", &c.id).unwrap().unwrap();
+    assert!(!after.skipped, "not skipped");
+    assert!(after.blocked.as_deref().is_some_and(|b| b.contains("vibes")), "{:?}", after.blocked);
+    assert!(!after.checkable(&store.audit("share-slice").unwrap().unwrap()), "not tried again on its own");
+    crate::audit::ops::operator_claim(&store, "share-slice", &c.id, "skip", "").unwrap();
+    let after = store.claim("share-slice", &c.id).unwrap().unwrap();
+    assert!(after.blocked.is_none() && !after.skipped, "s unblocks it");
+}
+
+/// Back-translation reads whole files and must quote each one's last line:
+/// a reviewer that read less is marked partial.
+#[test]
+fn a_back_translation_must_show_it_read_every_file() {
+    let stdout = "__FILE__ 120 5 0123456789ab check.py\n    1 | def helper(x):\n    2 |     return x\n    3 | \n    4 | def test_add():\n    5 |     assert helper(2) == 2\n__LAST__ check.py\t    assert helper(2) == 2\n__FILE__ 30 2 ba9876543210 check.toml\n    1 | kind = \"test\"\n    2 | run = \"pytest\"\n__LAST__ check.toml\trun = \"pytest\"\n";
+    let shown = review::parse(stdout);
+    assert_eq!(shown.expect.len(), 2);
+    assert!(shown.partial.is_empty());
+    assert!(shown.defined.contains(&"helper (check.py:1)".to_string()) && shown.defined.contains(&"test_add (check.py:4)".to_string()), "{:?}", shown.defined);
+    let task = review::task(&shown);
+    assert!(task.contains("check.py · 120 bytes · 5 lines · sha256 0123456789ab") && task.contains("SEEN"), "{task}");
+    let whole = review::settle("It checks helper(2) is 2.\nSEEN check.py: assert helper(2) == 2\nSEEN check.toml: `run = \"pytest\"`", &shown.expect, &shown.partial);
+    assert!(whole.contains("[+] read whole: 2 files") && !whole.contains("SEEN"), "{whole}");
+    let short = review::settle("It checks helper.\nSEEN check.py: def helper(x):", &shown.expect, &shown.partial);
+    assert!(short.starts_with("[~] partial review") && short.contains("check.py's last line") && short.contains("check.toml was not confirmed"), "{short}");
+    let cut = review::parse("__FILE__ 900000 20000 aaaaaaaaaaaa big.py\n    1 | x = 1\n__CUT__\n__LAST__ big.py\tx = 20000\n");
+    assert_eq!(cut.partial.len(), 1);
+    assert!(review::task(&cut).contains("only its first"));
+}
+
+/// A mutant whose run couldn't start (a tool missing, a patch that doesn't
+/// apply) is neither caught nor survived.
+#[test]
+fn a_mutant_that_never_ran_is_counted_neither_way() {
+    assert!(matches!(mutated(Some(127), false, "sh: pytest: command not found"), Mutated::Broken(why) if why.contains("pytest")));
+    assert!(matches!(mutated(Some(98), false, ""), Mutated::Broken(_)));
+    assert!(matches!(mutated(Some(1), true, ""), Mutated::Broken(_)));
+    assert!(matches!(mutated(Some(1), false, "AssertionError"), Mutated::Caught));
+    assert!(matches!(mutated(Some(0), false, ""), Mutated::Survived));
+}
+
+/// Archived, an audit leaves the agent's context and its board's audits,
+/// with everything kept; it comes back as it was, and a re-run brings it
+/// back too.
+#[test]
+fn an_archived_audit_is_hidden_and_kept() {
+    let (store, boards) = fresh();
+    board(&boards, "share-edit-lost");
+    running(&store, Some("share-edit-lost"), Mode::Diagnose, Gate::None, Post::Auto);
+    let c = claim(&store, "share-slice", "Redaction never changes the line count", Review::Accepted);
+    assert!(crate::audit::ops::lines(&store).unwrap().iter().any(|(name, _)| name == "share-slice"));
+    let said = crate::audit::ops::archive(&store, "share-slice", true).expect("archived");
+    assert!(said.contains("archived and stopped"), "{said}");
+    let audit = store.audit("share-slice").unwrap().unwrap();
+    assert!(audit.archived && !audit.shown() && audit.status == Status::Stopped);
+    assert!(crate::audit::ops::lines(&store).unwrap().iter().all(|(name, _)| name != "share-slice"), "out of the agent's context");
+    assert!(crate::audit::ops::for_board("share-edit-lost").is_empty(), "out of the projects tab");
+    assert!(store.claim("share-slice", &c.id).unwrap().is_some(), "its claims kept");
+    crate::audit::ops::archive(&store, "share-slice", false).expect("back");
+    assert!(!store.audit("share-slice").unwrap().unwrap().archived);
+    crate::audit::ops::archive(&store, "share-slice", true).expect("archived again");
+    rerun(&store, "share-slice", Who::Operator).expect("re-run");
+    assert!(!store.audit("share-slice").unwrap().unwrap().archived, "a re-run brings it back");
+}
+
+/// Deleted, an audit is gone from the store with all it had, its work
+/// tree and branch removed; another audit is untouched. Not while a batch
+/// is on a command: then it is stopped, and deleted on the next try.
+#[test]
+fn a_deleted_audit_is_gone_with_its_work_tree() {
+    let (store, _) = fresh();
+    let audit = running(&store, None, Mode::Diagnose, Gate::None, Post::Auto);
+    store
+        .change("share-slice", |a| {
+            a.kind = "git".into();
+            a.branch = "s0ma-audit/share-slice".into();
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    let c = claim(&store, "share-slice", "Redaction never changes the line count", Review::Accepted);
+    check(&store, "share-slice", &c.id, "test");
+    store.log("share-slice", Who::Operator, "something", "").unwrap();
+    store.create(&Audit { name: "other".into(), status: Status::Standing, created_at: audit::now(), ..Audit::default() }).unwrap();
+    claim(&store, "other", "A note is never lost", Review::Accepted);
+    let scripts = Rc::new(RefCell::new(Vec::<String>::new()));
+    let seen = scripts.clone();
+    FAKE.with(|fake| {
+        *fake.borrow_mut() = Some(Box::new(move |script: &str| {
+            seen.borrow_mut().push(script.to_string());
+            (Some(0), if script.contains("rm -rf") { "REMOVED".into() } else { String::new() })
+        }));
+    });
+    crate::util::locked(&RUNNING).insert("share-slice".into());
+    let refused = crate::audit::ops::delete(&store, "share-slice").expect_err("a batch is running");
+    assert!(refused.contains("again"), "{refused}");
+    assert_eq!(store.audit("share-slice").unwrap().unwrap().status, Status::Stopped);
+    crate::util::locked(&RUNNING).remove("share-slice");
+    let said = crate::audit::ops::delete(&store, "share-slice").expect("deleted");
+    assert!(said.ends_with("deleted"), "{said}");
+    assert!(store.audit("share-slice").unwrap().is_none());
+    assert!(store.claims("share-slice").unwrap().is_empty() && store.checks("share-slice", &c.id).unwrap().is_empty() && store.runs("share-slice").unwrap().is_empty());
+    let script = scripts.borrow().join("\n");
+    assert!(script.contains("worktree remove --force") && script.contains("branch -D") && script.contains(&format!("rm -rf -- {}", q(audit.work.trim_end_matches("/work")))), "{script}");
+    assert_eq!(store.claims("other").unwrap().len(), 1, "another audit untouched");
+}
+
+/// An unreviewed claim waits on the operator only where the audit needs
+/// his review to check it (assure mode, or the `reviewed` gate); elsewhere
+/// it is checked anyway, and nothing waits.
+#[test]
+fn only_a_review_the_audit_needs_waits_on_the_operator() {
+    let (store, _) = fresh();
+    let audit = running(&store, None, Mode::Diagnose, Gate::Plan, Post::Auto);
+    let c = claim(&store, "share-slice", "Redaction never changes the line count", Review::Proposed);
+    let a = store
+        .add_claim("share-slice", Claim { text: "assumes: store::save writes only under the lock".into(), kind: "assumes".into(), source: "src/x.rs:1".into(), review: Review::Proposed, ..Claim::default() })
+        .expect("assumption");
+    assert!(!c.waits_on(&audit) && !a.waits_on(&audit), "diagnose, gate plan: checked without review");
+    let reviewed = Audit { settings: Settings { gate: Gate::Reviewed, ..audit.settings.clone() }, ..audit.clone() };
+    assert!(c.waits_on(&reviewed) && !a.waits_on(&reviewed), "the reviewed gate: the claim waits, an assumption never does");
+    let assure = Audit { mode: Mode::Assure, ..audit.clone() };
+    assert!(c.waits_on(&assure));
+    let accepted = Claim { review: Review::Accepted, ..c.clone() };
+    assert!(!accepted.waits_on(&assure));
+    let question = Claim { readings: vec!["one".into(), "two".into()], ..accepted.clone() };
+    assert!(question.waits_on(&audit), "an open question does");
+    let blocked = Claim { blocked: Some("the python adapter's doctor run is going".into()), blocked_on: Some("python".into()), ..accepted.clone() };
+    assert!(!blocked.waits_on(&audit) && blocked.mark().0 == "[*]", "a doctor run under way is not his");
+    let refused = Claim { blocked: Some("kind vibes".into()), ..accepted };
+    assert!(refused.waits_on(&audit) && refused.mark().0 == "[!]");
+}
+
+#[test]
+fn a_shell_is_held_only_while_its_audit_runs_a_batch() {
+    let name = "shell-held-with-a-long-name-that-is-cut";
+    let shell = crate::audit::shell_name(name);
+    assert!(!shell_running(&shell));
+    crate::util::locked(&RUNNING).insert(name.to_string());
+    assert!(shell_running(&shell), "found by the shell's (cut) name");
+    assert!(!shell_running("audit-other"));
+    crate::util::locked(&RUNNING).remove(name);
+    assert!(!shell_running(&shell));
+}

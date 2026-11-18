@@ -243,12 +243,12 @@ impl FlowStore {
         Self { path: boards.flow_path() }
     }
 
-    fn connect(&self) -> Result<Connection> {
+    fn connect(&self) -> Result<crate::projects::journal::Db> {
         let mut db = Connection::open(&self.path)?;
         db.busy_timeout(Duration::from_secs(10))?;
         db.execute_batch(SCHEMA)?;
         repair_note_ids(&mut db)?;
-        Ok(db)
+        Ok(crate::projects::journal::wrap(db, crate::projects::journal::Store::Flow, &self.path))
     }
 
     pub fn get(&self, board_id: &str) -> Result<Option<Flow>> {
@@ -320,54 +320,89 @@ impl FlowStore {
         }))
     }
 
+    /// The board store beside this one: review notes are its comments.
+    fn boards(&self) -> BoardStore {
+        BoardStore::beside_archive(&self.path)
+    }
+
+    /// The operator's review notes: comments of a review round, each with
+    /// the agent's answer (its reply, when the last word in the thread is
+    /// the agent's; a resolved one counts as answered).
     pub fn notes(&self, board_id: &str) -> Result<Vec<Note>> {
-        let db = self.connect()?;
-        let mut statement = db.prepare(
-            "SELECT id, board_id, round, kind, text, created_at, answer, answered_at FROM notes \
-             WHERE board_id=?1 ORDER BY seq",
-        )?;
-        let rows = statement.query_map(params![board_id], |row| {
-            Ok(Note {
-                id: row.get(0)?,
-                board_id: row.get(1)?,
-                round: row.get(2)?,
-                text: row.get(4)?,
-                created_at: row.get(5)?,
-                answer: row.get(6)?,
-                answered_at: row.get(7)?,
+        self.move_notes_over(board_id)?;
+        Ok(self
+            .boards()
+            .threads(board_id)?
+            .into_iter()
+            .filter_map(|thread| {
+                let round = thread.root.round?;
+                let answered = !thread.waits_on_agent();
+                let reply = thread.replies.iter().rev().find(|r| !r.by_operator());
+                let text = if thread.root.on == "board" { thread.root.text.clone() } else { format!("on {}: {}", thread.on_said(), thread.root.text) };
+                Some(Note {
+                    id: thread.root.id.clone(),
+                    board_id: board_id.to_string(),
+                    round,
+                    text,
+                    created_at: thread.root.created_at.clone(),
+                    answer: answered.then(|| reply.map_or_else(|| "(resolved)".to_string(), |r| r.text.clone())),
+                    answered_at: if answered { reply.map(|r| r.created_at.clone()).or(thread.root.resolved_at.clone()) } else { None },
+                })
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .collect())
+    }
+
+    /// Notes from before comments, moved over: written as comments, then
+    /// taken from here.
+    fn move_notes_over(&self, board_id: &str) -> Result<()> {
+        let db = self.connect()?;
+        let old: Vec<Note> = {
+            let mut statement = db.prepare(
+                "SELECT id, board_id, round, kind, text, created_at, answer, answered_at FROM notes \
+                 WHERE board_id=?1 ORDER BY seq",
+            )?;
+            let rows = statement.query_map(params![board_id], |row| {
+                Ok(Note {
+                    id: row.get(0)?,
+                    board_id: row.get(1)?,
+                    round: row.get(2)?,
+                    text: row.get(4)?,
+                    created_at: row.get(5)?,
+                    answer: row.get(6)?,
+                    answered_at: row.get(7)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if old.is_empty() {
+            return Ok(());
+        }
+        self.boards().take_notes(&old)?;
+        db.execute("DELETE FROM notes WHERE board_id=?1", params![board_id])?;
+        Ok(())
     }
 
     /// The operator's note on a board in review, for its round: numbered one
     /// past the highest on the board (not its count, which a note taken back
     /// lowers, giving the next one an id already in use).
     pub fn add_note(&self, board_id: &str, round: i64, text: &str) -> Result<Note> {
-        let mut db = self.connect()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let id = format!("n{}", highest_note(&tx, board_id)? + 1);
-        let created_at = now();
-        tx.execute(
-            "INSERT INTO notes(id, board_id, round, kind, text, created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![id, board_id, round, "note", text, created_at],
-        )?;
-        tx.commit()?;
-        Ok(Note { id, board_id: board_id.into(), round, text: text.into(), created_at, answer: None, answered_at: None })
+        let (on, said) = crate::board::comments::split_on(text);
+        let comment = self.boards().comment(board_id, &on, Some(round), crate::board::comments::OPERATOR, &said)?;
+        Ok(Note { id: comment.id, board_id: board_id.into(), round, text: text.into(), created_at: comment.created_at, answer: None, answered_at: None })
     }
 
-    /// The operator takes back a note the agent has not answered.
+    /// The operator takes back a note nobody has replied to.
     pub fn remove_note(&self, board_id: &str, id: &str) -> Result<bool> {
-        let db = self.connect()?;
-        Ok(db.execute("DELETE FROM notes WHERE board_id=?1 AND id=?2 AND answer IS NULL", params![board_id, id])? > 0)
+        self.boards().take_back(board_id, id)
     }
 
+    /// The agent's answer: a reply in the note's thread.
     fn answer(&self, board_id: &str, id: &str, answer: &str) -> Result<bool> {
-        let db = self.connect()?;
-        Ok(db.execute(
-            "UPDATE notes SET answer=?1, answered_at=?2 WHERE board_id=?3 AND id=?4",
-            params![answer, now(), board_id, id],
-        )? > 0)
+        let boards = self.boards();
+        if !boards.comment_by_id(id)?.is_some_and(|c| c.board_id == board_id && c.round.is_some()) {
+            return Ok(false);
+        }
+        Ok(boards.reply(board_id, id, crate::board::comments::AGENT, answer)?.is_ok())
     }
 
     /// Something for the agent: `wake` starts a turn, otherwise it comes with
@@ -624,8 +659,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
              `files` are the absolute paths on your machine of the files that make up the work (code, configs, \
              outputs, logs; folders too): they are copied, as they are now, into /share/boards/<name>/files/, \
              beside report.md, and the board goes to the operator's review in his projects tab. Each round's report is \
-             kept too, as reports/round-<n>.md. When he sends a board back with notes, answer every one \
-             (board_answer) before writing it up again: the new report and files replace the old in report.md and \
+             kept too, as reports/round-<n>.md. When he sends a board back with notes, reply to every one \
+             (comment_reply, or board_answer) before writing it up again: the new report and files replace the old in report.md and \
              files/.",
             json!({"type": "object", "additionalProperties": false, "required": ["name", "report"], "properties": {
                 "name": name,
@@ -638,10 +673,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             "board_answer",
             "Answer one of the operator's review notes on a board he sent back to you (board_read shows them under \
              `review`): what he asked, or what you did with what he suggested and why. Every note needs an answer \
-             before the board can be written up again.",
+             before the board can be written up again. The same as comment_reply on the note's id.",
             json!({"type": "object", "additionalProperties": false, "required": ["name", "note_id", "answer"], "properties": {
                 "name": name,
-                "note_id": {"type": "string", "description": "e.g. n1."},
+                "note_id": {"type": "string", "description": "e.g. c-0004."},
                 "answer": {"type": "string"}
             }}),
         ),
@@ -703,7 +738,7 @@ pub fn execute(boards: &BoardStore, call: &ToolCall, share: &str, run: Run) -> R
             let notes = flows.notes(&board.id)?;
             let open: Vec<String> = notes.iter().filter(|note| note.answer.is_none()).map(|note| note.id.clone()).collect();
             if !open.is_empty() {
-                return Ok(rejected(format!("answer the operator's notes first (board_answer): {}", open.join(", "))));
+                return Ok(rejected(format!("reply to the operator's notes first (comment_reply): {}", open.join(", "))));
             }
             let mut report = match bounded(&text("report"), 40, MAX_REPORT_CHARS, "report") {
                 Ok(report) => report,
@@ -925,7 +960,7 @@ pub fn send_back(boards: &BoardStore, which: &str, why: &str) -> Result<std::res
             let listed: Vec<String> = notes.iter().map(|note| format!("  {}: {}", note.id, note.text)).collect();
             format!(
                 "The operator reviewed '{}' (round {}) and sent it back to you{}. It is open again.{}\n\
-                 Answer each of his notes with board_answer (board_read shows them), work on what they ask, \
+                 Reply to each of his notes with comment_reply (board_read shows them under review), work on what they ask, \
                  then close it and write it up again with board_report: it goes back to his review.",
                 board.name,
                 flow.round,
@@ -1104,6 +1139,26 @@ pub fn discard(boards: &BoardStore, which: &str) -> Result<std::result::Result<S
     commit(&flows, &before, &flow, || boards.discard(&board.id))?;
     flows.push_event(&format!("The operator discarded '{}': it is closed (abandoned); leave it be.", board.name), false)?;
     Ok(Ok(format!("{} discarded", board.name)))
+}
+
+/// The operator brings a board back from the archive: one closed without being
+/// delivered (discarded, exhausted) is open again, as it was left. Any other
+/// stays as it is (`Ok` of nothing).
+pub fn bring_back(boards: &BoardStore, which: &str) -> Result<std::result::Result<String, String>> {
+    let flows = FlowStore::beside(boards);
+    let Some(board) = find(boards, which)? else { return Ok(Err(format!("no board '{which}'"))) };
+    let mut flow = flows.get_or_new(&board)?;
+    let closed = matches!(board.status, BoardStatus::Abandoned | BoardStatus::Exhausted) || flow.stage() == Stage::Discarded;
+    if !closed {
+        return Ok(Ok(String::new()));
+    }
+    let before = flow.clone();
+    flow.stage = Some(Stage::Working);
+    flow.entered_at = now();
+    flow.verifier_state = None;
+    commit(&flows, &before, &flow, || boards.reopen(&board.id))?;
+    flows.push_event(&format!("The operator brought '{}' back from the archive: it is open again, as it was left.", board.name), false)?;
+    Ok(Ok(format!("{} is open again", board.name)))
 }
 
 /// The operator agrees with the agent that nothing is left to try: closed exhausted,
@@ -1406,27 +1461,47 @@ mod tests {
     }
 
     #[test]
-    fn a_note_taken_back_never_gives_its_id_to_two_notes() {
+    fn a_discarded_board_brought_back_is_open_again() {
+        let (root, boards) = temp_boards("bring-back");
+        let board = boards.open_board("back", "t", "o", "g", "The operator agrees", GoalTestKind::Judgment, 20).unwrap().unwrap();
+        // Open: nothing to do.
+        assert_eq!(bring_back(&boards, &board.id).unwrap(), Ok(String::new()));
+        discard(&boards, &board.id).unwrap().unwrap();
+        assert_eq!(boards.board_by_id(&board.id).unwrap().unwrap().status, BoardStatus::Abandoned);
+        assert_eq!(bring_back(&boards, &board.id).unwrap(), Ok("back is open again".to_string()));
+        let now = boards.board_by_id(&board.id).unwrap().unwrap();
+        assert_eq!(now.status, BoardStatus::Open);
+        assert_eq!(FlowStore::beside(&boards).get(&board.id).unwrap().unwrap().stage(), Stage::Working);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn review_notes_are_comments_with_the_answer_a_reply() {
         let (root, boards) = temp_boards("note-ids");
         let board = boards.open_board("ids", "t", "o", "g", "The operator agrees", GoalTestKind::Judgment, 20).unwrap().unwrap();
         let flows = FlowStore::beside(&boards);
-        flows.add_note(&board.id, 1, "first").unwrap();
-        flows.add_note(&board.id, 1, "second").unwrap();
-        assert!(flows.remove_note(&board.id, "n1").unwrap());
-        let third = flows.add_note(&board.id, 1, "third").unwrap();
-        assert_eq!(third.id, "n3", "past the highest, not the count");
-        let ids: Vec<String> = flows.notes(&board.id).unwrap().into_iter().map(|note| note.id).collect();
-        assert_eq!(ids, ["n2", "n3"]);
-
-        // Two notes that came to share an id before: the later one renumbered.
+        let first = flows.add_note(&board.id, 1, "first").unwrap();
+        let second = flows.add_note(&board.id, 1, "second").unwrap();
+        assert!(flows.remove_note(&board.id, &first.id).unwrap());
+        let third = flows.add_note(&board.id, 1, "on slice/c4: third").unwrap();
+        assert!(third.id != first.id && third.id != second.id, "never an id twice");
+        let notes = flows.notes(&board.id).unwrap();
+        assert_eq!(notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["second", "on claim slice/c4: third"]);
+        // The agent's answer is a reply; the operator's reply asks again.
+        assert!(flows.answer(&board.id, &second.id, "done").unwrap());
+        assert_eq!(flows.notes(&board.id).unwrap()[0].answer.as_deref(), Some("done"));
+        assert!(!flows.remove_note(&board.id, &second.id).unwrap(), "replied to: not taken back");
+        boards.reply(&board.id, &second.id, crate::board::comments::OPERATOR, "and the other one?").unwrap().unwrap();
+        assert_eq!(flows.notes(&board.id).unwrap()[0].answer, None);
+        // Notes from before comments are moved over, answers as replies.
         {
             let db = Connection::open(&flows.path).unwrap();
-            db.execute("INSERT INTO notes(id, board_id, round, kind, text, created_at) VALUES('n3', ?1, 1, 'note', 'duplicate', 'x')", params![board.id]).unwrap();
+            db.execute("INSERT INTO notes(id, board_id, round, kind, text, created_at, answer, answered_at) VALUES('n7', ?1, 1, 'note', 'older', 'x', 'answered then', 'y')", params![board.id]).unwrap();
         }
         let notes = flows.notes(&board.id).unwrap();
-        let ids: Vec<&str> = notes.iter().map(|note| note.id.as_str()).collect();
-        assert_eq!(ids, ["n2", "n3", "n4"], "repaired on the next open");
-        assert_eq!(notes[2].text, "duplicate", "the older keeps its id");
+        let older = notes.iter().find(|n| n.text == "older").expect("moved over");
+        assert_eq!(older.answer.as_deref(), Some("answered then"));
+        assert_eq!(flows.notes(&board.id).unwrap().len(), 3, "once");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

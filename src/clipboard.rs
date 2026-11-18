@@ -14,6 +14,10 @@
 //!   tmux, can lack `DISPLAY` and `WAYLAND_DISPLAY`: the display is then
 //!   found from its socket.
 //!
+//! - **The operator's own computer**, from a terminal attached with `s0ma
+//!   connect`: its clipboard tool, over the file link (`laptop::copy`), so a
+//!   copy lands whatever the terminal makes of OSC 52.
+//!
 //! Reading back (Ctrl+V) takes the desktop's clipboard on a local session,
 //! else tmux's buffer; a terminal's own paste works anywhere.
 
@@ -40,6 +44,9 @@ pub fn copy(text: &str) -> String {
     if !cfg!(test) && std::env::var_os("TMUX").is_some() && tmux_load(text) {
         methods.push("tmux");
     }
+    if !cfg!(test) && crate::laptop::linked() && crate::laptop::copy(text).is_ok() {
+        methods.push("your computer");
+    }
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let plain = format!("\x1b]52;c;{encoded}\x07");
@@ -61,12 +68,19 @@ pub fn copy(text: &str) -> String {
     );
     if methods == ["OSC 52"] {
         if std::env::var_os("VTE_VERSION").is_some() {
-            said.push_str(" (this terminal ignores OSC 52: select with the mouse, or use /copy from a terminal that takes it)");
+            said.push_str(" (this terminal ignores OSC 52: hold Shift and drag to select with the terminal itself)");
         } else if text.len() > OSC52_SAFE_BYTES {
             said.push_str(" (large: some terminals drop an OSC 52 copy past ~100 KB)");
         }
     }
     said
+}
+
+/// `text` to this computer's own clipboard, by its desktop's tool: which
+/// one, or why not. For the computer's side of `s0ma connect`.
+pub fn copy_here(text: &str) -> Result<&'static str, String> {
+    let display = local_display().ok_or("no desktop session found")?;
+    copy_with_tool(text, &display).ok_or_else(|| "no clipboard tool (wl-copy, xclip, xsel or pbcopy)".to_string())
 }
 
 /// What the clipboard holds, and where it came from: the desktop's, on a

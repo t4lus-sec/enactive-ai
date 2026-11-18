@@ -89,14 +89,12 @@ type Result<T> = std::result::Result<T, String>;
 /// matched in tests, read by a person scrolling the archive, and indexed by
 /// both indexes once the redacted line is re-read.
 ///
-/// **The name is in it, and the marker stays for good.** So a job named after
-/// a client writes that client's name permanently into the archive and into
-/// both search indexes -- which can be the one thing the job was keeping back.
-/// A code name avoids that, and nothing here depends on the name meaning
-/// anything. `/job start` says so.
-pub fn marker(job: &str) -> String {
-    format!("[redacted for job {job}]")
-}
+/// **The job's name is not in it.** The marker stays for good, in the archive
+/// and both search indexes, and a job named after a client would have kept
+/// that name there -- which can be the one thing the job was keeping back.
+/// Which job a stretch belonged to is in `jobs.json` (its spans), nowhere in
+/// the archive.
+pub const MARKER: &str = "[redacted for a closed job]";
 
 const FILE: &str = "jobs.json";
 const MAX_NAME: usize = 48;
@@ -420,7 +418,7 @@ pub fn sleep_held() -> Option<String> {
 /// working memory, held by the running session. Left alone, the next fold would
 /// write gists from those messages and put the content back into the store the
 /// close just cleared. Rotating rebuilds the context from the archive, which by
-/// then says `[redacted for job …]`.
+/// then says `[redacted for a closed job]`.
 pub fn take_rotation_owed() -> bool {
     ROTATION_OWED.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
@@ -530,8 +528,8 @@ A job covers everything appended while it was open, not everything about a
 topic: time is the only thing that can be judged reliably. Pause it for
 unrelated work in the middle. One job is open at a time.
 
-The name goes into the archive in place of what was redacted and stays there,
-so a code name is safer than a client's own.
+The name is kept in the job list only (/job list): what replaces the redacted
+content does not carry it.
 
 A close cannot reach what s0ma wrote down in its own words -- the world model,
 the board, threads, skills, open loops, its attention note, or a weakness it
@@ -711,10 +709,8 @@ fn start(memory: &Hippocampus, name: &str) -> Result<String> {
     })?;
     Ok(format!(
         "[job] {name} open from event #{from}. Everything appended until it closes is covered, so pause it for \
-         unrelated work. Deep sleep is held until the close.\n        The redaction reads \"{}\" and stays in \
-         the archive for good, so if the name itself is confidential, a code name is the safer choice: close \
-         this and start one under another name.",
-        marker(name)
+         unrelated work. Deep sleep is held until the close.\n        The redaction reads \"{MARKER}\": the \
+         name stays in the job list only."
     ))
 }
 
@@ -804,14 +800,14 @@ fn close(memory: &Hippocampus, name: &str, confirmed: bool) -> Result<String> {
                 .collect::<Vec<_>>()
                 .join(", ")
         )];
-        lines.push(
+        lines.push(format!(
             "        Each of those events keeps its number, its time and who spoke; its content becomes \
-             \"[redacted for job <name>]\". Also removed: those events' rows in the keyword and semantic \
-             indexes, every saved model call from the job (each holds the whole conversation as it was sent), \
-             the gists and NOT SETTLED items of the job, the compaction windows covering it, the /mistake \
-             records on those calls, the matching lines of the typed history, and a /goal set during it."
-                .into(),
-        );
+             \"{MARKER}\" (the job's name is not in it). Also removed: those events' rows in the keyword and \
+             semantic indexes, every saved model call from the job (each holds the whole conversation as it \
+             was sent), the gists and NOT SETTLED items of the job, the compaction windows covering it, the \
+             /mistake records on those calls, the matching lines of the typed history, and a /goal set \
+             during it."
+        ));
         lines.push(
             "        Not removed, because nothing records where it came from: what s0ma wrote into the world \
              model, the board, threads, skills, open loops or its attention note, and any weakness it \
@@ -867,7 +863,7 @@ fn close(memory: &Hippocampus, name: &str, confirmed: bool) -> Result<String> {
             .flatten()
             .unwrap_or_default();
         let redacted = memory
-            .redact_ranges(&ranges, &marker(name))
+            .redact_ranges(&ranges, MARKER)
             .map_err(|error| format!("the archive was not redacted ({error}); the job is still open"))?;
         purged.events = redacted.events;
         purged.ids = redacted.ids;
@@ -1204,8 +1200,11 @@ mod tests {
         assert!(report.contains("closed"), "{report}");
 
         // The job's events: content gone, everything else kept.
-        assert_eq!(fixture.content(3), "[redacted for job acme]");
-        assert_eq!(fixture.content(4), "[redacted for job acme]");
+        assert_eq!(fixture.content(3), MARKER);
+        assert_eq!(fixture.content(4), MARKER);
+        // The name is in the job list only: nowhere in the archive.
+        assert!(!MARKER.contains("acme"));
+        assert!(!fs::read_to_string(fixture.dir.join("hippocampus.jsonl")).unwrap().contains("acme"), "the name is not in the archive");
         // Outside the job: untouched.
         assert_eq!(fixture.content(1), "ordinary work");
         assert_eq!(fixture.content(2), "about ordinary work");

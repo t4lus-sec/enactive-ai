@@ -1,4 +1,5 @@
 mod db;
+mod laptop;
 mod style;
 mod memory;
 mod context;
@@ -48,6 +49,7 @@ mod session;
 mod overview;
 mod share;
 mod facts;
+mod freeze;
 mod transfer;
 mod util;
 mod crash;
@@ -69,6 +71,7 @@ mod vm;
 mod voice;
 mod weaknesses;
 mod tabs;
+mod projects;
 
 use std::path::Path;
 
@@ -86,10 +89,12 @@ s0ma
                                        past judgments (data/knowledge_audit.jsonl)
     s0ma connect <ssh target> [--remote <command>]
                                        a terminal onto the s0ma running on another
-                                       machine, over ssh (it runs `s0ma --bridge`
-                                       there; --remote names the command that runs
-                                       s0ma, default `s0ma` or S0MA_REMOTE_COMMAND).
-                                       /download and /upload move files with the share
+                                       machine, over ssh: its own terminal there,
+                                       every tab as it is on that machine, with a
+                                       file link back to this one (the share tab's
+                                       a and s, /download and /upload). --remote
+                                       names the command that runs s0ma there,
+                                       default `s0ma` or S0MA_REMOTE_COMMAND
     s0ma --fact-calibration            how often facts at each certainty level
                                        were later confirmed or contradicted
     s0ma --recall-eval generate [n]    make retrieval test cases from n facts
@@ -198,8 +203,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // The far end of `s0ma connect`: this process's input and output are the
-    // protocol, so nothing else may be printed.
+    // The far end of an older client's `s0ma connect`: this process's input
+    // and output are the protocol, so nothing else may be printed.
     if arguments.first().map(String::as_str) == Some("--bridge") {
         if let Err(error) = session::bridge(&root.join("data")) {
             eprintln!("s0ma: {error}");
@@ -232,20 +237,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprint!("s0ma connect: which machine? (an ssh target: host, user@host, or a Host from ~/.ssh/config)\n\n{USAGE}");
             std::process::exit(2);
         };
-        let remote = match session::open_remote(&target, &remote) {
-            Ok(remote) => remote,
+        match session::connect(&target, &remote) {
+            Ok(code) => std::process::exit(code),
             Err(error) => {
                 eprintln!("s0ma connect: {error}");
                 std::process::exit(1);
             }
+        }
+    }
+    // Started by `s0ma connect` on this machine: a terminal onto the s0ma
+    // running here (never a new one), with the operator's computer behind
+    // the socket ssh forwards.
+    let mut arguments = arguments;
+    let mut attach_only = false;
+    let mut _link = None;
+    if arguments.first().map(String::as_str) == Some("--laptop") {
+        let Some(socket) = arguments.get(1).cloned() else {
+            eprint!("s0ma: --laptop needs the forwarded socket\n\n{USAGE}");
+            std::process::exit(2);
         };
-        let _page = page::enter();
-        return session::attach_remote(&root.join("data"), remote);
+        laptop::set(std::path::PathBuf::from(socket));
+        _link = Some(laptop::Forget);
+        arguments.drain(..2);
+        attach_only = true;
     }
 
     let mut print_prompt = false;
     let mut options = print_prompt::Options::default();
-    for argument in std::env::args().skip(1) {
+    for argument in &arguments {
         match argument.as_str() {
             "--print-system-prompt" => {
                 print_prompt = true;
@@ -283,10 +302,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
 
+    // A window onto a running agent works with its folders and machine,
+    // however this terminal was started.
+    session::take_environment(&root.join("data"));
+
     // The agent's page (the alternate screen, the tab bar on top), for this agent
     // or a window onto a running one; the shell's screen comes back on the
     // way out.
     let _page = page::enter();
+    let _temp = util::PrivateTemp;
 
     // Before anything else touches the archive, the self-model or the sqlite
     // stores: if an agent is already running, this terminal becomes a window onto
@@ -294,10 +318,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // makes reconnecting after a dropped SSH session rejoin the turn already in
     // progress rather than starting a rival one.
     if session::attach_if_running(&root.join("data"))? {
+        laptop::forget();
         return Ok(());
+    }
+    if attach_only {
+        laptop::forget();
+        drop(_page);
+        eprintln!("s0ma: no s0ma is running on this machine to connect to; start it here first");
+        std::process::exit(1);
     }
 
     terminal::banner();
+    session::record_environment(&root.join("data"));
 
     let mut app = app::App::load(root, app::RuntimeMode::Conversation)?;
     let ran = app.run();

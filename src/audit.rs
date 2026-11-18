@@ -273,6 +273,7 @@ impl Settings {
                 _ => Err(format!("{key}: on or off")),
             };
             match key {
+                "steps" if value == "auto" => self.steps = None,
                 "steps" => self.steps = Some(value.parse().map_err(|_| "steps: a number".to_string())?),
                 "time" => {
                     let (check, total) = value.split_once('/').unwrap_or((value, ""));
@@ -284,7 +285,9 @@ impl Settings {
                     }
                 }
                 "workers" => self.workers = value.parse::<usize>().ok().filter(|n| (1..=8).contains(n)).ok_or("workers: 1 to 8")?,
+                "depth" if matches!(value, "auto" | "test-first") => self.depth = None,
                 "depth" => self.depth = Some(Level::parse(value).ok_or("depth: tested, property, bounded, model or proven")?),
+                "tools" if value == "all" => self.tools.clear(),
                 "tools" => {
                     for tool in value.split(',').filter(|tool| !tool.is_empty()) {
                         if !(tool.starts_with('+') || tool.starts_with('-')) {
@@ -339,7 +342,7 @@ impl Settings {
             show_secs(self.check_secs),
             show_secs(self.total_secs),
             self.workers,
-            self.depth.map_or("ceiling", Level::label),
+            self.depth.map_or("test first", Level::label),
             if self.tools.is_empty() { "all".to_string() } else { self.tools.join(",") },
             [("mutants", self.mutants), ("back-translation", self.back_translation), ("loophole", self.loophole)]
                 .iter()
@@ -438,9 +441,22 @@ pub struct Audit {
     pub spent_secs: u64,
     /// What went wrong setting it up, if anything.
     pub problem: Option<String>,
+    /// Set up or harvested and not yet finished: started again if the
+    /// harness stopped part way.
+    pub harvest_open: bool,
+    /// Put away by the operator: out of the portfolio, the agent's context
+    /// and the board, everything kept; brought back as it was.
+    pub archived: bool,
+    pub archived_at: Option<String>,
 }
 
 impl Audit {
+    /// Shown in the portfolio, the projects tab and the agent's context:
+    /// live and not archived.
+    pub fn shown(&self) -> bool {
+        self.status.live() && !self.archived
+    }
+
     /// The audit's shell's netbox name.
     pub fn shell(&self) -> String {
         shell_name(&self.name)
@@ -569,6 +585,12 @@ pub struct Claim {
     pub priority: i64,
     pub pinned: bool,
     pub skipped: bool,
+    /// Its check was refused for a reason only the operator or the harness
+    /// can lift (an adapter that has not passed its doctor run, say): why.
+    /// Not the same as skipped: lifted on its own once the reason goes.
+    pub blocked: Option<String>,
+    /// The adapter it waits on, when that is the reason.
+    pub blocked_on: Option<String>,
     pub depth: Option<Level>,
     pub tool: String,
     pub estimate_secs: u64,
@@ -581,6 +603,9 @@ pub struct Claim {
     pub held_until: Option<String>,
     /// A direction for its worker, waiting to be taken.
     pub steer: Option<String>,
+    /// The check the direction is for (`k2`): written again if it exists,
+    /// added if not. None: its first.
+    pub steer_check: Option<String>,
     // ---- the result (the harness's only)
     pub verdict: Verdict,
     pub level: Level,
@@ -627,8 +652,11 @@ impl Claim {
 
     /// The mark and its style for the ledger, `[!]` first.
     pub fn mark(&self) -> (&'static str, Tone) {
-        if self.weaker.is_some() || (self.repro == Repro::ModelOnly && !self.model_only_accepted) {
+        if self.weaker.is_some() || self.blocked_on_operator() || (self.repro == Repro::ModelOnly && !self.model_only_accepted) {
             return ("[!]", Tone::Warn);
+        }
+        if self.blocked.is_some() {
+            return ("[*]", Tone::Warn);
         }
         if self.unsound.is_some() || self.stale.is_some() {
             return ("[?]", Tone::Warn);
@@ -665,19 +693,46 @@ impl Claim {
         (group, -self.risk)
     }
 
+    /// Whether something about it is the operator's to answer before it
+    /// can go on: a review the audit requires (assure mode, or the
+    /// `reviewed` gate; elsewhere an unreviewed claim is checked anyway),
+    /// a weaker check, a model-only reason, a result to post, an open
+    /// question, or a refusal only he can lift.
+    pub fn waits_on(&self, audit: &Audit) -> bool {
+        if matches!(self.review, Review::Rejected | Review::Dropped) || self.waived {
+            return false;
+        }
+        let review_needed = audit.mode == Mode::Assure || audit.settings.gate == Gate::Reviewed;
+        (self.review == Review::Proposed && review_needed && !self.is_assumption())
+            || self.weaker.is_some()
+            || (self.repro == Repro::ModelOnly && !self.model_only_accepted)
+            || self.posted == Posted::Ready
+            || (!self.readings.is_empty() && self.picked.is_none())
+            || self.blocked_on_operator()
+    }
+
+    /// Blocked by something only the operator can lift: any refusal but an
+    /// adapter whose doctor run is still to pass (it runs on its own).
+    fn blocked_on_operator(&self) -> bool {
+        self.blocked.is_some()
+            && self.blocked_on.as_deref().is_none_or(|lang| {
+                store().and_then(|s| s.adapter_state(lang).ok().flatten()).is_some_and(|state| state.doctor_at.is_some() && !state.doctor_passed)
+            })
+    }
+
     /// Ready to be checked under the gate, in this mode.
     pub fn checkable(&self, audit: &Audit) -> bool {
-        if matches!(self.review, Review::Rejected | Review::Dropped) || self.skipped || self.waived {
+        if matches!(self.review, Review::Rejected | Review::Dropped) || self.skipped || self.blocked.is_some() || self.waived {
             return false;
         }
         if self.is_assumption() {
             return false;
         }
-        match (audit.mode, audit.settings.gate) {
-            (Mode::Assure, _) | (_, Gate::Reviewed) => self.review == Review::Accepted,
-            (_, Gate::Plan) => !self.new && audit.gone_at.is_some(),
-            (_, Gate::None) => true,
-        }
+        // Assure mode, or the `reviewed` gate: only what the operator accepted.
+        let reviewed = !(audit.mode == Mode::Assure || audit.settings.gate == Gate::Reviewed) || self.review == Review::Accepted;
+        // The `plan` gate: nothing before go, and rows added since wait for another.
+        let gone = audit.settings.gate != Gate::Plan || (!self.new && audit.gone_at.is_some());
+        reviewed && gone
     }
 }
 
@@ -696,6 +751,9 @@ pub enum Tone {
 #[serde(default)]
 pub struct Check {
     pub claim: String,
+    /// Which of the claim's checks it is (`k1`, `k2`…): a claim has several,
+    /// a test and a bounded check, say; a new version replaces its own.
+    pub slot: String,
     pub version: i64,
     /// `checks/c<N>/` in the work tree.
     pub dir: String,
@@ -712,16 +770,135 @@ pub struct Check {
     /// Clause anchors found in its files: `[1]`, `[2]`…
     pub anchors: Vec<usize>,
     pub by: String,
+    /// The worker job that wrote it, by its full id (`by` is its label,
+    /// which repeats across restarts).
+    pub by_job: String,
     pub commit: String,
     pub back_translation: Option<String>,
+    /// The job that read it back, never the one that wrote it.
+    pub back_by: String,
     pub kills: Option<(usize, usize)>,
     /// Mutants it killed, by name (strengthen-only compares these).
     pub killed: Vec<String>,
     pub survived: Vec<String>,
+    /// Mutants that never ran as mutants (didn't apply, a tool missing, the
+    /// check couldn't start), with why: counted neither way.
+    pub broken: Vec<String>,
     pub superseded_by: Option<i64>,
     /// Waiting for the operator, weaker than the one it would replace.
     pub held_weaker: bool,
     pub submitted_at: String,
+    // ---- its last run (the harness's only)
+    pub verdict: Verdict,
+    pub level: Level,
+    pub checked_at: Option<String>,
+    /// Where its counterexample is kept, when it failed.
+    pub trace: Option<String>,
+}
+
+impl Check {
+    /// Its name within the claim; checks from before claims had several
+    /// are `k1`.
+    pub fn slot(&self) -> &str {
+        if self.slot.is_empty() { "k1" } else { &self.slot }
+    }
+
+    fn slot_number(&self) -> u32 {
+        slot_number(self.slot())
+    }
+}
+
+/// Checks from before a claim had several: each becomes `k1`, and the one
+/// in force takes its claim's last result (kept on the claim until now).
+fn migrate_checks(db: &Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut statement = db.prepare("SELECT audit, data FROM checks WHERE data NOT LIKE '%\"slot\"%' ORDER BY version")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut checks: Vec<(String, Check)> = Vec::new();
+    for (audit, data) in rows {
+        checks.push((audit, serde_json::from_str(&data)?));
+    }
+    for i in 0..checks.len() {
+        let (audit, check) = &checks[i];
+        let in_force = !check.held_weaker
+            && check.superseded_by.is_none()
+            && !checks[i + 1..].iter().any(|(a, later)| a == audit && later.claim == check.claim && !later.held_weaker && later.superseded_by.is_none());
+        let mut check = check.clone();
+        check.slot = "k1".into();
+        if in_force {
+            let data: Option<String> =
+                db.query_row("SELECT data FROM claims WHERE audit=?1 AND id=?2", params![audit, check.claim], |row| row.get(0)).optional()?;
+            if let Some(claim) = data.and_then(|d| serde_json::from_str::<Claim>(&d).ok()) {
+                check.verdict = claim.verdict;
+                check.level = claim.level;
+                check.checked_at = claim.checked_at.clone();
+                check.trace = claim.trace.clone();
+            }
+        }
+        db.execute(
+            "UPDATE checks SET data=?4 WHERE audit=?1 AND claim=?2 AND version=?3",
+            params![audit, check.claim, check.version, serde_json::to_string(&check)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// `k3` → 3.
+pub fn slot_number(slot: &str) -> u32 {
+    slot.strip_prefix('k').and_then(|n| n.parse().ok()).unwrap_or(1)
+}
+
+/// A claim's verdict and level from its checks in force: failing if any
+/// fails; else holding at the deepest level any holds at; else vacuous, or
+/// an error; unchecked while none has run.
+pub fn roll_up(checks: &[Check]) -> (Verdict, Level) {
+    if checks.iter().any(|c| c.verdict == Verdict::Fails) {
+        return (Verdict::Fails, Level::Documented);
+    }
+    if let Some(level) = checks.iter().filter(|c| c.verdict == Verdict::Holds).map(|c| c.level).max() {
+        return (Verdict::Holds, level);
+    }
+    if checks.iter().any(|c| c.verdict == Verdict::Vacuous) {
+        return (Verdict::Vacuous, Level::Documented);
+    }
+    if checks.iter().any(|c| c.verdict == Verdict::Error) {
+        return (Verdict::Error, Level::Documented);
+    }
+    (Verdict::Unchecked, Level::Documented)
+}
+
+/// The check one line speaks for: a failing one, else the deepest that
+/// holds, else the newest.
+pub fn lead(checks: &[Check]) -> Option<&Check> {
+    checks
+        .iter()
+        .find(|c| c.verdict == Verdict::Fails)
+        .or_else(|| checks.iter().filter(|c| c.verdict == Verdict::Holds).max_by_key(|c| c.level))
+        .or_else(|| checks.iter().max_by_key(|c| c.version))
+}
+
+/// Where a claim's check lives in the work tree: `checks/c3/k2`. A claim
+/// whose first check predates several (`checks/c3` itself) puts the others
+/// beside it (`checks/c3-k2`), never inside.
+pub fn check_dir(claim: &str, slot: &str, existing: &[Check]) -> String {
+    if let Some(same) = existing.iter().rev().find(|c| c.slot() == slot) {
+        return same.dir.clone();
+    }
+    if existing.iter().any(|c| c.dir == format!("checks/{claim}")) {
+        format!("checks/{claim}-{slot}")
+    } else {
+        format!("checks/{claim}/{slot}")
+    }
+}
+
+/// The next check a claim can have: `k1` with none, else one past the last.
+pub fn next_slot(existing: &[Check]) -> String {
+    format!("k{}", existing.iter().map(Check::slot_number).max().unwrap_or(0) + 1)
 }
 
 /// One entry of the log: a choice and its reason, or a change of the
@@ -758,6 +935,9 @@ pub struct RunCommand {
     pub verdict: String,
     pub ms: u64,
     pub by_operator: bool,
+    /// What it printed, stdout and stderr together as the shell showed them
+    /// (clipped; the run's transcript has it whole).
+    pub output: String,
 }
 
 /// A link between an audit and a board.
@@ -780,6 +960,8 @@ pub struct Link {
 #[serde(default)]
 pub struct Evidence {
     pub claim: String,
+    /// The check it is about (`k2`); empty for the claim's own (a repro).
+    pub check: String,
     pub kind: String,
     pub name: String,
     pub path: String,
@@ -816,7 +998,20 @@ impl AuditStore {
         Self { path }
     }
 
-    fn connect(&self) -> Result<Connection> {
+    /// A connection to the store. The schema is checked and its tables made
+    /// once per file in a process: a read is only a read, with no write (and
+    /// sync) behind it, so the tab drawing every frame never queues behind
+    /// the scheduler and workers for the write lock.
+    fn connect(&self) -> Result<crate::projects::journal::Db> {
+        let db = self.connect_raw()?;
+        Ok(crate::projects::journal::wrap(db, crate::projects::journal::Store::Audit, &self.path))
+    }
+
+    fn connect_raw(&self) -> Result<Connection> {
+        static READY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        if self.path.exists() && crate::util::locked(&READY).contains(&self.path) {
+            return Ok(crate::db::open(&self.path)?);
+        }
         if self.path.exists() {
             let schema: Option<String> = Connection::open(&self.path)
                 .ok()
@@ -841,7 +1036,12 @@ impl AuditStore {
              CREATE TABLE IF NOT EXISTS policies(board TEXT PRIMARY KEY, data TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS adapters(lang TEXT PRIMARY KEY, data TEXT NOT NULL);",
         )?;
-        db.execute("INSERT OR REPLACE INTO metadata VALUES('schema', ?1)", params![SCHEMA])?;
+        db.execute("INSERT OR IGNORE INTO metadata VALUES('schema', ?1)", params![SCHEMA])?;
+        migrate_checks(&db)?;
+        let mut ready = crate::util::locked(&READY);
+        if !ready.contains(&self.path) {
+            ready.push(self.path.clone());
+        }
         Ok(db)
     }
 
@@ -867,7 +1067,25 @@ impl AuditStore {
         })
     }
 
+    /// An audit and everything the store has of it, gone: its claims,
+    /// checks, evidence, runs, log and links. Findings it posted are the
+    /// boards' and stay.
+    pub fn delete_audit(&self, name: &str) -> Result<()> {
+        let mut db = self.connect()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in ["claims", "checks", "evidence", "links", "log", "runs"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE audit=?1"), params![name])?;
+        }
+        tx.execute("DELETE FROM audits WHERE name=?1", params![name])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn create(&self, audit: &Audit) -> std::result::Result<(), String> {
+        // An audit's name is its id in the files: one archived keeps it.
+        if crate::projects::archived(crate::projects::Kind::Audit, &audit.name) {
+            return Err(format!("an archived audit is named {} (bring it back from the archive, or choose another name)", audit.name));
+        }
         let db = self.connect().map_err(|e| e.to_string())?;
         let seq: i64 = db.query_row("SELECT COALESCE(MAX(seq),0)+1 FROM audits", [], |row| row.get(0)).map_err(|e| e.to_string())?;
         db.execute(
@@ -973,9 +1191,21 @@ impl AuditStore {
         Ok(out)
     }
 
-    /// The check in force: the latest not held as weaker.
+    /// The checks in force, one per slot (the latest version not held as
+    /// weaker nor superseded), in slot order.
+    pub fn current_checks(&self, audit: &str, claim: &str) -> Result<Vec<Check>> {
+        let mut by_slot: std::collections::BTreeMap<u32, Check> = std::collections::BTreeMap::new();
+        for check in self.checks(audit, claim)? {
+            if !check.held_weaker && check.superseded_by.is_none() {
+                by_slot.insert(check.slot_number(), check);
+            }
+        }
+        Ok(by_slot.into_values().collect())
+    }
+
+    /// The check one line speaks for (`lead`).
     pub fn current_check(&self, audit: &str, claim: &str) -> Result<Option<Check>> {
-        Ok(self.checks(audit, claim)?.into_iter().rev().find(|check| !check.held_weaker && check.superseded_by.is_none()))
+        Ok(lead(&self.current_checks(audit, claim)?).cloned())
     }
 
     pub fn add_check(&self, audit: &str, mut check: Check) -> Result<Check> {
@@ -1211,6 +1441,15 @@ pub fn init(archive: &Path) {
     crate::audit::run::start_scheduler();
 }
 
+/// An attached terminal's: the board store (the projects tab makes boards
+/// and comments there). Not the audit store: what the audit tab does runs
+/// in the primary's scheduler, which this process hasn't.
+pub fn init_attached(archive: &Path) {
+    *crate::util::locked(&BOARDS_ONLY) = Some(archive.with_file_name("audit.sqlite3"));
+}
+
+static BOARDS_ONLY: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// The data folder (where adapters live, under `audit/langs`).
 pub fn data_dir() -> Option<PathBuf> {
     store_path().and_then(|path| path.parent().map(Path::to_path_buf))
@@ -1222,7 +1461,9 @@ pub fn store() -> Option<AuditStore> {
 
 /// The board store beside this one.
 pub fn boards() -> Option<crate::board::BoardStore> {
-    store_path().map(|path| crate::board::BoardStore::beside_archive(&path))
+    store_path()
+        .or_else(|| crate::util::locked(&BOARDS_ONLY).clone())
+        .map(|path| crate::board::BoardStore::beside_archive(&path))
 }
 
 #[cfg(not(test))]

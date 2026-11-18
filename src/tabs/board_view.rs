@@ -739,7 +739,7 @@ fn audit_head(name: &str) -> Vec<(Style, String)> {
         let (mark, status) = audit.status_mark();
         let failing = claims.iter().filter(|c| c.verdict == crate::audit::Verdict::Fails && !c.waived).count();
         let holding = claims.iter().filter(|c| c.verdict == crate::audit::Verdict::Holds).count();
-        let waiting = claims.iter().filter(|c| c.mark().0 == "[!]").count();
+        let waiting = claims.iter().filter(|c| c.waits_on(&audit)).count();
         out.push((Style::Warn, format!("  {mark} {status}")));
         out.push((Style::Dim, format!(" · {} claims", claims.len())));
         if failing > 0 {

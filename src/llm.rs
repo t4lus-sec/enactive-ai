@@ -1432,6 +1432,16 @@ pub fn model_context_capacity() -> Result<usize, Box<dyn std::error::Error>> {
     if crate::model_config::hosted() {
         return Ok(hosted_capacity());
     }
+    // Kept a minute: a subagent's start asks while it holds the subagents'
+    // lock, and a server busy with them may take seconds to answer.
+    static KNOWN: std::sync::Mutex<Option<(String, usize, Instant)>> = std::sync::Mutex::new(None);
+    let key = format!("{} {}", endpoint("/v1/models"), model_name());
+    if let Some((at, window, when)) = KNOWN.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+        && *at == key
+        && when.elapsed() < Duration::from_secs(60)
+    {
+        return Ok(*window);
+    }
     let response: Value = crate::model_config::authorize(
         Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -1442,7 +1452,9 @@ pub fn model_context_capacity() -> Result<usize, Box<dyn std::error::Error>> {
     .send()?
     .error_for_status()?
     .json()?;
-    served_capacity(&response, &model_name())
+    let window = served_capacity(&response, &model_name())?;
+    *KNOWN.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, window, Instant::now()));
+    Ok(window)
 }
 
 /// A hosted model's window: its entry in the API's `/v1/models`, where the
@@ -1714,9 +1726,10 @@ mod interim_fix_tests {
         }
     }
 
+    type Sample = Result<S0maResponse, Box<dyn std::error::Error>>;
+
     /// Scripted samples; counts how many were drawn.
-    fn script(items: Vec<Result<S0maResponse, Box<dyn std::error::Error>>>)
-        -> (RefCell<std::vec::IntoIter<Result<S0maResponse, Box<dyn std::error::Error>>>>, RefCell<usize>) {
+    fn script(items: Vec<Sample>) -> (RefCell<std::vec::IntoIter<Sample>>, RefCell<usize>) {
         (RefCell::new(items.into_iter()), RefCell::new(0))
     }
 

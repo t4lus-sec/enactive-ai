@@ -1,9 +1,9 @@
 //! Small helpers several modules need, each written once: a lock that
-//! survives a panic, one shell word, a text clipped, a quick hash, and a file
-//! replaced whole.
+//! survives a panic, one shell word, a text clipped, a quick hash, a file
+//! replaced whole, and a temporary folder of this process's own.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -74,6 +74,47 @@ fn write_whole(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Resu
         let _ = std::fs::File::open(folder).and_then(|folder| folder.sync_all());
     }
     Ok(())
+}
+
+static PRIVATE_TEMP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// A folder in the temporary directory for what the operator is writing or
+/// moving (a draft in the editor, a shared file being edited or carried):
+/// made once, under a name nobody can guess, for its owner alone (0700), so
+/// nothing in it is read or put in its place by another user of the machine.
+pub fn private_temp() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut made = locked(&PRIVATE_TEMP);
+    if let Some(dir) = made.as_ref().filter(|dir| dir.is_dir()) {
+        return Ok(dir.clone());
+    }
+    let mut last = None;
+    for _ in 0..8 {
+        let mut bytes = [0u8; 8];
+        std::fs::File::open("/dev/urandom").and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))?;
+        let tag: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("s0ma-{}-{tag}", std::process::id()));
+        // Made new, never an existing folder taken: that one could be another's.
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {
+                *made = Some(dir.clone());
+                return Ok(dir);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temporary folder")))
+}
+
+/// `private_temp`'s folder removed, as the process ends.
+pub struct PrivateTemp;
+
+impl Drop for PrivateTemp {
+    fn drop(&mut self) {
+        if let Some(dir) = locked(&PRIVATE_TEMP).take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 #[cfg(test)]

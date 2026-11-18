@@ -563,6 +563,9 @@ impl App {
         // Audits: their store, and the scheduler that serves the ones the
         // operator started.
         crate::audit::init(memory.archive_path());
+        // Boards and audits as files in projects/ (the stores index them).
+        crate::projects::init(memory.archive_path());
+        crate::freeze::init(memory.archive_path());
         // Alt+M's writes go through this archive's own handle.
         crate::tabs::init_memory(&memory);
         // ~/s0ma-share kept in step with /share (share/sync.rs).
@@ -1006,7 +1009,9 @@ impl App {
         loop {
             // The overview tab's changes, run as the operator would have typed them,
             // and a fresh snapshot when it asked (overview.rs).
+            crate::freeze::at("between turns: the overview's requests");
             self.serve_overview();
+            crate::freeze::at("between turns: subagents' events");
             crate::subagent::pump(&mut self.memory)?;
             // A subagent that stopped wants the operator's eye; its progress
             // is for the expanded view, as during a turn.
@@ -1019,6 +1024,9 @@ impl App {
             }
             for status in crate::mistakes::take_statuses() {
                 self.notify(&status);
+            }
+            if let Some(note) = crate::freeze::take_note() {
+                crate::terminal::warn_status(&note);
             }
             if self.interrupt.load(Ordering::SeqCst) {
                 crate::subagent::cancel_all();
@@ -1125,9 +1133,11 @@ impl App {
             // The operator's moves in his projects tab that need the agent: a board sent
             // back to work, or to verification (whose independent verifier
             // starts here). Like a VM event, they may start the first turn.
+            crate::freeze::at("between turns: starting the harness's workers");
             if let Some(turn) = self.take_board_turn()? {
                 return Ok(Some(turn));
             }
+            crate::freeze::at("between turns: the rest");
 
             // A command the agent ran in a netbox that ended after its call
             // returned (it waited for input, or for the operator's Enter).
@@ -1236,34 +1246,20 @@ impl App {
     /// this thread: a spawn needs the archive), and his moves that need the agent
     /// make the next turn (`board/flow.rs`).
     fn take_board_turn(&mut self) -> AppResult<Option<TurnInput>> {
-        for (board_id, task) in crate::board::flow::verifiers_wanted() {
-            let call = crate::types::ToolCall {
-                id: format!("board-verifier-{board_id}"),
-                kind: "function".into(),
-                function: crate::types::FunctionCall {
-                    name: "subagent_spawn".into(),
-                    arguments: serde_json::json!({"tasks": [{"task": task}]}).to_string(),
-                },
-            };
-            // The operator sent the board to verification: its verifier is his.
-            let spawned = crate::approval::by_operator(|| {
-                crate::subagent::execute(&call, &mut self.memory, &self.interrupt, |status| {
-                    crate::terminal::say_note(&status);
-                    Ok(())
-                })
-            });
-            let outcome = match spawned {
-                Ok(answer) => match serde_json::from_str::<serde_json::Value>(&answer) {
-                    Ok(value) if value["ok"] == serde_json::json!(true) => value["job_ids"][0]
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| "no job id".to_string()),
-                    Ok(value) => Err(value["error"].as_str().unwrap_or("not started").to_string()),
-                    Err(_) => Err(answer),
-                },
-                Err(error) => Err(error.to_string()),
-            };
+        let verifiers = crate::board::flow::verifiers_wanted();
+        // A start waits on the model's server (seconds, when it is busy):
+        // with a tab up, its keys are read meanwhile, as during a turn.
+        let keys = (crate::audit::run::any_wanted() || !verifiers.is_empty()) && crate::tabs::is_open() && self.input.begin_active().is_ok();
+        // The audits' workers: spawned as the agent's are, each in a tab of
+        // its own (also between the agent's steps, `agent.rs`).
+        crate::audit::run::start_wanted(&mut self.memory, &mut |status| crate::terminal::say_note(&status));
+        // The operator sent the board to verification: its verifier is his.
+        for (board_id, task) in verifiers {
+            let outcome = crate::subagent::spawn_for_harness(&format!("board-verifier-{board_id}"), &task, &mut self.memory, &mut |status| crate::terminal::say_note(&status));
             crate::board::flow::verifier_started(&board_id, outcome);
+        }
+        if keys {
+            let _ = self.input.end_active();
         }
         Ok(crate::board::flow::take_turn().map(|content| TurnInput {
             content,
@@ -1414,6 +1410,7 @@ impl App {
             reasoning: bare(&self.reasoning.status()),
             worker_reasoning: crate::reasoning::worker_profile().label().to_string(),
             looping: self.runtime_mode == RuntimeMode::Looping,
+            approval: crate::approval::enabled(),
             vm_access: crate::vm::access::allowed(),
             voice_on: self.voice.listening(),
             voice: bare(&self.voice.status()),
@@ -1578,6 +1575,7 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
         tools.extend(open_loops::tool_definitions());
         tools.extend(board::tool_definitions());
         tools.extend(crate::board::flow::tool_definitions());
+        tools.extend(crate::projects::tools::tool_definitions());
         tools.extend(crate::vm::wake::tool_definitions());
         tools.extend(crate::mcp::tool_definitions());
 
@@ -2026,7 +2024,7 @@ impl App {
         self.arrived.clear();
         // And what he did in the share tab, the loops he closed, and his
         // word on boards the agent proposed solved.
-        let notes: Vec<String> = [note, crate::share::files::take_note(), crate::open_loops::take_note(), crate::board::take_note(), crate::board::flow::take_note(), crate::audit::ops::take_note(), crate::vm::netboxes::take_note(), crate::tabs::editor_note()].into_iter().flatten().collect();
+        let notes: Vec<String> = [note, crate::share::files::take_note(), crate::open_loops::take_note(), crate::board::take_note(), crate::board::flow::take_note(), crate::audit::ops::take_note(), crate::projects::take_note(), crate::vm::netboxes::take_note(), crate::tabs::editor_note()].into_iter().flatten().collect();
         (!notes.is_empty()).then(|| notes.concat())
     }
 
@@ -2036,6 +2034,7 @@ impl App {
     /// printed Alt+P as `^[p` there instead of switching tabs. The steering
     /// pane is up from the start; the cycle's own `begin_active` finds it so.
     fn process_turn(&mut self, turn: TurnInput) -> AppResult<()> {
+        crate::freeze::at("a turn: starting");
         self.input.begin_active()?;
         let _ = self.input.active_display().start_clock();
         let result = self.admit_and_run_turn(turn);

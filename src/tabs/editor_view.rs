@@ -156,14 +156,14 @@ struct Doc {
     dirty: (u64, bool),
     marks: Marks,
     wrap: bool,
-    /// The split view (Ctrl+P twice): the text beside it rendered, or the
+    /// The split view (Ctrl+T): the text beside it rendered, or the
     /// rendered text alone when the tab is narrow.
     preview: bool,
     /// The live preview (Ctrl+P): the markdown rendered in place, the line
     /// being edited as written (`editor/live.rs`).
     live: bool,
     /// Each line's place with fenced code, as of a revision, for `live`.
-    fences: Option<(u64, Vec<crate::editor::live::Fence>)>,
+    fences: Option<(u64, Vec<crate::editor::live::Place>)>,
     top: (usize, usize),
     left: usize,
     bar: Option<Bar>,
@@ -707,7 +707,7 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent, page: usize) -> Outcome {
         bar_key(doc, tab, key);
         return Outcome::Stay;
     }
-    // The preview alone, full screen: it scrolls; Ctrl+P or Esc back.
+    // The preview alone, full screen: it scrolls; Ctrl+T, Ctrl+P or Esc back.
     if doc.preview && tab_width_is_narrow() {
         match key.code {
             KeyCode::Up => doc.preview_scroll = doc.preview_scroll.saturating_sub(1),
@@ -716,7 +716,9 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent, page: usize) -> Outcome {
             KeyCode::PageDown | KeyCode::Char(' ') => doc.preview_scroll += page,
             KeyCode::Home => doc.preview_scroll = 0,
             KeyCode::Esc => doc.preview = false,
-            KeyCode::Char('p' | 'P') if ctrl => doc.preview = false,
+            KeyCode::Char('t' | 'T') if ctrl => doc.preview = false,
+            // Straight to the live preview.
+            KeyCode::Char('p' | 'P') if ctrl => (doc.live, doc.preview) = (true, false),
             _ => {}
         }
         return Outcome::Stay;
@@ -823,13 +825,14 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent, page: usize) -> Outcome {
                 doc.bar = Some(Bar::Find { query, replace: Draft::default(), in_replace: false, origin });
             }
             'g' => doc.bar = Some(Bar::Goto(Draft::default())),
-            // Text, then the live preview, then the split view, then text.
-            'p' => {
+            // The live preview (Ctrl+P) and the split view (Ctrl+T): each
+            // key turns its own view on, and off again; one at a time.
+            'p' | 't' => {
                 if doc.markdown() {
-                    (doc.live, doc.preview) = match (doc.live, doc.preview) {
-                        (false, false) => (true, false),
-                        (true, _) => (false, true),
-                        (false, true) => (false, false),
+                    let split = c.eq_ignore_ascii_case(&'t');
+                    (doc.live, doc.preview) = match (split, doc.live, doc.preview) {
+                        (false, live, _) => (!live, false),
+                        (true, _, preview) => (false, !preview),
                     };
                     doc.preview_scroll = 0;
                     doc.preview_free = false;
@@ -1267,11 +1270,9 @@ pub(super) fn body(tab: &mut Open, width: usize, rows: usize) -> (Vec<Line>, Foo
     } else {
         let mut hints = vec![("^s", "save"), ("^f", "find")];
         if doc.markdown() {
-            hints.push(("^p", match (doc.live, doc.preview) {
-                (true, _) => "split",
-                (false, true) => "text",
-                (false, false) => "preview",
-            }));
+            // Each view has its own button; the one that is up reads `text`.
+            hints.push(("^p", if doc.live { "text" } else { "preview" }));
+            hints.push(("^t", if doc.preview { "text" } else { "split" }));
         }
         hints.extend([("^q", "close"), ("esc", "back")]);
         hints
@@ -1431,9 +1432,9 @@ fn text_view(doc: &mut Doc, width: usize, rows: usize) -> (Vec<Line>, Option<(us
     // when the text changes.
     let live = doc.live && doc.bar.is_none() && doc.markdown();
     if live && doc.fences.as_ref().is_none_or(|(revision, _)| *revision != doc.buffer.revision) {
-        doc.fences = Some((doc.buffer.revision, crate::editor::live::fences(doc.buffer.lines().iter().map(String::as_str))));
+        doc.fences = Some((doc.buffer.revision, crate::editor::live::places(doc.buffer.lines().iter().map(String::as_str))));
     }
-    let fences: Vec<crate::editor::live::Fence> = if live { doc.fences.as_ref().map(|(_, fences)| fences.clone()).unwrap_or_default() } else { Vec::new() };
+    let fences: Vec<crate::editor::live::Place> = if live { doc.fences.as_ref().map(|(_, fences)| fences.clone()).unwrap_or_default() } else { Vec::new() };
     let held = doc.buffer.selection();
     // A line shown rendered: in the live preview, every one but the
     // cursor's, those the selection touches and those with a clash above.
@@ -1446,7 +1447,7 @@ fn text_view(doc: &mut Doc, width: usize, rows: usize) -> (Vec<Line>, Option<(us
             return None;
         }
         let text = doc.buffer.line(line).replace('\t', &" ".repeat(tab));
-        Some(crate::editor::live::render(&text, fences.get(line).copied().unwrap_or(crate::editor::live::Fence::Outside), room))
+        Some(crate::editor::live::render(&text, &fences.get(line).cloned().unwrap_or_default(), room))
     };
 
     // How many rows a line takes (wrapped), and the rows of conflict above it.

@@ -703,6 +703,34 @@ fn strike_file(path: &Path, fragments: &Fragments, apply: bool) -> Result<usize>
     Ok(count)
 }
 
+/// A project file: a board's, audit's or folder's line by line (under its
+/// lock, written whole and renamed into place), anything else as text.
+fn strike_project_file(path: &Path, fragments: &Fragments, apply: bool) -> Result<usize> {
+    let logged = matches!(path.extension().and_then(|e| e.to_str()), Some("board" | "audit")) || path.file_name().is_some_and(|n| n == ".folder");
+    if !logged {
+        return strike_file(path, fragments, apply);
+    }
+    let locked = crate::projects::log::Locked::exclusive(path)?;
+    let mut log = crate::projects::log::read_from(&locked.file)?;
+    let mut count = 0;
+    for line in log.lines.iter_mut() {
+        let mut value = Value::Object(std::mem::take(line));
+        count += strike_json(&mut value, &|s| fragments.strike(s));
+        if let Value::Object(map) = value {
+            *line = map;
+        }
+    }
+    if apply && count > 0 {
+        crate::projects::log::rewrite_locked(path, &locked, &log)?;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+pub fn strike_project_file_for_test(path: &Path, fragments: &Fragments) -> Result<usize> {
+    strike_project_file(path, fragments, true)
+}
+
 /// The typed history: lines that hold a fragment, struck, in either of the
 /// forms the file keeps a line break in.
 fn strike_history(path: &Path, fragments: &Fragments, apply: bool) -> Result<usize> {
@@ -977,6 +1005,18 @@ fn run_with(memory: &Hippocampus, fragments: &Fragments, apply: bool, look_after
     for name in ["board.sqlite3", "cairn_board.sqlite3"] {
         if let Err(error) = strike_sqlite(&archive.with_file_name(name), "board", BOARD, fragments, apply, &mut impact) {
             notes.push(note("the board", error));
+        }
+    }
+    // The projects: boards', audits' and folders' files, pages and notes,
+    // the trash too. The board store above is their index.
+    if let Some(root) = crate::projects::root() {
+        for path in files_under(&root) {
+            let shown = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+            match strike_project_file(&path, fragments, apply) {
+                Ok(0) => {}
+                Ok(count) => impact.places.push(Place::new("projects", shown, count)),
+                Err(error) => notes.push(note("the projects", error)),
+            }
         }
     }
     if let Err(error) =

@@ -888,12 +888,12 @@ mod tests {
 
         // Something else changed the event meanwhile — another redaction, or a
         // job's close.
-        fixture.memory.redact_ranges(&[(id, id)], "[redacted for job acme]").unwrap();
+        fixture.memory.redact_ranges(&[(id, id)], crate::jobs::MARKER).unwrap();
 
         let error = approve(&fixture.memory, &fixture.book, 1).unwrap_err();
         assert!(error.contains("changed since"), "{error}");
         assert_eq!(fixture.book.load(1).unwrap().state, State::Stale);
-        assert_eq!(fixture.content(id), "[redacted for job acme]", "the approval did not overwrite it");
+        assert_eq!(fixture.content(id), crate::jobs::MARKER, "the approval did not overwrite it");
     }
 
     /// The event approving rewrote is cited by a world record: the record's

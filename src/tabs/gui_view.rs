@@ -66,22 +66,27 @@ pub(super) enum Pick {
     MemorySection(usize),
     /// A projects subtab.
     Subtab(View),
-    /// The audit tab's section, by its index.
+    /// The audit tab's filter over its tree, by its index.
     AuditSection(usize),
-    /// A row of the audit tab's list (or of its portfolio), by its index.
+    /// A row of the audit tab's tree (or of its portfolio), by its index.
     AuditRow(usize),
-    /// A file's group in the audit tab's map: opens it code first.
-    AuditFile(String),
     /// The claim view's pane, by its index.
     ClaimPane(usize),
     /// A clause in the claim view, by its number.
     Clause(usize),
     /// A line of the claim view's code pane.
     CodeLine(usize),
+    /// The code beside the audit tab's tree: its code (0) or its check (1),
+    /// at a line (`usize::MAX`: the part's head).
+    Preview(usize, usize),
     /// The board reference in the claim view: the board's tab at it.
     ClaimBoard,
     /// An audit (at a claim) from a board: the audit tab at it.
     OpenAudit(String, Option<String>),
+    /// A row of the projects tree, by its index.
+    ProjectsRow(usize),
+    /// A folder to move to, by its index in the list.
+    ProjectsMove(usize),
 }
 
 /// Where a click lands: a frame's row, its columns `from..to`.
@@ -312,7 +317,8 @@ pub(super) fn part(spec: &'static str, label: &'static str) -> Vec<Part> {
 
 /// The footer: `left` at the left edge, then the buttons for the keys
 /// (`part`), the last ones left out when they don't fit (the menu still has
-/// them). With the buttons, as `(name, click)`, for the menu.
+/// them), but for the way out. With the buttons, as `(name, click)`, for the
+/// menu.
 pub(super) fn footer(left: Line, hints: &[(&'static str, &'static str)], room: usize) -> (Line, Vec<(String, Click)>) {
     let mut actions: Vec<(String, Click)> = Vec::new();
     let mut kept: Vec<(&str, &str)> = Vec::new();
@@ -342,14 +348,29 @@ pub(super) fn footer(left: Line, hints: &[(&'static str, &'static str)], room: u
         }
         right_width += piece;
     }
-    for (name, click) in &actions {
-        let piece = 1 + width(name) + 2;
-        if right_width + piece > budget {
+    // The way out (Esc's button, the last) stays when not all of them fit:
+    // the ones before it give way.
+    let piece_of = |name: &str| 1 + width(name) + 2;
+    let all: usize = actions.iter().map(|(name, _)| piece_of(name)).sum();
+    let way_out = actions
+        .last()
+        .filter(|(_, click)| matches!(click, Click::Keys(keys) if keys.first().is_some_and(|key| key.code == KeyCode::Esc)))
+        .filter(|(name, _)| right_width + all > budget && right_width + piece_of(name) <= budget);
+    let reserved = way_out.map_or(0, |(name, _)| piece_of(name));
+    let before = actions.len() - usize::from(way_out.is_some());
+    for (name, click) in &actions[..before] {
+        let piece = piece_of(name);
+        if right_width + piece + reserved > budget {
             break;
         }
         right.push((Style::Plain, " ".into()));
         right.push(button(name, click.clone()));
         right_width += piece;
+    }
+    if let Some((name, click)) = way_out {
+        right.push((Style::Plain, " ".into()));
+        right.push(button(name, click.clone()));
+        right_width += reserved;
     }
     let mut line: Line = vec![(Style::Plain, " ".into())];
     let left_room = room.saturating_sub(2 + right_width);

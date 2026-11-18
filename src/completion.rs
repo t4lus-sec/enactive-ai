@@ -45,6 +45,8 @@ pub const COMMANDS: &[Command] = &[
     cmd("/job", "work whose record is removed when it ends", &["start", "pause", "resume", "close", "list", "show", "help"], true),
     cmd("/redact", "the memory tab at its redactions: what s0ma asked to remove", &["view", "list", "help"], true),
     cmd("/hint", "leave a note on a board: it stays, and s0ma sees it on every read", &[], true),
+    cmd("/comment", "comment on a board, a row of it (board#i8) or a page: /comment <on> <text>", &[], true),
+    cmd("/resolve", "resolve a comment thread: /resolve <comment id>", &[], true),
     cmd("/identity", "show the identity text in context", &[], false),
     cmd("/img", "send an image: /img <path> <message>", &[], true),
     cmd("/kill", "stop the running tool call, or a subagent (list, all, subagents, <slot>)", &["list", "all", "subagents"], true),

@@ -955,7 +955,7 @@ pub fn render_lines(text: &str, width: usize) -> Vec<String> {
         if style == RESET || style.starts_with("\x1b[0m") {
             style.clear();
         }
-        let wrapped = wrap_styled(&carried, width);
+        let wrapped = wrap_block(&carried, width);
         if wrapped.is_empty() {
             lines.push(String::new());
         }
@@ -968,7 +968,57 @@ pub fn render_lines(text: &str, width: usize) -> Vec<String> {
 /// Words longer than a line are broken; a line that starts mid-span reopens
 /// the style in force there, since the caller resets styles at line ends.
 fn wrap_styled(text: &str, width: usize) -> Vec<String> {
-    let mut wrap = StyledWrap { width: width.max(1), ..StyledWrap::default() };
+    wrap_with(text, StyledWrap { width: width.max(1), ..StyledWrap::default() })
+}
+
+/// A rendered line wrapped as a block: its indentation kept, and the rows it
+/// goes on to set under its text (past a list marker, behind a quote's bar).
+fn wrap_block(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let plain = strip_styles(text);
+    let indent = plain.chars().take_while(|c| *c == ' ').count();
+    let rest = &plain[indent..];
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    let (mut hang, mut hang_width) = if rest.starts_with("│ ") && !rest.ends_with('│') {
+        (format!("\x1b[0;{DECO}m│ "), indent + 2)
+    } else if rest.starts_with("• ") {
+        (String::new(), indent + 2)
+    } else if digits > 0 && rest[digits..].starts_with(". ") {
+        (String::new(), indent + digits + 2)
+    } else {
+        (String::new(), indent)
+    };
+    // Too deep for the width: the rows after start at the edge.
+    if hang_width * 2 > width {
+        (hang, hang_width) = (String::new(), 0);
+    }
+    if hang.is_empty() {
+        hang = " ".repeat(hang_width);
+    } else {
+        hang.insert_str(0, &" ".repeat(indent));
+    }
+    wrap_with(text, StyledWrap { width, keep_indent: true, fresh: true, hang, hang_width, ..StyledWrap::default() })
+}
+
+/// `text` without the SGR sequences this module inserts.
+fn strip_styles(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn wrap_with(text: &str, mut wrap: StyledWrap) -> Vec<String> {
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
         match c {
@@ -1003,6 +1053,13 @@ struct StyledWrap {
     word_style: String,
     /// Spaces before `word`.
     gap: usize,
+    /// Spaces at the start of the text are kept (`wrap_block`).
+    keep_indent: bool,
+    /// No word is on the line yet.
+    fresh: bool,
+    /// What a row the text goes on to starts with, and its width.
+    hang: String,
+    hang_width: usize,
 }
 
 impl StyledWrap {
@@ -1021,7 +1078,8 @@ impl StyledWrap {
     fn char(&mut self, c: char) {
         let width = UnicodeWidthChar::width(c).unwrap_or(0);
         // A word as wide as the line is broken where it fills it.
-        if self.word_width > 0 && self.word_width + width > self.width {
+        let room = self.width.saturating_sub(if self.fresh { self.line_width } else { self.hang_width }).max(1);
+        if self.word_width > 0 && self.word_width + width > room {
             self.place();
         }
         self.begin_word();
@@ -1031,7 +1089,13 @@ impl StyledWrap {
 
     fn space(&mut self) {
         self.place();
-        self.gap += 1;
+        if self.keep_indent && self.fresh && self.lines.is_empty() {
+            // Indentation: part of the line.
+            self.line.push(' ');
+            self.line_width += 1;
+        } else {
+            self.gap += 1;
+        }
     }
 
     fn place(&mut self) {
@@ -1041,14 +1105,16 @@ impl StyledWrap {
             self.word.clear();
             return;
         }
-        if self.line_width > 0 && self.line_width + self.gap + self.word_width > self.width {
+        let begun = if self.keep_indent { !self.fresh } else { self.line_width > 0 };
+        if begun && self.line_width + self.gap + self.word_width > self.width {
             self.lines.push(std::mem::take(&mut self.line));
-            self.line = self.word_style.clone();
-            self.line_width = 0;
-        } else if self.line_width > 0 {
+            self.line = format!("{}{}", self.hang, self.word_style);
+            self.line_width = self.hang_width;
+        } else if begun {
             self.line.extend(std::iter::repeat_n(' ', self.gap));
             self.line_width += self.gap;
         }
+        self.fresh = false;
         self.line.push_str(&self.word);
         self.line_width += self.word_width;
         self.word.clear();
@@ -1058,7 +1124,7 @@ impl StyledWrap {
 
     fn finish(mut self) -> Vec<String> {
         self.place();
-        if self.line_width > 0 || self.lines.is_empty() {
+        if (self.line_width > 0 && !(self.keep_indent && self.fresh)) || self.lines.is_empty() {
             self.lines.push(self.line);
         }
         self.lines
@@ -1126,5 +1192,32 @@ mod tests {
             let second = &raw[raw.find('\n').unwrap()..];
             assert!(!second.contains(";3m"), "italic leaked: {second:?}");
         }
+    }
+}
+#[cfg(test)]
+mod block_tests {
+    use super::{render_lines, strip_styles};
+
+    fn plain(text: &str, width: usize) -> Vec<String> {
+        render_lines(text, width).iter().map(|line| strip_styles(line)).collect()
+    }
+
+    #[test]
+    fn rendered_lines_keep_their_indentation() {
+        let text = "1. one\n   - nested\n     - deeper\n\n```rust\nfn main() {\n    body();\n}\n```\n";
+        let lines = plain(text, 40);
+        assert!(lines.contains(&"   • nested".to_string()), "{lines:?}");
+        assert!(lines.contains(&"     • deeper".to_string()), "{lines:?}");
+        assert!(lines.contains(&"    body();".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn a_wrapped_row_goes_on_under_its_text() {
+        let lines = plain("- a bullet whose text is long enough to wrap\n\n> a quote that is long enough to wrap too\n", 24);
+        assert_eq!(lines[0], "• a bullet whose text is");
+        assert_eq!(lines[1], "  long enough to wrap");
+        let quote: Vec<&String> = lines.iter().filter(|line| line.starts_with('│')).collect();
+        assert!(quote.len() >= 2 && quote.iter().all(|line| line.starts_with("│ ")), "{lines:?}");
+        assert!(lines.iter().all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 24), "{lines:?}");
     }
 }

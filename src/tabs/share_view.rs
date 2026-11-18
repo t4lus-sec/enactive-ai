@@ -382,7 +382,9 @@ fn load(state: &mut State) {
         // An attached terminal: what the sync is doing, before the listing
         // (the files it wrote are seen before they could show as news).
         crate::tabs::follow_share_sync();
+        // The projects' own hidden files (synced, not for this list).
         crate::share::files::list(&dir, &mut crate::share::run_on_machine)
+            .map(|entries| entries.into_iter().filter(|e| !e.path.split('/').any(|part| part.starts_with('.'))).collect::<Vec<_>>())
     }) {
         Ok(slot) => state.listing = Some(slot),
         Err(error) => state.entries = Some(Err(error)),
@@ -1047,6 +1049,29 @@ fn on_machine(before: &str) -> Found {
     Found { start: before[..start].chars().count(), candidates }
 }
 
+/// Paths on the operator's computer, over the file link: the typed word's
+/// folder listed there.
+fn on_computer(before: &str) -> Found {
+    let start = crate::completion::token_start(before);
+    let typed = crate::completion::unescape_path(&before[start..]);
+    let (folder, prefix) = match typed.rsplit_once('/') {
+        Some((folder, prefix)) => (format!("{folder}/"), prefix.to_string()),
+        None => (String::new(), typed.clone()),
+    };
+    let listed = crate::laptop::list(if folder.is_empty() { "~" } else { &folder }).map(|(_, entries)| entries).unwrap_or_default();
+    let escape = |text: &str| text.replace(' ', "\\ ");
+    let candidates = listed
+        .into_iter()
+        .filter(|entry| entry.name.starts_with(&prefix))
+        .map(|entry| {
+            let shown = if entry.dir { format!("{}/", entry.name) } else { entry.name.clone() };
+            let base = if folder.is_empty() { "~/".to_string() } else { folder.clone() };
+            (escape(&format!("{base}{shown}")), shown, !entry.dir)
+        })
+        .collect();
+    Found { start: before[..start].chars().count(), candidates }
+}
+
 /// Tab in the line being typed: the path completed as far as it is one
 /// thing; when it is several, they are listed under the line.
 fn complete(tab: &mut Open) {
@@ -1055,6 +1080,7 @@ fn complete(tab: &mut Open) {
     let before: String = input.text[..input.cursor].iter().collect();
     let found = match input.purpose {
         Purpose::New | Purpose::Folder => in_folder(&entries, &before),
+        Purpose::Add if crate::laptop::linked() => on_computer(&before),
         Purpose::Add => on_machine(&before),
     };
     let typed: String = input.text[found.start..input.cursor].iter().collect();
@@ -1112,7 +1138,7 @@ pub(super) fn paste(tab: &mut Open, text: &str) {
 /// `text` in the operator's editor, under the file's own name (so the editor knows
 /// its kind): what he saved, or `None` when the editor failed.
 pub(super) fn in_editor(tab: &mut Open, relative: &str, text: &str) -> Result<Option<String>, String> {
-    let folder = std::env::temp_dir().join(format!("s0ma-share-edit-{}", std::process::id()));
+    let folder = crate::util::private_temp().map_err(|error| error.to_string())?.join("share-edit");
     std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
     let name = relative.rsplit('/').next().unwrap_or(relative);
     let path = folder.join(name);
@@ -1303,6 +1329,35 @@ fn make(dir: &str, path: &str, text: &str, run: crate::share::files::Run) -> Res
 }
 
 fn add(tab: &mut Open, typed: &str) {
+    // From the operator's computer, over the file link (`s0ma connect`):
+    // files and folders.
+    if crate::laptop::linked() {
+        let paths: Vec<String> = crate::transfer::words(&typed.replace("\\ ", "\u{0}")).into_iter().map(|w| w.replace('\u{0}', " ")).collect();
+        if paths.is_empty() {
+            return tab.note("give a path on your computer", true);
+        }
+        let dir = tab.share.dir.clone();
+        let folder = tab.share.folder();
+        start(tab, "adding", move || {
+            let mut added = Vec::new();
+            let mut failed = Vec::new();
+            for path in paths {
+                match crate::laptop::upload(&path, &dir, &folder, &mut |_| {}) {
+                    Ok(moved) => {
+                        tell(Change::Added { line: format!("{} ({} file(s), {}, from his computer)", moved.to, moved.files, crate::share::human_size(moved.bytes)) });
+                        added.push(moved.to);
+                    }
+                    Err(error) => failed.push(error),
+                }
+            }
+            match (added.len(), failed.is_empty()) {
+                (_, false) => Err(failed.join(" · ")),
+                (1, true) => Ok(format!("added {}", added[0])),
+                (n, true) => Ok(format!("added {n}")),
+            }
+        });
+        return;
+    }
     let paths = match crate::share::parse_paths(typed) {
         Ok(paths) => paths,
         Err(error) => return tab.note(error.replace("usage: /share", "give"), true),
@@ -1343,6 +1398,35 @@ fn home_short(path: &str) -> String {
 }
 
 fn save(tab: &mut Open) {
+    // To the operator's computer's Downloads, over the file link: a file,
+    // or a folder with everything in it.
+    if crate::laptop::linked() {
+        let Some(entry) = tab.share.selected_entry() else { return tab.note("pick a file or folder", true) };
+        let dir = tab.share.dir.clone();
+        let (paths, folder): (Vec<(String, String)>, Option<String>) = if entry.dir {
+            let prefix = format!("{}/", entry.path);
+            let name = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
+            let inside = tab
+                .share
+                .entries()
+                .iter()
+                .filter(|e| !e.dir && e.path.starts_with(&prefix))
+                .map(|e| (crate::share::files::shown(&dir, &e.path), e.path[prefix.len()..].to_string()))
+                .collect();
+            (inside, Some(name))
+        } else {
+            let name = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
+            (vec![(crate::share::files::shown(&dir, &entry.path), name)], None)
+        };
+        if paths.is_empty() {
+            return tab.note("nothing in it", true);
+        }
+        start(tab, "downloading", move || {
+            crate::laptop::download(&paths, folder.as_deref(), &mut |_| {})
+                .map(|moved| format!("saved → {} ({} file(s), {})", moved.to, moved.files, crate::share::human_size(moved.bytes)))
+        });
+        return;
+    }
     let Some(entry) = tab.share.selected_entry().filter(|entry| !entry.dir) else {
         return tab.note("pick a file", true);
     };

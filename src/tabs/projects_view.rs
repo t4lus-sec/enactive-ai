@@ -49,8 +49,9 @@ use std::time::{Duration, Instant};
 /// Read again this often while up.
 const POLL: Duration = Duration::from_millis(1500);
 
-/// The subtabs, in order: Alt+P steps through them.
-pub(super) const SUBTABS: [View; 4] = [View::Board, View::Review, View::Verification, View::Deliverables];
+/// The subtabs, in order: Tab steps through them. The first is the tree
+/// of every project (`projects_tree.rs`).
+pub(super) const SUBTABS: [View; 5] = [View::Projects, View::Board, View::Review, View::Verification, View::Deliverables];
 
 pub(super) fn is_projects(view: &View) -> bool {
     SUBTABS.contains(view)
@@ -70,14 +71,20 @@ pub(super) fn previous(view: &View) -> View {
 
 /// A note or a reason is being typed here: Tab is not a subtab switch then.
 pub(super) fn typing_now(tab: &Open) -> bool {
-    tab.projects.input.is_some() || (section(tab) == Section::Audit && super::audit_view::holds_keys(tab))
+    (tab.view == View::Projects && super::projects_tree::typing_now()) || tab.projects.input.is_some() || (section(tab) == Section::Audit && super::audit_view::holds_keys(tab))
 }
 
 static LAST: Mutex<Option<View>> = Mutex::new(None);
 
 /// The subtab last up (Alt+P from elsewhere opens it).
 pub(super) fn last() -> View {
-    LAST.lock().ok().and_then(|last| last.clone()).unwrap_or(View::Board)
+    LAST.lock().ok().and_then(|last| last.clone()).unwrap_or(View::Projects)
+}
+
+pub(super) fn set_last(view: View) {
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some(view);
+    }
 }
 
 fn stage_of(view: &View) -> Stage {
@@ -182,7 +189,7 @@ pub(super) struct State {
     read: Option<Read>,
     reading: Option<Slot<Read>>,
     /// By board id, so boards arriving or leaving don't move it.
-    selected: Option<String>,
+    pub(super) selected: Option<String>,
     top: usize,
     section: usize,
     scroll: usize,
@@ -334,6 +341,8 @@ pub enum Move {
     /// The agent's proposed exhaustion: closed exhausted, or open again with why.
     Exhaust,
     Reopen { why: String },
+    /// Back from the archive: a discarded or exhausted board is open again.
+    BringBack,
 }
 
 /// `Action::Project`, in that process: the move, and the agent woken for it.
@@ -349,6 +358,7 @@ pub(super) fn perform(archive: &std::path::Path, board: &str, done: Move) -> Res
         Move::Discard => crate::board::flow::discard(&boards, board),
         Move::Exhaust => crate::board::flow::exhaust(&boards, board),
         Move::Reopen { why } => crate::board::flow::reopen_exhausted(&boards, board, &why),
+        Move::BringBack => crate::board::flow::bring_back(&boards, board),
     };
     let outcome = outcome.map_err(|error| format!("the board could not be written: {error}"))?;
     crate::subagent::wake_prompt();
@@ -443,19 +453,22 @@ pub(super) fn subtab_line(view: &View, width: usize) -> Line {
     let mut line: Line = vec![(Style::Plain, " ".into())];
     for (index, subtab) in SUBTABS.iter().enumerate() {
         let name = match subtab {
+            View::Projects => "tree",
             View::Board => "open",
             View::Review => "review",
             View::Verification => "verification",
             _ => "complete",
         };
-        let count = if index == 0 || counts[index] == 0 { String::new() } else { format!(" {}", counts[index]) };
+        // The stages' counts (the tree and the open boards have none).
+        let stage = index.saturating_sub(1);
+        let count = if index <= 1 || counts[stage] == 0 { String::new() } else { format!(" {}", counts[stage]) };
         // A click on a subtab opens it.
         let click = || Click::Pick(Pick::Subtab(subtab.clone()));
         if subtab == view {
             line.push(super::gui_view::hot(Style::Tab, format!(" {name}{count} "), click()));
         } else {
             line.push(super::gui_view::hot(Style::Dim, format!(" {name}"), click()));
-            line.push(super::gui_view::hot(if index == 1 && counts[1] > 0 { Style::Warn } else { Style::Dim }, format!("{count} "), click()));
+            line.push(super::gui_view::hot(if *subtab == View::Review && counts[1] > 0 { Style::Warn } else { Style::Dim }, format!("{count} "), click()));
         }
         line.push((Style::Plain, " ".into()));
     }
@@ -693,7 +706,7 @@ pub(super) fn body(tab: &mut Open, width: usize, rows: usize) -> (Vec<Line>, Foo
             View::Verification => "Nothing in verification. From review, Verify (twice) sends a board here.",
             _ => "Nothing complete yet. A verified board you accept comes here.",
         };
-        out.push(vec![(Style::Dim, format!("  {empty}"))]);
+        out.extend(flow(&[(Style::Dim, format!("  {empty}"))], width, 2));
         return (out, Footer::new(Vec::new(), back));
     }
     let index = selected(tab, &all).unwrap_or(0);
@@ -891,7 +904,7 @@ pub(super) fn wheel(tab: &mut Open, up: bool, row: usize, page: usize) {
     let section = section(tab);
     if section == Section::Audit {
         if row >= tab.projects.files_at {
-            super::audit_view::wheel(tab, up);
+            super::audit_view::wheel(tab, up, 0);
         }
         return;
     }

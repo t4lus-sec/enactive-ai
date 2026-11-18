@@ -907,6 +907,24 @@ pub enum Merged {
     Conflict { theirs: Vec<String>, mine: Vec<String> },
 }
 
+/// The two edits of `base` as one text, when they don't clash.
+pub fn merge_text(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    let merged = merge3(&split_lines(base), &split_lines(mine), &split_lines(theirs));
+    let mut lines = Vec::with_capacity(merged.len());
+    for line in merged {
+        match line {
+            Merged::Line { text, .. } => lines.push(text),
+            Merged::Conflict { .. } => return None,
+        }
+    }
+    let ending = if mine.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut text = lines.join(ending);
+    if mine.ends_with('\n') || (mine.is_empty() && theirs.ends_with('\n')) {
+        text.push_str(ending);
+    }
+    Some(text)
+}
+
 /// `base` changed into `mine` here and `theirs` there: both sets of changes,
 /// line by line. Changes that touch the same lines of `base` differently
 /// are a conflict.

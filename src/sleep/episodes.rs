@@ -114,10 +114,11 @@ pub(super) fn staged_get_tool() -> llm::ToolDefinition {
     llm::ToolDefinition::function(
         "sleep_staged_get",
         "Read one episode of the current set in full by its handle (a proposal b<batch>.<n>, a staged_N, or an \
-         earlier pass's handle), before editing or merging it. Without a handle, list this pass's part of the \
-         set: its proposals and the episodes added, edited or dropped so far.",
+         earlier pass's handle), before editing or merging it. With search (words), find episodes earlier \
+         passes kept, older ones the prompt does not list among them. With neither, list this pass's part of \
+         the set: its proposals and the episodes added, edited or dropped so far.",
         json!({"type":"object","additionalProperties":false,"properties":{
-            "handle":{"type":"string"}}}),
+            "handle":{"type":"string"},"search":{"type":"string"}}}),
     )
 }
 
@@ -449,6 +450,9 @@ fn catalog_line(handle: &str, episode: &Episode) -> String {
     format!("{handle} [{outcome}] {} (events #{first}–#{last}; cue: {cue})", episode.title)
 }
 
+/// Most episodes `sleep_staged_get`'s search lists.
+const SEARCH_HITS: usize = 20;
+
 /// Most groups `likely_duplicates` lists.
 const DUPLICATE_GROUPS: usize = 60;
 
@@ -668,14 +672,54 @@ impl Session {
         self.pool = None;
     }
 
-    /// One line per episode earlier passes kept, for the next pass's prompt.
-    pub fn kept_catalog(&self) -> String {
-        self.kept
-            .episodes
-            .iter()
-            .map(|(handle, episode)| catalog_line(handle, episode))
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// One line per episode earlier passes kept, for the next pass's prompt:
+    /// the latest `most`, and how to find the older ones.
+    pub fn kept_catalog(&self, most: usize) -> String {
+        let all = &self.kept.episodes;
+        let skipped = all.len().saturating_sub(most);
+        let mut lines: Vec<String> = Vec::new();
+        if skipped > 0 {
+            lines.push(format!(
+                "({skipped} older ones are not listed: find them with sleep_staged_get {{\"search\": \"words\"}}, which matches titles, cues and lessons)"
+            ));
+        }
+        lines.extend(all[skipped..].iter().map(|(handle, episode)| catalog_line(handle, episode)));
+        lines.join("\n")
+    }
+
+    /// sleep_staged_get's search: earlier passes' episodes whose title, cues
+    /// or lesson hold every word, most words matched first.
+    fn search_kept(&self, query: &str) -> Vec<String> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let text = |episode: &Episode| {
+            let mut text = episode.title.to_lowercase();
+            for cue in &episode.cues {
+                text.push(' ');
+                text.push_str(&cue.to_lowercase());
+            }
+            if let Some(lesson) = &episode.lesson {
+                text.push(' ');
+                text.push_str(&lesson.to_lowercase());
+            }
+            text
+        };
+        let entries: Vec<(&str, &Episode)> = match &self.pool {
+            Some(pool) => pool.entries.iter().filter(|entry| entry.origin == Origin::Earlier).map(|entry| (entry.handle.as_str(), &entry.episode)).collect(),
+            None => self.kept.episodes.iter().map(|(handle, episode)| (handle.as_str(), episode)).collect(),
+        };
+        let mut hits: Vec<(usize, String)> = entries
+            .into_iter()
+            .filter_map(|(handle, episode)| {
+                let text = text(episode);
+                let matched = words.iter().filter(|word| text.contains(word.as_str())).count();
+                (matched > 0).then(|| (matched, catalog_line(handle, episode)))
+            })
+            .collect();
+        hits.sort_by_key(|(matched, _)| std::cmp::Reverse(*matched));
+        hits.into_iter().take(SEARCH_HITS).map(|(_, line)| line).collect()
     }
 
     /// Groups in the open set that likely tell one experience twice: entries
@@ -757,8 +801,13 @@ impl Session {
         #[serde(deny_unknown_fields)]
         struct Args {
             handle: Option<String>,
+            search: Option<String>,
         }
         let args: Args = serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments })?;
+        if let Some(query) = args.search.filter(|query| !query.trim().is_empty()) {
+            let hits = self.search_kept(&query);
+            return Ok(json!({"search":query,"earlier_passes":hits}).to_string());
+        }
         let Some(pool) = &self.pool else {
             let handle = args.handle.ok_or("no integration pass is open")?;
             let (_, episode) = self
@@ -1041,7 +1090,7 @@ mod tests {
         let mut resumed = f.session("resume");
         setup(&mut resumed);
         resumed.restore(saved);
-        assert!(resumed.kept_catalog().starts_with("b1.1 "));
+        assert!(resumed.kept_catalog(usize::MAX).starts_with("b1.1 "));
         resumed.open_pass(0..1);
         assert!(resumed.resume_pass(&state).is_err(), "another pass's set");
         resumed.open_pass(1..2);
@@ -1051,5 +1100,29 @@ mod tests {
         assert_eq!(result["results"][0]["added"], "staged_2", "handles continue, never reused");
         resumed.close_pass().unwrap();
         assert_eq!(resumed.commit().unwrap().len(), 4);
+    }
+    /// The prompt lists the latest kept episodes; the older ones are found by
+    /// search.
+    #[test]
+    fn the_catalog_lists_the_latest_and_search_finds_the_rest() {
+        let f = Fixture::new();
+        let mut s = f.session("catalog");
+        let titles = ["the lock was held twice", "a parser loops on tabs", "the cache served stale pages"];
+        for (batch, title) in titles.iter().enumerate() {
+            s.register_proposal(batch, titled(title, &[4])).unwrap();
+        }
+        for batch in 0..3 {
+            s.open_pass(batch..batch + 1);
+            s.close_pass().unwrap();
+        }
+        let catalog = s.kept_catalog(2);
+        assert!(catalog.starts_with("(1 older ones are not listed"), "{catalog}");
+        assert!(!catalog.contains("lock was held"));
+        assert!(catalog.contains("parser loops") && catalog.contains("stale pages"));
+        s.open_pass(3..3);
+        let found: serde_json::Value = serde_json::from_str(&s.staged_get(r#"{"search":"lock held"}"#).unwrap()).unwrap();
+        let hits = found["earlier_passes"].as_array().unwrap();
+        assert!(hits[0].as_str().unwrap().contains("the lock was held twice"), "{found}");
+        assert!(!hits.iter().any(|hit| hit.as_str().unwrap().contains("parser")));
     }
 }

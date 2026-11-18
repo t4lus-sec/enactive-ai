@@ -168,6 +168,9 @@ struct DocLine {
     spans: Vec<(Style, String)>,
     words: bool,
     link: Option<u64>,
+    /// The first line of one piece of the store's text (a field, an item,
+    /// an event's content), so the piece can be taken whole.
+    start: bool,
 }
 
 impl DocLine {
@@ -175,10 +178,10 @@ impl DocLine {
         self.spans.iter().map(|(_, text)| text.as_str()).collect()
     }
     fn label(style: Style, text: impl Into<String>) -> Self {
-        Self { spans: vec![(style, text.into())], words: false, link: None }
+        Self { spans: vec![(style, text.into())], words: false, link: None, start: false }
     }
     fn words(style: Style, text: impl Into<String>) -> Self {
-        Self { spans: vec![(style, text.into())], words: true, link: None }
+        Self { spans: vec![(style, text.into())], words: true, link: None, start: false }
     }
     fn blank() -> Self {
         Self::default()
@@ -187,9 +190,29 @@ impl DocLine {
 
 /// The store's text, a line each, marked as the store's words.
 fn text_lines(out: &mut Vec<DocLine>, style: Style, text: &str) {
-    for line in text.split('\n') {
-        out.push(DocLine::words(style, line));
+    for (i, line) in text.split('\n').enumerate() {
+        out.push(DocLine { start: i == 0, ..DocLine::words(style, line) });
     }
+}
+
+/// Every piece of the store's text in a doc, whole, as it is kept.
+fn pieces(doc: &[DocLine]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in doc {
+        if !line.words {
+            open = false;
+            continue;
+        }
+        if line.start || !open {
+            out.push(line.text());
+            open = true;
+        } else if let Some(piece) = out.last_mut() {
+            piece.push('\n');
+            piece.push_str(&line.text());
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -825,6 +848,7 @@ impl State {
             ],
             words: false,
             link: None,
+            start: false,
         }];
         out.push(DocLine::blank());
         text_lines(&mut out, Style::Plain, &event.content);
@@ -924,7 +948,7 @@ impl State {
         if let Some(level) = body["certainty"].as_str() {
             head.push((Style::Dim, format!(" · {level}")));
         }
-        out.push(DocLine { spans: head, words: false, link: None });
+        out.push(DocLine { spans: head, words: false, link: None, start: false });
         if let Some(reason) = body["certainty_reason"].as_str().filter(|r| !r.is_empty()) {
             out.push(DocLine::label(Style::Dim, format!("how sure: {reason}")));
         }
@@ -1002,6 +1026,7 @@ impl State {
             ],
             words: false,
             link: None,
+            start: false,
         }];
         if open {
             let since = entry.distance_since(distance);
@@ -1054,6 +1079,7 @@ impl State {
             ],
             words: false,
             link: None,
+            start: false,
         }];
         out.push(DocLine::blank());
         out.push(DocLine::label(Style::Heading, if request.author == "operator" { "note" } else { "s0ma's reason" }));
@@ -1591,10 +1617,14 @@ pub(super) fn body(tab: &mut Open, width: usize, rows: usize) -> (Vec<Line>, Foo
             hints.push(("a", "review"));
             hints.push(("u", "unmark"));
         }
+        hints.push(("r", "redact all"));
         hints.push(("esc", "list"));
         hints
     } else {
         let mut hints = vec![("tab", "section"), ("↑↓", "move"), ("⏎", "mark text")];
+        if state.section != Section::Redactions {
+            hints.push(("r", "redact all"));
+        }
         match state.section {
             Section::Archive => {
                 hints.push(("/", "search"));
@@ -1784,6 +1814,31 @@ fn start(tab: &mut Open, what: Reviewing, writing: bool, action: Action) {
     }
     tab.memory.review = None;
     tab.memory.working = Some(Working { what, writing, started: Instant::now(), answer });
+}
+
+/// `r`: the whole entry shown -- every piece of its text, as kept --
+/// marked at once, and the review of where it is kept opened (`a` strikes).
+fn redact_whole(tab: &mut Open) {
+    if tab.memory.doc_for.is_none() {
+        tab.note("select an entry", true);
+        return;
+    }
+    let all = pieces(&tab.memory.doc);
+    let long: Vec<String> = all
+        .iter()
+        .map(|piece| piece.trim().to_string())
+        .filter(|piece| piece.chars().count() >= crate::strike::MIN_FRAGMENT && !crate::strike::MARKER.contains(piece.as_str()))
+        .collect();
+    if long.is_empty() {
+        tab.note("nothing here to redact", true);
+        return;
+    }
+    for piece in long {
+        if !tab.memory.marks.contains(&piece) {
+            tab.memory.marks.push(piece);
+        }
+    }
+    begin_review(tab);
 }
 
 fn begin_review(tab: &mut Open) {
@@ -1998,6 +2053,7 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent, page: usize) -> Outcome {
                 }
             }
             KeyCode::Char('a') if !state.marks.is_empty() => begin_review(tab),
+            KeyCode::Char('r') if state.section != Section::Redactions => redact_whole(tab),
             _ => {}
         }
         return Outcome::Stay;
@@ -2089,6 +2145,7 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent, page: usize) -> Outcome {
             }
         }
         KeyCode::Char('a') if !tab.memory.marks.is_empty() => begin_review(tab),
+        KeyCode::Char('r') if section != Section::Redactions => redact_whole(tab),
         KeyCode::Char('e') if section == Section::Redactions => match selected_request(&mut tab.memory) {
             Some(request) if request.state == crate::redact::State::Pending => edit(tab, &request),
             Some(request) => tab.note(format!("#{} is decided", request.request), true),
@@ -2189,6 +2246,26 @@ mod tests {
 
     fn press(tab: &mut Open, code: KeyCode, modifiers: KeyModifiers) -> Outcome {
         key(tab, &KeyEvent::new(code, modifiers), 10)
+    }
+
+    /// `r` marks the whole entry: each piece of its text whole, as kept
+    /// (an event's content in one, a record's fields one each), and none of
+    /// its labels; then the review opens.
+    #[test]
+    fn r_marks_every_piece_of_the_entry_whole() {
+        let mut tab = Open::new(super::super::View::Memory);
+        let mut doc = vec![DocLine::label(Style::Heading, "event #7")];
+        text_lines(&mut doc, Style::Plain, "the key is sk-123456\nand the host is db.internal");
+        doc.push(DocLine::label(Style::Heading, "statement"));
+        text_lines(&mut doc, Style::Plain, "first item");
+        text_lines(&mut doc, Style::Plain, "second item");
+        text_lines(&mut doc, Style::Plain, "ok");
+        assert_eq!(pieces(&doc), ["the key is sk-123456\nand the host is db.internal", "first item", "second item", "ok"]);
+        tab.memory.doc = doc;
+        tab.memory.doc_for = Some("x".into());
+        press(&mut tab, KeyCode::Char('r'), KeyModifiers::NONE);
+        assert_eq!(tab.memory.marks, ["the key is sk-123456\nand the host is db.internal", "first item", "second item"], "too short to strike everywhere: left");
+        assert!(tab.memory.working.is_some(), "the review is under way");
     }
 
     /// Shift and the arrows mark; Enter keeps it; the labels around the

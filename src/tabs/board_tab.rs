@@ -613,6 +613,9 @@ pub(super) fn waiting_for_operator(store: &crate::board::BoardStore) -> usize {
     crate::board::flow::waiting(&crate::board::flow::FlowStore::beside(store))
 }
 
+/// Comment threads the agent left waiting on the operator, as last counted.
+static COMMENTS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// How many boards wait for the operator (in review, verified, proposed exhausted), as last counted.
 pub(super) static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// When they were last counted for the tab bar (at most every `WAITING_EVERY`).
@@ -667,6 +670,10 @@ pub(super) fn boards_waiting() -> usize {
         let _ = std::thread::Builder::new().name("boards-waiting".into()).spawn(move || {
             let store = crate::board::BoardStore::beside_archive(&archive);
             let waiting = waiting_for_operator(&store);
+            let comments = store.waiting_on_operator().unwrap_or(0);
+            if COMMENTS_WAITING.swap(comments, std::sync::atomic::Ordering::SeqCst) != comments {
+                poke();
+            }
             // And the agent's redaction requests, for the memory tab's mark.
             let asked = crate::redact::Book::beside_archive(&archive).pending().map(|pending| pending.len()).unwrap_or(0);
             if REDACTIONS_WAITING.swap(asked, std::sync::atomic::Ordering::SeqCst) != asked {
@@ -680,5 +687,5 @@ pub(super) fn boards_waiting() -> usize {
             }
         });
     }
-    WAITING.load(std::sync::atomic::Ordering::SeqCst)
+    WAITING.load(std::sync::atomic::Ordering::SeqCst) + COMMENTS_WAITING.load(std::sync::atomic::Ordering::SeqCst)
 }

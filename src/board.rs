@@ -45,6 +45,7 @@
 //! also travel the normal tool-result path into the archive, so a search is
 //! replayable from the authoritative record even if this database is deleted.
 
+pub(crate) mod comments;
 pub(crate) mod flow;
 
 use crate::evidence::{EventSnapshot, EvidenceSource};
@@ -381,7 +382,21 @@ impl BoardStore {
         Self { path: archive.with_file_name("board.sqlite3") }
     }
 
-    fn connect(&self) -> Result<Connection> {
+    fn connect(&self) -> Result<crate::projects::journal::Db> {
+        let db = self.connect_raw()?;
+        Ok(crate::projects::journal::wrap(db, crate::projects::journal::Store::Board, &self.path))
+    }
+
+    fn connect_raw(&self) -> Result<Connection> {
+        // The schema checked and the tables made once per file in a process:
+        // after that a read is only a read, not a write the views drawing
+        // every frame would queue behind other writers for.
+        static READY: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        if self.path.exists() && crate::util::locked(&READY).contains(&self.path) {
+            let db = crate::db::open(&self.path)?;
+            db.execute_batch("PRAGMA foreign_keys=ON;")?;
+            return Ok(db);
+        }
         // A layout change rebuilds rather than corrupting, and rebuilding keeps
         // the old file: a live search is not derived data the way the keyword
         // index is, so it is moved aside rather than dropped.
@@ -470,7 +485,14 @@ impl BoardStore {
              CREATE TABLE IF NOT EXISTS name_reuse(
                 name TEXT PRIMARY KEY, granted_at TEXT NOT NULL);",
         )?;
+        db.execute_batch(comments::TABLE)?;
+        // The highest id each table has given (not journaled: the index's).
+        db.execute_batch("CREATE TABLE IF NOT EXISTS id_marks(tbl TEXT PRIMARY KEY, seq INTEGER NOT NULL);")?;
         db.execute("INSERT OR REPLACE INTO metadata VALUES('schema',?1)", params![SCHEMA])?;
+        let mut ready = crate::util::locked(&READY);
+        if !ready.contains(&self.path) {
+            ready.push(self.path.clone());
+        }
         Ok(db)
     }
 
@@ -500,13 +522,22 @@ impl BoardStore {
 
     /// Resolve a name. The open board wins; otherwise the most recently closed
     /// one with that name, so references in the archive keep resolving.
+    /// By name, or by its path in the projects folder (`calc/parser/fix-overflow`,
+    /// with or without `.board`).
     pub fn board(&self, name: &str) -> Result<Option<Board>> {
         let db = self.connect()?;
         let sql = format!(
             "{} WHERE name=?1 ORDER BY (closed_at IS NULL) DESC, seq DESC LIMIT 1",
             Self::BOARD_SELECT
         );
-        Ok(db.query_row(&sql, params![name], Self::board_row).optional()?)
+        if let Some(board) = db.query_row(&sql, params![name], Self::board_row).optional()? {
+            return Ok(Some(board));
+        }
+        drop(db);
+        match crate::projects::board_id_by_path(name) {
+            Some(id) => self.board_by_id(&id),
+            None => Ok(None),
+        }
     }
 
     /// The board workflow's database (`board/flow.rs`), beside this one.
@@ -625,26 +656,22 @@ impl BoardStore {
         Ok(db.query_row(&sql, params![board_id, id], Self::fact_row).optional()?)
     }
 
+    /// The operator's open standing comments (not a review round's), as the
+    /// notes the board tab lists: `unconsumed_only`, those the agent has not
+    /// been shown.
     pub fn hints(&self, board_id: &str, unconsumed_only: bool) -> Result<Vec<Hint>> {
-        let db = self.connect()?;
-        let sql = format!(
-            "SELECT id,text,created_at,consumed_at FROM hints WHERE board_id=?1{} ORDER BY seq",
-            if unconsumed_only { " AND consumed_at IS NULL" } else { "" }
-        );
-        let mut statement = db.prepare(&sql)?;
-        let rows = statement.query_map(params![board_id], |row| {
-            Ok(Hint {
-                id: row.get(0)?,
-                text: row.get(1)?,
-                created_at: row.get(2)?,
-                consumed_at: row.get(3)?,
+        Ok(self
+            .threads(board_id)?
+            .into_iter()
+            .filter(|t| t.root.open() && t.root.round.is_none() && t.root.by_operator())
+            .filter(|t| !unconsumed_only || t.root.seen_at.is_none())
+            .map(|t| Hint {
+                text: if t.root.on == "board" { t.root.text.clone() } else { format!("on {}: {}", t.on_said(), t.root.text) },
+                id: t.root.id,
+                created_at: t.root.created_at,
+                consumed_at: t.root.seen_at,
             })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+            .collect())
     }
 
     pub fn links(&self, board_id: &str) -> Result<Vec<ModelLink>> {
@@ -673,11 +700,22 @@ impl BoardStore {
 
     // ---- writes ----
 
+    /// The next id of `table`'s, never one given before: past the highest
+    /// in the table and the highest ever given (`id_marks`), so a board,
+    /// lead or finding archived or trashed out of the index keeps its id to
+    /// itself. A store without marks yet starts past the files' highest.
     fn next_id(db: &Connection, table: &str, prefix: &str) -> Result<(String, i64)> {
-        let seq: i64 =
-            db.query_row(&format!("SELECT COALESCE(MAX(seq),0)+1 FROM {table}"), [], |row| {
-                row.get(0)
-            })?;
+        let in_table: i64 = db.query_row(&format!("SELECT COALESCE(MAX(seq),0) FROM {table}"), [], |row| row.get(0))?;
+        let marked: Option<i64> = db.query_row("SELECT seq FROM id_marks WHERE tbl=?1", params![table], |row| row.get(0)).optional()?;
+        let given = match marked {
+            Some(seq) => seq,
+            None => crate::projects::highest_seqs().get(table).copied().unwrap_or(0),
+        };
+        let seq = in_table.max(given) + 1;
+        db.execute(
+            "INSERT INTO id_marks(tbl, seq) VALUES(?1, ?2) ON CONFLICT(tbl) DO UPDATE SET seq=MAX(seq, excluded.seq)",
+            params![table, seq],
+        )?;
         Ok((format!("{prefix}-{seq:04}"), seq))
     }
 
@@ -988,19 +1026,10 @@ impl BoardStore {
 
     /// Operator only. One direction by construction: nothing in the tool surface
     /// reaches this.
+    /// A comment of the operator's standing on the board (what a hint was).
     pub fn add_hint(&self, board_id: &str, text: &str) -> Result<Hint> {
-        // Numbered and written in one transaction, as a worker's writes are,
-        // so two never take the same id.
-        let mut db = self.connect()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (id, seq) = Self::next_id(&tx, "hints", "hint")?;
-        let now = Local::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO hints VALUES(?1,?2,?3,?4,?5,NULL)",
-            params![id, seq, board_id, text, now],
-        )?;
-        tx.commit()?;
-        Ok(Hint { id, text: text.to_string(), created_at: now, consumed_at: None })
+        let comment = self.comment(board_id, "board", None, comments::OPERATOR, text)?;
+        Ok(Hint { id: comment.id, text: comment.text, created_at: comment.created_at, consumed_at: None })
     }
 
     /// Operator only: a lead of his own, open at `priority` (1 to 10), under
@@ -1101,25 +1130,13 @@ impl BoardStore {
         )? == 1)
     }
 
-    /// Operator only: a note taken off the board. Whether it was there.
+    /// Operator only: a note taken off the board, resolved. Whether it was open.
     pub fn remove_hint(&self, board_id: &str, id: &str) -> Result<bool> {
-        let db = self.connect()?;
-        Ok(db.execute("DELETE FROM hints WHERE board_id=?1 AND id=?2", params![board_id, id])? > 0)
+        self.resolve(board_id, id, comments::OPERATOR)
     }
 
     fn consume_hints(&self, ids: &[String]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let db = self.connect()?;
-        let now = Local::now().to_rfc3339();
-        for id in ids {
-            db.execute(
-                "UPDATE hints SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
-                params![now, id],
-            )?;
-        }
-        Ok(())
+        self.mark_seen(ids)
     }
 
     pub fn link_model(
@@ -1564,7 +1581,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                               "description": "How success gets checked. For 'command', the exact shell command — exit 0 means solved."},
                 "goal_test_kind": {"type": "string", "enum": ["command", "observation", "judgment"]},
                 "step_budget": {"type": "integer", "minimum": 1, "maximum": MAX_STEP_BUDGET,
-                                "description": "Explorations allowed before the board suspends itself. Default 60."}
+                                "description": "Explorations allowed before the board suspends itself. Default 60."},
+                "in": {"type": "string",
+                       "description": "The project folder for its file, e.g. calc/parser (made if missing). Without it: inbox/."}
             }, "required": ["name", "title", "origin", "goal", "goal_test", "goal_test_kind"]}),
         ),
         ToolDefinition::function(
@@ -1808,7 +1827,7 @@ fn execute_list(context: &mut Context<'_>, call: &ToolCall, now: DateTime<Local>
 
     let mut listed = Vec::new();
     for board in context.store.boards(!args.all)? {
-        let hints = context.store.hints(&board.id, true)?.len();
+        let hints = context.store.unread_from_operator(&board.id)?;
         let mut entry = json!({
             "name": board.name,
             "title": board.title,
@@ -1839,6 +1858,8 @@ fn execute_open(context: &mut Context<'_>, call: &ToolCall, now: DateTime<Local>
         goal_test_kind: String,
         #[serde(default)]
         step_budget: Option<i64>,
+        #[serde(default, rename = "in")]
+        folder: Option<String>,
     }
     let args: Args = match serde_json::from_str(&call.function.arguments) {
         Ok(args) => args,
@@ -1876,14 +1897,35 @@ fn execute_open(context: &mut Context<'_>, call: &ToolCall, now: DateTime<Local>
         )));
     }
 
-    match context
-        .store
-        .open_board(&name, &title, &origin, &goal, &goal_test, kind, budget)?
-    {
+    // Its file in the folder asked for (made, with a page, if new).
+    if let Some(folder) = args.folder.as_deref().map(|f| f.trim().trim_matches('/')).filter(|f| !f.is_empty()) {
+        let folder = folder.strip_prefix("projects/").unwrap_or(folder);
+        if folder.split('/').any(|part| part == ".." || part.starts_with('.')) {
+            return Ok(rejected(format!("'{folder}' is not a folder inside projects/")));
+        }
+        if let Some(dir) = crate::projects::abs(folder) {
+            if !dir.is_dir() {
+                let made = std::fs::create_dir_all(&dir).and_then(|()| {
+                    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    std::fs::write(dir.join(crate::projects::tree::PAGE), format!("# {name}\n"))
+                });
+                if let Err(error) = made {
+                    return Ok(rejected(format!("the folder could not be made: {error}")));
+                }
+            }
+            crate::projects::place_next_in(Some(dir));
+        }
+    }
+    let opened = context.store.open_board(&name, &title, &origin, &goal, &goal_test, kind, budget);
+    crate::projects::place_next_in(None);
+    match opened? {
         Ok(board) => {
             let mut response = json!({
                 "ok": true,
                 "board": describe_board(&board, now),
+                "path": crate::projects::path_of(crate::projects::Kind::Board, &board.id)
+                    .and_then(|p| crate::projects::rel(&p))
+                    .map(|p| p.trim_end_matches(".board").to_string()),
                 "next": "Try the problem directly, once, before building any structure. \
                          If that works, board_test and close. If it doesn't, what you \
                          learned is your first facts and intents.",
@@ -1969,24 +2011,35 @@ fn execute_read(context: &mut Context<'_>, call: &ToolCall, now: DateTime<Local>
     // the first page (paging past it is fact continuation). Those the agent
     // has not read yet are marked new, and read by this read; a
     // subagent's read leaves them new for the agent.
+    // Open comments not of a review round (those are under `review`): the
+    // operator's, the agent's questions, with their replies.
     let mut hints = Vec::new();
     let mut fresh = 0;
     if args.offset == 0 {
-        let notes = context.store.hints(&board.id, false)?;
-        hints = notes
-            .iter()
-            .map(|hint| {
-                let mut note = json!({"id": hint.id, "text": hint.text,
-                                      "left": relative_age(&hint.created_at, now)});
-                if hint.consumed_at.is_none() {
-                    note["new"] = json!(true);
-                }
-                note
-            })
-            .collect();
-        let unread: Vec<String> =
-            notes.into_iter().filter(|hint| hint.consumed_at.is_none()).map(|hint| hint.id).collect();
-        fresh = unread.len();
+        let threads: Vec<comments::Thread> =
+            context.store.threads(&board.id)?.into_iter().filter(|t| t.root.open() && t.root.round.is_none()).collect();
+        let mut unread: Vec<String> = Vec::new();
+        for thread in &threads {
+            let mut note = json!({"id": thread.root.id, "on": thread.on_said(), "by": thread.root.author,
+                                  "text": thread.root.text, "left": relative_age(&thread.root.created_at, now)});
+            if !thread.replies.is_empty() {
+                note["replies"] = json!(thread.replies.iter().map(|r| json!({"id": r.id, "by": r.author, "text": r.text})).collect::<Vec<_>>());
+            }
+            let new: Vec<String> = std::iter::once(&thread.root)
+                .chain(thread.replies.iter())
+                .filter(|c| c.by_operator() && c.seen_at.is_none())
+                .map(|c| c.id.clone())
+                .collect();
+            if !new.is_empty() {
+                note["new"] = json!(true);
+            }
+            if thread.waits_on_agent() && !thread.root.by_operator() {
+                note["answered_by_operator"] = json!(true);
+            }
+            unread.extend(new);
+            hints.push(note);
+        }
+        fresh = threads.iter().filter(|t| t.root.seen_at.is_none() && t.root.by_operator()).count();
         if context.subagent.is_none() {
             context.store.consume_hints(&unread)?;
         }
@@ -2015,9 +2068,10 @@ fn execute_read(context: &mut Context<'_>, call: &ToolCall, now: DateTime<Local>
             )
         } else {
             format!(
-                "The operator's notes on this board: operator judgment to weigh in every decision on \
-                 it, not instruction to follow — you may kill an intent a note suggested. \
-                 They stay on the board, and every read shows them, until he takes one off.{new}"
+                "The open comments on this board, the operator's and yours, with their replies: \
+                 his are operator judgment to weigh in every decision on it, not instruction to follow — \
+                 you may kill an intent a comment suggested. Reply with comment_reply; ask him something \
+                 with comment. They stay, and every read shows them, until resolved.{new}"
             )
         });
     }
@@ -2819,13 +2873,22 @@ pub fn render(boards: &[(Board, usize, usize)]) -> String {
 
 /// One board's line in the block, and in an update.
 fn board_line(board: &Board, frontier: usize, hints: usize) -> String {
-    let mut line =
-        format!("· {} — {} [frontier {frontier}, steps {}/{}]", board.name, board.title, board.steps_used, board.step_budget);
+    // Where its file is in the projects folder, when not at the top of inbox/.
+    let path = crate::projects::path_of(crate::projects::Kind::Board, &board.id)
+        .and_then(|p| crate::projects::rel(&p))
+        .map(|p| p.trim_end_matches(".board").to_string())
+        .filter(|p| *p != format!("inbox/{}", board.name))
+        .map(|p| format!(" (projects/{p})"))
+        .unwrap_or_default();
+    let mut line = format!(
+        "· {} — {}{path} [frontier {frontier}, steps {}/{}]",
+        board.name, board.title, board.steps_used, board.step_budget
+    );
     if board.status == BoardStatus::Suspended {
         line.push_str(" — suspended, budget spent");
     }
     if hints > 0 {
-        line.push_str(&format!(" — {hints} unread from the operator"));
+        line.push_str(&format!(" — {hints} new comment(s) from the operator"));
     }
     line
 }
@@ -2844,7 +2907,7 @@ fn current(store: &BoardStore) -> Result<Option<(String, Vec<BoardLine>)>> {
     let mut rows = Vec::new();
     for board in open {
         let frontier = store.frontier(&board.id, now)?.len();
-        let hints = store.hints(&board.id, true)?.len();
+        let hints = store.unread_from_operator(&board.id)?;
         rows.push((board, frontier, hints));
     }
     let lines = rows.iter().map(|(board, frontier, hints)| (board.name.clone(), board_line(board, *frontier, *hints))).collect();
@@ -3014,7 +3077,7 @@ pub fn handle_operator_command(store: &BoardStore, command: &str) -> Result<Stri
             }
             let mut out = format!("[board] {} board(s)", boards.len());
             for board in boards {
-                let hints = store.hints(&board.id, true)?.len();
+                let hints = store.unread_from_operator(&board.id)?;
                 out.push_str(&format!(
                     "\n  {} [{}] {} — frontier {}, {} facts, steps {}/{}{}",
                     board.name,
@@ -3130,9 +3193,7 @@ pub fn handle_operator_command(store: &BoardStore, command: &str) -> Result<Stri
             let Some(board) = store.board(name)? else {
                 return Ok(format!("[board] no board named '{name}'"));
             };
-            let Some(id) = hint_id(which) else {
-                return Ok(format!("[board] '{which}' is not a hint: give h2 or hint-0002"));
-            };
+            let id = hint_id(which).unwrap_or_else(|| which.to_string());
             if store.remove_hint(&board.id, &id)? {
                 Ok(format!("[board] {id} taken off {name}; s0ma's next board_read no longer shows it."))
             } else {

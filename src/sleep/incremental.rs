@@ -56,6 +56,16 @@ const PASS_EPISODES: usize = 40;
 const PASS_CARRY_RESERVE: usize = 32_768;
 /// A later pass's prompt lists what earlier passes staged, one line each.
 const PASS_CATALOG_TOKENS_PER_EPISODE: usize = 80;
+/// At most this much of the list: the latest episodes, the older ones found
+/// with `sleep_staged_get`'s search. Unbounded, a window of hundreds of
+/// batches filled the prompt with it (pass 238 of 404 started at 251k tokens
+/// of a 262k window).
+const PASS_CATALOG_TOKENS: usize = 12_000;
+/// Episodes the catalog lists at most.
+const PASS_CATALOG_LINES: usize = PASS_CATALOG_TOKENS / PASS_CATALOG_TOKENS_PER_EPISODE;
+/// The checkpoint passes hand on is kept under this many tokens: the final
+/// pass writes it whole in one response. Past it, a pass condenses it.
+const PASS_CHECKPOINT_TOKENS: usize = 20_000;
 
 /// `S0MA_SLEEP_PASSES=1`: always one integration pass, compressing digests with
 /// rollups when they don't fit (the behaviour before passes).
@@ -76,11 +86,12 @@ fn pass_episode_limit() -> usize {
 /// checkpoint's reserve), `sizes[i]` digest i's tokens and `episodes[i]` its
 /// proposals. A later pass also lists what earlier ones staged, so its room
 /// shrinks by that much.
-fn plan_passes(sizes: &[usize], episodes: &[usize], overhead: usize, budget: usize, max_episodes: usize) -> Vec<usize> {
+/// `earlier`: episodes kept before the first of `sizes` (a plan's tail).
+fn plan_passes(sizes: &[usize], episodes: &[usize], overhead: usize, budget: usize, max_episodes: usize, earlier: usize) -> Vec<usize> {
     let mut ends = Vec::new();
-    let (mut start, mut earlier) = (0, 0);
+    let (mut start, mut earlier) = (0, earlier);
     while start < sizes.len() {
-        let mut tokens = overhead + earlier * PASS_CATALOG_TOKENS_PER_EPISODE;
+        let mut tokens = overhead + (earlier * PASS_CATALOG_TOKENS_PER_EPISODE).min(PASS_CATALOG_TOKENS);
         let (mut end, mut proposals) = (start, 0);
         while end < sizes.len() {
             let (more_tokens, more_proposals) = (tokens + sizes[end], proposals + episodes[end]);
@@ -878,6 +889,7 @@ fn pass_request(
         )
     };
     source.push_str(pass.carried.as_deref().filter(|carried| !carried.trim().is_empty()).unwrap_or("None"));
+    let carried_tokens = pass.carried.as_deref().map_or(0, estimated_tokens);
     source.push_str(&format!(
         "\n\nORDERED BATCH DIGESTS FOR THIS PASS (batches {first}–{last} of {})\n",
         pass.total
@@ -897,12 +909,16 @@ fn pass_request(
     push_duplicates(&mut source, &pass.duplicates);
     let scope = if pass.number < pass.count {
         format!(
-            "This is integration pass {} of {}: integrate batches {first}–{last} now. Later passes integrate batches {}–{}, and the final pass writes the whole checkpoint once, so do not rewrite it here. The checkpoint is kept in sections, each starting with a line `## Heading`. When finished with tools, return ONLY the sections this pass changes or adds, each complete under its exact heading (keep existing headings as they are; to rename one, remove it and add the new one): a section you leave out is kept as it is, a returned one replaces the section with its heading, a new heading is added at the end, and a section whose whole body is `(removed)` is deleted. Not a progress report and not a plan for later passes. If this pass changes no section, return exactly {NO_SECTION_CHANGES}.",
-            pass.number, pass.count, last + 1, pass.total
+            "This is integration pass {} of {}: integrate batches {first}–{last} now. Later passes integrate batches {}–{}, and the final pass writes the whole checkpoint once, so do not rewrite it here. The checkpoint is kept in sections, each starting with a line `## Heading`. When finished with tools, return ONLY the sections this pass changes or adds, each complete under its exact heading (keep existing headings as they are; to rename one, remove it and add the new one): a section you leave out is kept as it is, a returned one replaces the section with its heading, a new heading is added at the end, and a section whose whole body is `(removed)` is deleted. Not a progress report and not a plan for later passes. If this pass changes no section, return exactly {NO_SECTION_CHANGES}.{}",
+            pass.number,
+            pass.count,
+            last + 1,
+            pass.total,
+            condense(carried_tokens)
         )
     } else {
         format!(
-            "This is the final integration pass ({} of {}): earlier passes integrated batches 1–{} into the checkpoint above; integrate batches {first}–{last}. When finished with tools, return ONLY the complete checkpoint for the whole window, written once in full under `## ` section headings, including retained previous continuity, not a progress report.",
+            "This is the final integration pass ({} of {}): earlier passes integrated batches 1–{} into the checkpoint above; integrate batches {first}–{last}. When finished with tools, return ONLY the complete checkpoint for the whole window, written once in full under `## ` section headings, including retained previous continuity, not a progress report. Keep it under about {PASS_CHECKPOINT_TOKENS} tokens: condense older, settled sections rather than dropping what is still open.",
             pass.number, pass.count, pass.start
         )
     };
@@ -910,6 +926,19 @@ fn pass_request(
         "This pass's set holds the proposals of batches {first}–{last} and the episodes earlier passes kept. When an episode here continues, duplicates or corrects one an earlier pass kept, read that one with sleep_staged_get and replace both with the merged episode."
     );
     integration_request(system, source, &scope, &episodes, Some(()))
+}
+
+/// For a pass whose carried checkpoint has grown past
+/// `PASS_CHECKPOINT_TOKENS`: return its longest sections condensed, so the
+/// final pass can still write it whole.
+fn condense(carried_tokens: usize) -> String {
+    if carried_tokens <= PASS_CHECKPOINT_TOKENS {
+        return String::new();
+    }
+    format!(
+        " The checkpoint so far is about {carried_tokens} tokens, over the {PASS_CHECKPOINT_TOKENS} it must stay within (the final pass writes it whole in one response): also return its longest, most settled sections condensed, each complete under its heading, keeping what is still open, event IDs that support it, and recent continuity, so that it comes back under {} tokens.",
+        PASS_CHECKPOINT_TOKENS * 3 / 4
+    )
 }
 
 /// The integration request around `source`. `scope` closes the integration
@@ -1127,7 +1156,10 @@ fn integration_plan(
     path: &Path,
     count: &mut TokenCounter<'_>,
 ) -> Result<Vec<usize>> {
-    if progress.pass_plan.len() > 1 && progress.pass_plan.last() == Some(&digests.len()) {
+    let saved = progress.pass_plan.len() > 1 && progress.pass_plan.last() == Some(&digests.len());
+    // A saved plan with every pass done, or none done yet planned now: as it is.
+    let done = progress.passes.len();
+    if saved && (done == 0 || done >= progress.pass_plan.len()) {
         return Ok(progress.pass_plan.clone());
     }
     let sleep = ChatOptions::sleep();
@@ -1160,7 +1192,34 @@ fn integration_plan(
     let (messages, tools) = pass_request(system, &empty, &[], preparation);
     let overhead = count(&messages, Some(&tools))? + previous_tokens.max(PASS_CARRY_RESERVE);
     let limit = pass_episode_limit();
-    let plan = plan_passes(&sizes, episodes, overhead, budget, limit);
+    // A resumed plan: its finished passes kept, the rest planned again (a plan
+    // saved by a build that let the catalog grow without bound went down to a
+    // batch a pass, and still overflowed).
+    if saved {
+        let finished = progress.pass_plan[..done].to_vec();
+        let start = finished.last().copied().unwrap_or(0);
+        let kept = progress.passes.last().map_or(0, |receipt| receipt.kept.episodes.len());
+        // The checkpoint carried into the next pass, where it is past the reserve.
+        let carried = match progress.passes.last() {
+            Some(receipt) => count(&[Message::user(receipt.checkpoint.clone())], None)?.saturating_sub(blank),
+            None => 0,
+        };
+        let overhead = overhead + carried.saturating_sub(previous_tokens.max(PASS_CARRY_RESERVE));
+        let tail = plan_passes(&sizes[start..], &episodes[start..], overhead, budget, limit, kept);
+        let plan: Vec<usize> = finished.into_iter().chain(tail.into_iter().map(|end| end + start)).collect();
+        if plan != progress.pass_plan {
+            crate::terminal::say_status(&format!(
+                "[sleep] integration planned again from pass {}: {} passes in all, was {}",
+                done + 1,
+                plan.len(),
+                progress.pass_plan.len()
+            ));
+            progress.pass_plan = plan.clone();
+            save(path, progress)?;
+        }
+        return Ok(plan);
+    }
+    let plan = plan_passes(&sizes, episodes, overhead, budget, limit, 0);
     if plan.len() > 1 {
         let proposals: usize = episodes.iter().sum();
         let tokens: usize = sizes.iter().sum();
@@ -1232,7 +1291,7 @@ fn integrate_in_passes(
             end,
             total: count,
             carried: carried_sections.clone(),
-            catalog: session.kept_catalog(),
+            catalog: session.kept_catalog(PASS_CATALOG_LINES),
             duplicates: session.likely_duplicates(),
         };
         let started = std::time::Instant::now();
@@ -2149,3 +2208,70 @@ mod reliability_tests {
     }
 }
 
+
+#[cfg(test)]
+mod pass_bounds {
+    use super::*;
+
+    /// Hundreds of batches: the list of what earlier passes kept is bounded,
+    /// so late passes take as many batches as early ones (unbounded, they went
+    /// down to one batch each and still outgrew the window).
+    #[test]
+    fn late_passes_are_as_wide_as_early_ones() {
+        let sizes = vec![1_000; 600];
+        let episodes = vec![5; 600];
+        let plan = plan_passes(&sizes, &episodes, 50_000, 131_072, 40, 0);
+        let widths: Vec<usize> = plan.iter().scan(0, |start, &end| {
+            let width = end - *start;
+            *start = end;
+            Some(width)
+        }).collect();
+        assert!(widths.iter().all(|&width| width == 8), "{widths:?}");
+        // A tail planned after 3,000 kept episodes: the same.
+        let tail = plan_passes(&sizes[..80], &episodes[..80], 50_000, 131_072, 40, 3_000);
+        assert_eq!(tail.len(), 10);
+    }
+
+    fn receipt(end: usize) -> PassReceipt {
+        PassReceipt { end, checkpoint: "## Earlier memory\nkept".into(), kept: episodes::Kept::default() }
+    }
+
+    /// A plan saved by an older build is planned again after its finished
+    /// passes, which are kept as they are.
+    #[test]
+    fn a_resumed_plan_is_planned_again_after_its_finished_passes() {
+        let dir = std::env::temp_dir().join(format!("s0ma-pass-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sleep_batches.json");
+        let digests: Vec<String> = (0..60).map(|_| "x".repeat(400)).collect();
+        let episodes = vec![2; 60];
+        // One batch a pass from pass 4 on, as the old plan had it.
+        let old: Vec<usize> = (1..=60).collect();
+        let mut progress: Progress = serde_json::from_value(json!({
+            "version": 1, "fingerprint": "", "batches": [], "rollups": [], "integrated": null, "integrated_threads": null,
+            "pass_plan": old,
+        }))
+        .unwrap();
+        progress.passes = vec![receipt(1), receipt(2), receipt(3)];
+        let mut count = |messages: &[Message], tools: Option<&[llm::ToolDefinition]>| -> Result<usize> {
+            let text: usize = messages.iter().map(|m| m.content.len()).sum();
+            let tools = tools.map_or(0, |tools| serde_json::to_string(tools).unwrap().len());
+            Ok((text + tools) / 4)
+        };
+        let plan = integration_plan("system", None, &digests, &episodes, None, 262_144, &mut progress, &path, &mut count).unwrap();
+        assert_eq!(&plan[..3], &[1, 2, 3], "finished passes kept");
+        assert_eq!(*plan.last().unwrap(), 60);
+        assert!(plan.len() < 10, "{plan:?}");
+        assert_eq!(progress.pass_plan, plan, "saved");
+        assert_eq!(progress.passes.len(), 3, "receipts kept");
+        // Planned again, it stays as it is.
+        assert_eq!(integration_plan("system", None, &digests, &episodes, None, 262_144, &mut progress, &path, &mut count).unwrap(), plan);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_checkpoint_is_condensed_by_the_next_pass() {
+        assert_eq!(condense(PASS_CHECKPOINT_TOKENS), "");
+        assert!(condense(PASS_CHECKPOINT_TOKENS + 1).contains("condensed"));
+    }
+}

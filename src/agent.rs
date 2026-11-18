@@ -220,6 +220,8 @@ where
     tools.extend(crate::audit::tools::tool_definitions());
     // A finished board's write-up, review answers and verification.
     tools.extend(crate::board::flow::tool_definitions());
+    // Projects: read them, comment and reply, write a page.
+    tools.extend(crate::projects::tools::tool_definitions());
     tools.extend(crate::vm::wake::tool_definitions());
     // Last, so the native tools' prefix is unchanged when MCP servers come and go.
     tools.extend(crate::mcp::tool_definitions());
@@ -231,7 +233,10 @@ where
 
     loop {
         crate::subagent::pump(memory)?;
-        for status in crate::subagent::take_statuses()? {
+        // Workers the harness wants (an audit's) start now, not after the turn.
+        let mut said = Vec::new();
+        crate::audit::run::start_wanted(memory, &mut |status| said.push(status));
+        for status in said.into_iter().chain(crate::subagent::take_statuses()?).chain(crate::freeze::take_note()) {
             on_event(AgentEvent::Status(status))?;
         }
         for status in crate::mistakes::take_statuses() {
@@ -349,7 +354,9 @@ where
         let response = {
             let mut interruptible_event = |event: StreamEvent| -> Result<(), Box<dyn Error>> {
                 crate::subagent::pump(memory)?;
-                for status in crate::subagent::take_statuses()? {
+                let mut said = Vec::new();
+                crate::audit::run::start_wanted(memory, &mut |status| said.push(status));
+                for status in said.into_iter().chain(crate::subagent::take_statuses()?) {
                     on_event(AgentEvent::Status(status))?;
                 }
                 check_interrupt(interrupt_requested)?;
@@ -654,6 +661,7 @@ where
 
                 name if crate::share::handles(name) => crate::share::execute(&call),
                 name if crate::share::files::handles(name) => crate::share::files::execute(&call),
+                name if crate::projects::tools::handles(name) => crate::projects::tools::execute(&call),
                 name if crate::board::flow::handles(name) => {
                     let mut run = crate::share::run_on_machine;
                     crate::board::flow::execute(boards, &call, &crate::share::share_dir(), &mut run)

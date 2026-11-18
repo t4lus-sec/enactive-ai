@@ -680,6 +680,7 @@ fn ids_in_scope(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_detailed(
     memory: &Hippocampus,
     query: &str,

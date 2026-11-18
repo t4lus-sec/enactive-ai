@@ -59,6 +59,8 @@ enum Row {
     Reasoning,
     WorkerReasoning,
     Loop,
+    /// Approval mode (`/approval`).
+    Approval,
     Voice,
     /// The agent's access to its machine.
     Vm,
@@ -120,6 +122,8 @@ pub(super) struct State {
     sent: Option<(String, Instant)>,
     /// The operator's edit of `mcp.json` that was not saved, and why.
     draft: Option<(String, String)>,
+    /// The first line of the list shown, when it is taller than its room.
+    top: usize,
 }
 
 /// The watches row: how many run, the first named.
@@ -158,7 +162,7 @@ fn watches_detail(watches: &crate::overview::Watches) -> String {
 }
 
 fn rows(snapshot: &Snapshot) -> Vec<Row> {
-    let mut rows = vec![Row::Reasoning, Row::WorkerReasoning, Row::Loop, Row::Voice, Row::Vm, Row::Machine, Row::Sleep, Row::Tz, Row::Context, Row::Goal, Row::AuditPolicy, Row::Jobs, Row::Shells, Row::Watches];
+    let mut rows = vec![Row::Reasoning, Row::WorkerReasoning, Row::Loop, Row::Approval, Row::Voice, Row::Vm, Row::Machine, Row::Sleep, Row::Tz, Row::Context, Row::Goal, Row::AuditPolicy, Row::Jobs, Row::Shells, Row::Watches];
     rows.extend([Row::ModelServer, Row::ModelName, Row::ModelKey, Row::ModelType, Row::ModelWindow, Row::Embeddings]);
     rows.extend(snapshot.mcp.iter().map(|server| Row::Server(server.name.clone())));
     rows.push(Row::McpConfig);
@@ -212,8 +216,15 @@ fn label_row(name: &str, value: Line, action: &str, selected: bool, width: usize
     let name = format!("{name:<14}");
     let mut line = vec![lead, (if selected { Style::Bold } else { Style::Plain }, name)];
     // The selected row's own keys, as buttons.
-    let buttons = if selected { super::gui_view::row_buttons(action) } else { Vec::new() };
-    let buttons_width: usize = buttons.iter().map(|(_, text)| text_width(text)).sum();
+    let mut buttons = if selected { super::gui_view::row_buttons(action) } else { Vec::new() };
+    let mut buttons_width: usize = buttons.iter().map(|(_, text)| text_width(text)).sum();
+    // What the row holds comes before its buttons: a row too narrow for
+    // both shows the value (the keys still work).
+    let value_width: usize = value.iter().map(|(_, text)| text_width(text)).sum();
+    if width.saturating_sub(2 + 14 + buttons_width + 3) < value_width.min(12) {
+        buttons.clear();
+        buttons_width = 0;
+    }
     let room = width.saturating_sub(2 + 14 + buttons_width + 3);
     let mut used = 0;
     for (style, text) in value {
@@ -296,8 +307,11 @@ pub(super) fn body(tab: &mut Open, width: usize, rows_left: usize) -> (Vec<Line>
     let mut out: Vec<Line> = Vec::new();
     let heading = |text: &str| vec![(Style::Status, format!("  {text}"))];
     out.push(heading("settings"));
+    // The selected row's line, and its group's heading when it is the first.
+    let mut selected_lines = (0, 0);
     for (index, row) in all.iter().enumerate() {
         let here = index == state.selected;
+        let before = out.len();
         if *row == Row::Context {
             out.push(heading("s0ma"));
         }
@@ -306,6 +320,9 @@ pub(super) fn body(tab: &mut Open, width: usize, rows_left: usize) -> (Vec<Line>
         }
         if matches!(row, Row::Server(_) | Row::McpConfig) && !matches!(all.get(index.wrapping_sub(1)), Some(Row::Server(_))) {
             out.push(heading("mcp"));
+        }
+        if here {
+            selected_lines = (if index == 0 { 0 } else { before }, out.len());
         }
         let typed = state.input.as_ref().filter(|input| field_of(row) == Some(input.field));
         let model = &snapshot.model;
@@ -317,6 +334,7 @@ pub(super) fn body(tab: &mut Open, width: usize, rows_left: usize) -> (Vec<Line>
                 "←→ change".into(),
             ),
             Row::Loop => ("loop".into(), on_off(snapshot.looping), format!("⏎ turn {}", if snapshot.looping { "off" } else { "on" })),
+            Row::Approval => ("approval".into(), on_off(snapshot.approval), format!("⏎ turn {}", if snapshot.approval { "off" } else { "on" })),
             Row::Voice => ("voice".into(), on_off(snapshot.voice_on), format!("⏎ turn {}", if snapshot.voice_on { "off" } else { "on" })),
             Row::Vm => (
                 "vm access".into(),
@@ -484,6 +502,7 @@ pub(super) fn body(tab: &mut Open, width: usize, rows_left: usize) -> (Vec<Line>
         Some(Row::AuditPolicy) => "Whether s0ma may start an audit for a new project: ask (it proposes, you start it in Alt+U), auto (it starts \
             them within the ceilings you set), off (it can't). Each project's own is /board audits <board> off|ask|auto.".into(),
         Some(Row::Loop) => "On, s0ma keeps taking turns on its own; off, it waits for you (/loop).".into(),
+        Some(Row::Approval) => "On, every command s0ma or a subagent would run, and every subagent it starts, waits for you: alt+a twice approves, alt+x declines (/approval).".into(),
         Some(Row::Voice) => snapshot.voice.clone(),
         Some(Row::Vm) if snapshot.vm_access => "On, s0ma and its subagents use its machine: commands, shells, the desktop and browser, /share files, \
             board tests and reports, MCP servers in the VM. Off, every one of those is refused at once, mid-turn too, until it is on again (/vm).".into(),
@@ -554,12 +573,40 @@ pub(super) fn body(tab: &mut Open, width: usize, rows_left: usize) -> (Vec<Line>
     if matches!(selected, Some(Row::Server(_) | Row::McpConfig)) && !snapshot.mcp_notes.is_empty() {
         detail.push_str(&format!("\n\n{}", snapshot.mcp_notes.join("\n")));
     }
-    let left_rows = rows_left.saturating_sub(out.len() + 1);
-    out.push(vec![(Style::Dim, format!("  {}", "─".repeat(width.saturating_sub(4))))]);
     let mut strip: Vec<Line> = Vec::new();
     for line in detail.lines() {
         strip.extend(flow(&[(Style::Plain, format!("  {line}"))], width, 2));
     }
+    // A list taller than its room scrolls to keep the selected row (and its
+    // heading) in view; what it says in full keeps up to a third below.
+    let room = rows_left.saturating_sub(1 + strip.len().min(rows_left / 3)).max(1);
+    let mut more = String::new();
+    if out.len() > room {
+        let (first, last) = selected_lines;
+        let mut top = state.top;
+        if last >= top + room {
+            top = last + 1 - room;
+        }
+        if first < top {
+            top = first;
+        }
+        let top = top.min(out.len() - room);
+        state.top = top;
+        let below = out.len() - room - top;
+        more = match (top, below) {
+            (0, 0) => String::new(),
+            (0, below) => format!(" {below} more "),
+            (above, 0) => format!(" {above} above "),
+            (above, below) => format!(" {above} above · {below} more "),
+        };
+        out = out.split_off(top);
+        out.truncate(room);
+    } else {
+        state.top = 0;
+    }
+    let left_rows = rows_left.saturating_sub(out.len() + 1);
+    let rule = width.saturating_sub(4 + more.chars().count());
+    out.push(vec![(Style::Dim, format!("  {}", "─".repeat(rule))), (Style::Cursor, more)]);
     out.extend(strip.into_iter().take(left_rows));
     out.truncate(rows_left);
 
@@ -641,6 +688,9 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent) -> Outcome {
         }
         KeyCode::Enter | KeyCode::Char(' ') if row == Some(Row::Loop) => {
             send(tab, format!("/loop {}", if snapshot.looping { "off" } else { "on" }));
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if row == Some(Row::Approval) => {
+            send(tab, format!("/approval {}", if snapshot.approval { "off" } else { "on" }));
         }
         KeyCode::Enter | KeyCode::Char(' ') if row == Some(Row::Voice) => {
             send(tab, format!("/voice {}", if snapshot.voice_on { "off" } else { "on" }));
@@ -991,8 +1041,8 @@ mod tests {
             paste(tab, text);
             let _ = super::key(tab, &key(KeyCode::Enter));
         };
-        // The server: from what it is now, to a hosted API's (past the audits' row).
-        for _ in 0..14 {
+        // The server: from what it is now, to a hosted API's (past the audits' and approval's rows).
+        for _ in 0..15 {
             let _ = super::key(&mut tab, &key(KeyCode::Down));
         }
         let _ = super::key(&mut tab, &key(KeyCode::Enter));

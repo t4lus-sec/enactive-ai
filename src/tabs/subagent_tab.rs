@@ -2,42 +2,6 @@
 
 use super::*;
 
-/// A tab that reads the agent's own files and state from the disk of the machine
-/// it runs on, shown in a terminal attached from another computer (`s0ma
-/// connect`, `session::is_remote`): those reads don't go over the
-/// connection yet. The page, its history and the subagents' tabs do, as
-/// the primary sends them.
-pub(super) fn server_only(view: &View) -> bool {
-    crate::session::is_remote() && !matches!(view, View::Subagent(_) | View::History | View::Page)
-}
-
-/// What a tab `server_only` shows instead.
-pub(super) fn remote_body(view: &View, width: usize) -> (Vec<Line>, Footer) {
-    let what = match view {
-        View::Shell { .. } => "Shells",
-        View::Memory => "The memory tab",
-        View::Share => "The shared folder's tab",
-        View::Overview => "The overview",
-        View::Audit => "The audit tab",
-        View::Edit => "The editor",
-        _ => "The projects tab",
-    };
-    let text = [
-        format!("{what} reads the files of the machine s0ma runs on, and a terminal attached with s0ma connect can't show it yet."),
-        String::new(),
-        "For it now, ssh to that machine and run s0ma there. /download and /upload move files from and to the shared folder from here.".to_string(),
-    ];
-    let mut body = vec![Vec::new()];
-    for paragraph in text {
-        if paragraph.is_empty() {
-            body.push(Vec::new());
-            continue;
-        }
-        body.extend(crate::style::wrap(&[(Style::Dim, format!("  {paragraph}"))], width));
-    }
-    (body, Footer::new(vec![(Style::Dim, "not available here".into())], vec![]))
-}
-
 pub(super) fn subagent_body(number: usize, expanded: bool, width: usize, now: Instant) -> (Vec<Line>, Footer) {
     let Some(worker) = subagent_at(number) else {
         let key = if number == 10 { 0 } else { number };

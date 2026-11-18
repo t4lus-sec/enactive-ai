@@ -875,6 +875,7 @@ pub(crate) fn edit_path(path: &std::path::Path) -> io::Result<bool> {
         // leave (^O, ^X), where vi leaves someone who does not know it stuck
         // on a screen that is not the agent's.
         .unwrap_or_else(|| if on_path("nano") { "nano".into() } else { "vi".into() });
+    let _paused = crate::freeze::pause();
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$1\""))

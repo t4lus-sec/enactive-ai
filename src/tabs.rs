@@ -39,11 +39,14 @@ mod board_view;
 mod memory_view;
 mod share_view;
 mod overview_view;
+mod projects_tree;
 mod projects_view;
 mod editor_view;
 mod select_view;
 mod gui_view;
 mod audit_view;
+mod audit_settings;
+mod audit_tree;
 mod claim_view;
 mod draw;
 mod subagent_tab;
@@ -122,6 +125,9 @@ pub enum View {
     /// Alt+O: the agent's settings and state, MCP's servers among them
     /// (`tabs/overview_view.rs`).
     Overview,
+    /// Alt+P: the projects tab's first subtab, every project as a tree
+    /// with the selected item's page (`tabs/projects_tree.rs`).
+    Projects,
     /// The projects tab's later subtabs (Alt+P steps through them, the board
     /// being the first): boards in the operator's review, in verification, and
     /// delivered (`tabs/projects_view.rs`, `board/flow.rs`).
@@ -329,6 +335,12 @@ struct Open {
     audit: audit_view::State,
     /// Text being selected with the mouse, or just copied (`tabs/select_view.rs`).
     selection: Option<select_view::Selection>,
+    /// Rows left empty under the conversation in `View::History` opened by a
+    /// drag on the page, so its text stays where the page had it.
+    lift: usize,
+    /// That page was the idle one: its prompt stood on the conversation's
+    /// last, empty row, which is left out to match.
+    lift_idle: bool,
     /// Where the clickable parts of the frame drawn are (`tabs/gui_view.rs`), and
     /// what its footer's buttons do (a right-click's menu offers them).
     hits: Vec<gui_view::Hit>,
@@ -394,6 +406,8 @@ impl Open {
             projects: projects_view::State::default(),
             audit: audit_view::State::default(),
             selection: None,
+            lift: 0,
+            lift_idle: false,
             hits: Vec::new(),
             actions: Vec::new(),
             menu: None,
@@ -441,6 +455,17 @@ impl Open {
 }
 
 static OPEN: Mutex<Option<Open>> = Mutex::new(None);
+
+thread_local! {
+    /// Set while a tab is composed as one of two panes (`draw_split`): a
+    /// view that has a side panel at full width leaves it out.
+    static SPLIT_PANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the tab being composed is one of two panes.
+pub(super) fn in_split() -> bool {
+    SPLIT_PANE.with(std::cell::Cell::get)
+}
 static ARCHIVE: OnceLock<PathBuf> = OnceLock::new();
 
 fn lock() -> MutexGuard<'static, Option<Open>> {
@@ -548,6 +573,19 @@ pub fn split_from_page(display: &ActiveDisplay, idle_prompt: Option<(&str, usize
     draw_any(&mut open, &mut split, display)
 }
 
+/// A draft typed to the agent in a pane of its page, left when the panes
+/// closed back to the page.
+static PAGE_DRAFT: Mutex<Option<String>> = Mutex::new(None);
+
+fn page_draft() -> MutexGuard<'static, Option<String>> {
+    PAGE_DRAFT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// That draft, for the page's own prompt to take up.
+pub fn take_page_draft() -> Option<String> {
+    page_draft().take()
+}
+
 /// The pane put aside when two became one (Alt+\), as it was, and the side
 /// it was on: two again bring it back there.
 static PARKED: Mutex<Option<(Open, usize)>> = Mutex::new(None);
@@ -580,11 +618,17 @@ fn toggle_split(open: &mut MutexGuard<'static, Option<Open>>, split: &mut MutexG
     if let Some(state) = split.take() {
         set_split_up(false);
         // The pane beside, kept as it is for two panes again.
-        *parked() = Some((state.other, 1 - state.focus));
+        let mut aside = state.other;
         if open.as_ref().is_some_and(|tab| tab.view == View::Page) {
-            open.take();
+            // Back on the agent's page: what was being typed to it in a pane
+            // (this one's first) goes back to the page's own prompt.
+            let typed = open.take().map(|mut tab| tab.draft.take()).filter(|text| !text.is_empty());
+            let typed = typed.or_else(|| (aside.view == View::Page && !aside.draft.is_empty()).then(|| aside.draft.take()));
+            *page_draft() = typed;
+            *parked() = Some((aside, 1 - state.focus));
             return Ok(Outcome::Closed);
         }
+        *parked() = Some((aside, 1 - state.focus));
         if let Some(tab) = open.as_mut() {
             tab.frame.clear();
             tab.painted = None;
@@ -655,8 +699,10 @@ fn draw_split(open: &mut Option<Open>, state: &mut Split, display: &ActiveDispla
     crate::vm::terms::touch();
     let (left_width, right_width) = pane_widths(columns);
     let (mine, other) = if state.focus == 0 { (left_width, right_width) } else { (right_width, left_width) };
+    SPLIT_PANE.with(|split| split.set(true));
     let (focused, cursor) = compose(tab, display, (mine as u16, rows as u16), now);
     let (beside, _) = compose(&mut state.other, display, (other as u16, rows as u16), now);
+    SPLIT_PANE.with(|split| split.set(false));
     // The pane without the keyboard: its tab in the bar not lit.
     let beside: Vec<Line> = beside
         .into_iter()
@@ -687,9 +733,19 @@ fn draw_split(open: &mut Option<Open>, state: &mut Split, display: &ActiveDispla
 /// `line` exactly `width` columns: cut (a raw row at its codes' edges) and
 /// padded.
 fn fit_line(line: &Line, width: usize) -> Line {
+    let (mut out, used) = cut_line(line, width);
+    if used < width {
+        out.push((Style::Plain, " ".repeat(width - used)));
+    }
+    out
+}
+
+/// `line` in at most `width` columns (a raw row cut at its codes' edges),
+/// and how many it takes. Text that goes on past the edge ends in `…`.
+fn cut_line(line: &Line, width: usize) -> (Line, usize) {
     let mut out: Line = Vec::with_capacity(line.len() + 1);
     let mut used = 0;
-    for (style, text) in line {
+    for (index, (style, text)) in line.iter().enumerate() {
         if used >= width {
             break;
         }
@@ -710,6 +766,7 @@ fn fit_line(line: &Line, width: usize) -> Line {
             out.push((*style, text.clone()));
             used += shown;
         } else {
+            // Blanks alone are just cut.
             let mut cut = String::new();
             let mut taken = 0;
             for c in text.chars() {
@@ -720,14 +777,22 @@ fn fit_line(line: &Line, width: usize) -> Line {
                 taken += w;
                 cut.push(c);
             }
+            let rest = &text[cut.len()..];
+            let more = !rest.trim().is_empty() || line[index + 1..].iter().any(|(style, text)| *style != Style::Raw && !text.trim().is_empty());
+            if more && !cut.trim().is_empty() {
+                while taken + 1 > room {
+                    let Some(last) = cut.pop() else { break };
+                    taken -= last.width().unwrap_or(0);
+                }
+                cut.push('…');
+                taken += 1;
+            }
             out.push((*style, cut));
             used += taken;
+            break;
         }
     }
-    if used < width {
-        out.push((Style::Plain, " ".repeat(width - used)));
-    }
-    out
+    (out, used)
 }
 
 /// Go to `target`: a tab opens (covering the agent's display) or the open one
@@ -864,6 +929,69 @@ pub fn history(display: &ActiveDisplay, idle_prompt: Option<(&str, usize)>, back
     draw(&mut open, display)
 }
 
+/// The left button on the agent's page, off its tab bar: where it went down,
+/// and where the mouse is since. A drag from there selects text
+/// (`select_from_page`).
+type Press = Option<((u16, u16), (u16, u16))>;
+static PAGE_PRESS: Mutex<Press> = Mutex::new(None);
+
+fn page_press_lock() -> MutexGuard<'static, Press> {
+    PAGE_PRESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The button went down on the page at `at` (column, row), or came up (`None`).
+pub fn page_press(at: Option<(u16, u16)>) {
+    *page_press_lock() = at.map(|at| (at, at));
+}
+
+/// The mouse moved to `at` with the button held; whether a press on the page
+/// is being dragged.
+pub fn page_dragged(at: (u16, u16)) -> bool {
+    match page_press_lock().as_mut() {
+        Some((_, mouse)) => {
+            *mouse = at;
+            true
+        }
+        None => false,
+    }
+}
+
+/// A drag on the agent's page: its conversation in `View::History`, each row
+/// where the page had it, and the text selected from where the button went
+/// down (`select_event` takes the rest of the drag, and copies on release).
+pub fn select_from_page(display: &ActiveDisplay, idle_prompt: Option<(&str, usize)>) -> io::Result<Outcome> {
+    let Some(((column, row), mouse)) = page_press_lock().take() else {
+        return Ok(Outcome::Stay);
+    };
+    let mut open = lock();
+    if open.is_some() {
+        return Ok(Outcome::Stay);
+    }
+    let (columns, rows) = crossterm::terminal::size()?;
+    let top = crate::page::top_rows() as usize;
+    // The rows the conversation has on the page: down to the idle prompt,
+    // or to the turn's pane.
+    let prompt_row = idle_prompt.and_then(|(draft, cursor)| display.idle_prompt_row(draft, cursor));
+    let shown = match prompt_row {
+        Some(prompt) => (prompt as usize).saturating_sub(top),
+        None => display.page_rows(rows),
+    }
+    .clamp(1, (rows as usize).saturating_sub(top + 1).max(1));
+    let Some(pressed) = (row as usize).checked_sub(top).filter(|row| *row < shown) else {
+        return Ok(Outcome::Stay);
+    };
+    let mut tab = Open::new(View::History);
+    history_rows(&mut tab, display, columns as usize)?;
+    tab.lift = (rows as usize).saturating_sub(top + 1 + shown);
+    tab.lift_idle = prompt_row.is_some();
+    let mut selection = select_view::Selection::new((pressed, column as usize));
+    selection.mouse = ((mouse.1 as usize).saturating_sub(top).min(shown - 1), mouse.0 as usize);
+    tab.selection = Some(selection);
+    display.cover(idle_prompt)?;
+    *open = Some(tab);
+    draw(&mut open, display)
+}
+
 /// Close the tab (both panes, when two are up) without drawing anything
 /// (the caller uncovers).
 pub fn close() {
@@ -883,17 +1011,44 @@ pub fn tick(display: &ActiveDisplay) -> io::Result<()> {
     if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
         return Ok(());
     }
+    crate::freeze::at("a tab: waiting for its lock, to draw");
     let mut open = lock();
     if open.is_none() {
         return Ok(());
     }
+    crate::freeze::at(view_mark(open.as_ref()));
     let mut split = split_lock();
-    draw_any(&mut open, &mut split, display).map(|_| ())
+    let drawn = draw_any(&mut open, &mut split, display).map(|_| ());
+    crate::freeze::at("a tab: drawn");
+    drawn
+}
+
+/// Where a freeze happened, by the tab drawn (`freeze.rs`).
+fn view_mark(open: Option<&Open>) -> &'static str {
+    match open.map(|tab| &tab.view) {
+        Some(View::Board) => "drawing the projects tab (board)",
+        Some(View::Review | View::Verification | View::Deliverables | View::Projects) => "drawing the projects tab",
+        Some(View::Audit) => "drawing the audit tab",
+        Some(View::Subagent(_)) => "drawing a subagent's tab",
+        Some(View::Shell { .. }) => "drawing a shell's tab",
+        Some(View::Memory) => "drawing the memory tab",
+        Some(View::Share) => "drawing the share tab",
+        Some(View::Overview) => "drawing the overview",
+        Some(View::Edit) => "drawing the editor",
+        Some(View::History | View::Page) => "drawing the page",
+        None => "a tab: none open",
+    }
 }
 
 /// A key, a paste or a resize, while a tab is open (or two panes are).
 pub fn event(event: &Event, display: &ActiveDisplay) -> io::Result<Outcome> {
+    crate::freeze::at("a tab: waiting for its lock, for a key");
     let mut open = lock();
+    crate::freeze::at(match open.as_ref().map(|tab| &tab.view) {
+        Some(View::Board | View::Review | View::Verification | View::Deliverables | View::Projects) => "a key in the projects tab",
+        Some(View::Audit) => "a key in the audit tab",
+        _ => "a key in a tab",
+    });
     if open.is_none() {
         return Ok(Outcome::Stay);
     }
@@ -950,7 +1105,10 @@ pub fn event(event: &Event, display: &ActiveDisplay) -> io::Result<Outcome> {
 fn finish(open: &mut MutexGuard<'static, Option<Open>>, split: &mut MutexGuard<'static, Option<Split>>, display: &ActiveDisplay, outcome: Outcome) -> io::Result<Outcome> {
     // Scrolled back down to the end: the page again.
     let outcome = match open.as_ref() {
-        Some(tab) if outcome == Outcome::Stay && tab.view == View::History && tab.back == 0 => Outcome::Closed,
+        // (A selection made from the page stays up until a key or a click.)
+        Some(tab) if outcome == Outcome::Stay && tab.view == View::History && tab.back == 0 && tab.selection.is_none() => {
+            Outcome::Closed
+        }
         _ => outcome,
     };
     match outcome {
@@ -1012,6 +1170,7 @@ fn pane_event(open: &mut Option<Open>, event: &Event, display: &ActiveDisplay) -
                 View::Audit => audit_view::paste(tab, &text),
                 View::Edit => editor_view::paste(tab, &text),
                 View::Review | View::Verification | View::Deliverables => projects_view::paste(tab, &text),
+                View::Projects => projects_tree::paste(&text),
                 view if view.has_prompt() => tab.draft.insert_str(&text),
                 _ => {}
             }
@@ -1022,9 +1181,11 @@ fn pane_event(open: &mut Option<Open>, event: &Event, display: &ActiveDisplay) -
         // Selecting text, in every tab but the editor (it has its own).
         Event::Mouse(mouse) if tab.view != View::Edit && select_event(tab, mouse) => Outcome::Stay,
         Event::Mouse(mouse) if tab.view == View::Edit => {
-            if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Up(_)) {
+            if mouse.kind == MouseEventKind::Moved {
                 return Ok(Outcome::Stay);
             }
+            // The button coming up too: it ends a drag, or the wheel would
+            // go on selecting.
             editor_view::mouse(mouse);
             Outcome::Stay
         }
@@ -1034,7 +1195,7 @@ fn pane_event(open: &mut Option<Open>, event: &Event, display: &ActiveDisplay) -
                 MouseEventKind::ScrollDown => false,
                 _ => return Ok(Outcome::Stay),
             };
-            wheel_view(tab, up, (mouse.row as usize).saturating_sub(body_top()));
+            wheel_view(tab, up, (mouse.row as usize).saturating_sub(body_top()), mouse.column as usize);
             Outcome::Stay
         }
         Event::Resize(..) => {
@@ -1225,29 +1386,35 @@ fn pick_one(tab: &mut Open, pick: gui_view::Pick) {
         }
         gui_view::Pick::AuditSection(index) => audit_view::pick_section(tab, index),
         gui_view::Pick::AuditRow(index) => audit_view::pick(tab, index),
-        gui_view::Pick::AuditFile(file) => audit_view::pick_file(tab, &file),
         gui_view::Pick::ClaimPane(index) => claim_view::pick_pane(tab, index),
         gui_view::Pick::Clause(k) => claim_view::pick_clause(tab, k),
         gui_view::Pick::CodeLine(line) => claim_view::pick_line(tab, line),
+        gui_view::Pick::Preview(part, at) => audit_view::pick_preview(tab, part, at),
         gui_view::Pick::ClaimBoard => audit_view::to_board(tab),
         gui_view::Pick::OpenAudit(audit, claim) => {
             let _ = go_to(tab, Target::View(View::Audit));
             audit_view::open_at(tab, &audit, claim.as_deref());
         }
+        gui_view::Pick::ProjectsRow(index) => projects_tree::pick_tree_row(index),
+        gui_view::Pick::ProjectsMove(index) => projects_tree::pick_move(index),
     }
 }
 
 /// A turn of the wheel over body row `row` of a tab. The board and the
 /// share tab, and the other lists: the wheel walks the list, or scrolls the
 /// strip under it, by where it is turned; the rest scroll back.
-fn wheel_view(tab: &mut Open, up: bool, row: usize) {
+fn wheel_view(tab: &mut Open, up: bool, row: usize, column: usize) {
     if tab.view == View::Audit {
         tab.audit.armed = None;
         if tab.audit.view.is_some() {
             claim_view::wheel(tab, up);
         } else {
-            audit_view::wheel(tab, up);
+            audit_view::wheel(tab, up, column);
         }
+        return;
+    }
+    if tab.view == View::Projects {
+        projects_tree::wheel(up, row, column);
         return;
     }
     if !matches!(tab.view, View::Board | View::Share | View::Review | View::Verification | View::Deliverables | View::Memory | View::Overview) {
@@ -1308,7 +1475,7 @@ fn select_event(tab: &mut Open, mouse: &crossterm::event::MouseEvent) -> bool {
                 _ => None,
             };
             if let Some(up) = edge {
-                wheel_view(tab, up, on);
+                wheel_view(tab, up, on, column);
                 if let Some(selection) = tab.selection.as_mut() {
                     selection.scrolled(if up { -(WHEEL_ROWS as isize) } else { WHEEL_ROWS as isize });
                 }
@@ -1317,7 +1484,7 @@ fn select_event(tab: &mut Open, mouse: &crossterm::event::MouseEvent) -> bool {
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if dragging => {
             let up = mouse.kind == MouseEventKind::ScrollUp;
-            wheel_view(tab, up, row.unwrap_or(0));
+            wheel_view(tab, up, row.unwrap_or(0), column);
             if let Some(selection) = tab.selection.as_mut() {
                 selection.scrolled(if up { -(WHEEL_ROWS as isize) } else { WHEEL_ROWS as isize });
             }
@@ -1353,8 +1520,37 @@ fn wheel(tab: &mut Open, kind: MouseEventKind) -> bool {
 }
 
 fn key_event(tab: &mut Open, key: &KeyEvent, display: &ActiveDisplay) -> io::Result<Outcome> {
+    let outcome = view_key(tab, key, display)?;
+    Ok(projects_tree::closed(tab, key, outcome))
+}
+
+fn view_key(tab: &mut Open, key: &KeyEvent, display: &ActiveDisplay) -> io::Result<Outcome> {
+    // Typed over a selection made on the page: the page again, and the
+    // character in its prompt.
+    if tab.view == View::History
+        && tab.back == 0
+        && tab.selection.is_some()
+        && let KeyCode::Char(c) = key.code
+        && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        *page_draft() = Some(c.to_string());
+        return Ok(Outcome::Closed);
+    }
+    // Ctrl+C (or Ctrl+Shift+C, where the terminal passes it on) over a
+    // selection copies it again; it interrupts nothing.
+    if matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && tab.view != View::Edit
+        && let Some(text) = tab.selection.as_ref().filter(|selection| !selection.dragging).and_then(|selection| selection.text())
+    {
+        let said = crate::clipboard::copy(&text);
+        tab.tell(said.trim_start_matches("[copy] ").replacen(" via ", " copied via ", 1));
+        // Put away, so the next Ctrl+C is the view's own.
+        tab.selection = None;
+        return Ok(Outcome::Stay);
+    }
     // A key puts away a selection made with the mouse.
-    tab.selection = None;
     tab.disarm_if_stale(Instant::now());
     // A right-click's menu takes the keys while it is open: ↑↓ choose, Enter
     // does it, anything else closes it.
@@ -1414,16 +1610,12 @@ fn key_event(tab: &mut Open, key: &KeyEvent, display: &ActiveDisplay) -> io::Res
         let to = if key.code == KeyCode::BackTab { projects_view::previous(&tab.view) } else { projects_view::next(&tab.view) };
         return Ok(go_to(tab, Target::View(to)));
     }
-    // Over `s0ma connect`, a tab that reads the server's files has nothing
-    // to act on yet: Esc closes it, Ctrl+C and Ctrl+D do as anywhere, and
-    // the other keys do nothing.
-    if server_only(&tab.view) {
-        return Ok(match key.code {
-            KeyCode::Esc | KeyCode::Char('q') if !ctrl && !alt => Outcome::Closed,
-            KeyCode::Char('c' | 'C') if ctrl => Outcome::Interrupt,
-            KeyCode::Char('d' | 'D') if ctrl => Outcome::Eof,
-            _ => Outcome::Stay,
-        });
+    // A board or audit opened from the projects tree: Esc goes back to it.
+    if let Some(outcome) = projects_tree::intercept(tab, key) {
+        return Ok(outcome);
+    }
+    if tab.view == View::Projects {
+        return Ok(projects_tree::key(tab, key));
     }
     if matches!(tab.view, View::Review | View::Verification | View::Deliverables) {
         return Ok(projects_view::key(tab, key, page));
@@ -1488,6 +1680,7 @@ fn key_event(tab: &mut Open, key: &KeyEvent, display: &ActiveDisplay) -> io::Res
         View::Overview => Ok(overview_view::key(tab, key)),
         View::Audit => Ok(audit_view::key(tab, key)),
         View::Review | View::Verification | View::Deliverables => Ok(projects_view::key(tab, key, page)),
+        View::Projects => Ok(projects_tree::key(tab, key)),
         View::Edit => Ok(editor_view::key(tab, key, page)),
     }
 }
@@ -1594,18 +1787,16 @@ fn shell_key(tab: &mut Open, key: &KeyEvent) -> Outcome {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     // Ctrl+Q twice: the shell closed, and back to the page. The first says
     // what closing it would cut short, when something runs in it.
-    // An audit's shell stays until the audit ends: Ctrl+Q is refused while a
-    // command runs in it, and otherwise closes the tab only.
+    // An audit's shell closes as any other (it opens again when the audit
+    // needs it), but not under a check the audit is running in it.
     if ctrl
         && !alt
         && matches!(key.code, KeyCode::Char('q' | 'Q'))
-        && let Some(audit) = crate::vm::netboxes::name_of(session).and_then(|name| name.strip_prefix("audit-").map(str::to_string))
+        && let Some(name) = crate::vm::netboxes::name_of(session)
+        && crate::audit::run::shell_running(name)
     {
-        if crate::audit::run::running(&audit) || crate::vm::terms::netboxes().into_iter().any(|n| n.name == format!("audit-{audit}") && n.busy().is_some()) {
-            tab.note(format!("refused: a command runs in audit·{audit} (Ctrl+C interrupts it, z in Alt+U pauses the audit)"), true);
-            return Outcome::Stay;
-        }
-        return Outcome::Closed;
+        tab.note(format!("refused: {}", crate::audit::run::SHELL_RUNNING), true);
+        return Outcome::Stay;
     }
     if ctrl && !alt && matches!(key.code, KeyCode::Char('q' | 'Q')) && crate::vm::netboxes::name_of(session).is_some() {
         let session = session.clone();
@@ -1838,7 +2029,7 @@ fn submit(tab: &mut Open, _display: &ActiveDisplay) {
     }
     match tab.view {
         View::Shell { .. } | View::History | View::Memory | View::Share | View::Overview | View::Audit | View::Edit | View::Page => {}
-        View::Review | View::Verification | View::Deliverables => {}
+        View::Review | View::Verification | View::Deliverables | View::Projects => {}
         View::Subagent(number) => {
             let Some(worker) = subagent_at(number) else {
                 tab.note("no subagent here to send it to", true);
@@ -2207,10 +2398,20 @@ fn text_width(text: &str) -> usize {
 }
 
 fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if text_width(text) <= max {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    // By columns, not characters: a wide character takes two.
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
     out.truncate(out.trim_end().len());
     out.push('…');
     out
@@ -2238,6 +2439,50 @@ fn span(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row wider than the screen ends in `…`; blanks past the edge are
+    /// just cut, and a wide character never straddles it.
+    #[test]
+    fn a_cut_row_says_it_goes_on() {
+        let text = |line: &Line| line.iter().map(|(_, text)| text.as_str()).collect::<String>();
+        let (cut, used) = cut_line(&vec![(Style::Plain, "  a long path ".into()), (Style::Dim, "and more".into())], 10);
+        assert_eq!((text(&cut).as_str(), used), ("  a long …", 10));
+        let (cut, used) = cut_line(&vec![(Style::Plain, "name".into()), (Style::Plain, "        ".into())], 6);
+        assert_eq!((text(&cut).as_str(), used), ("name  ", 6));
+        let (cut, used) = cut_line(&vec![(Style::Plain, "日本語の".into())], 5);
+        assert_eq!((text(&cut).as_str(), used), ("日本…", 5));
+        assert_eq!(clip("日本語の文章", 7), "日本語…");
+    }
+
+    /// The bar's pipe stays in one column on every row, however narrow, and
+    /// no row is wider than the bar.
+    #[test]
+    fn the_tab_bar_keeps_its_halves() {
+        for width in [20, 29, 40, 60, 100] {
+            let bar = tab_bar(None, None, width);
+            let pipes: Vec<usize> = bar
+                .iter()
+                .map(|line| {
+                    let row: String = line.iter().map(|(_, text)| text.as_str()).collect();
+                    text_width(&row[..row.find('│').expect("a pipe")])
+                })
+                .collect();
+            assert!(pipes.iter().all(|at| *at == pipes[0]), "{width}: {pipes:?}");
+            for line in &bar {
+                assert!(line.iter().map(|(_, text)| text_width(text)).sum::<usize>() <= width, "{width}");
+            }
+        }
+    }
+
+    /// A footer too narrow for all its buttons keeps the way out.
+    #[test]
+    fn a_narrow_footer_keeps_back() {
+        let hints = [("v", "view"), ("e", "edit"), ("n", "new"), ("f", "folder"), ("esc", "back")];
+        let (line, _) = gui_view::footer(vec![(Style::Status, "share".into())], &hints, 30);
+        let row: String = line.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(row.contains("Back") && row.contains("View") && !row.contains("Folder"), "{row}");
+        assert!(text_width(&row) <= 30, "{row}");
+    }
 
     #[test]
     fn ctrl_q_closes_a_finished_subagents_tab() {

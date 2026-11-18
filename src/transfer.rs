@@ -149,6 +149,12 @@ fn clear_stale_partials(folder: &Path) {
 /// so its parts go to one file beside `name`, which takes its place, under a
 /// free name, at `done`. What it landed as, in the share, or `""` before.
 pub fn write_part(root: &Path, upload: &str, name: &str, offset: u64, data: &str, done: bool) -> Result<String, String> {
+    write_part_saying(root, upload, name, offset, data, done, true)
+}
+
+/// `write_part`, saying it on the status line or not (`s0ma connect`'s side
+/// of the file link has no page to say it on: ssh draws the screen).
+pub fn write_part_saying(root: &Path, upload: &str, name: &str, offset: u64, data: &str, done: bool, say: bool) -> Result<String, String> {
     if upload.len() < 8 || upload.len() > 64 || !upload.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("a bad upload id".into());
     }
@@ -187,18 +193,20 @@ pub fn write_part(root: &Path, upload: &str, name: &str, offset: u64, data: &str
         let _ = std::fs::remove_file(&partial);
         format!("{name}: {error}")
     })?;
-    crate::terminal::say_status(&format!(
-        "[share] uploaded {} ({})",
-        landed.strip_prefix(root).unwrap_or(&landed).display(),
-        crate::share::human_size(offset + bytes.len() as u64)
-    ));
+    if say {
+        crate::terminal::say_status(&format!(
+            "[share] uploaded {} ({})",
+            landed.strip_prefix(root).unwrap_or(&landed).display(),
+            crate::share::human_size(offset + bytes.len() as u64)
+        ));
+    }
     Ok(landed.strip_prefix(root).unwrap_or(&landed).to_string_lossy().into_owned())
 }
 
 // --------------------------------------------------------------- a terminal
 
 /// Words of a command line, `"…"` and `'…'` keeping spaces in a path.
-fn words(text: &str) -> Vec<String> {
+pub(crate) fn words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;

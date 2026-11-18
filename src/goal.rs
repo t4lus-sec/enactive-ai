@@ -1160,12 +1160,12 @@ pub fn forget_job(job: &str) -> Result<Forgotten> {
     kept.touched_by.retain(|touched| touched != job);
     let scrubbed = kept.note.is_some() || kept.hold.is_some();
     if kept.note.is_some() {
-        kept.note = Some(crate::jobs::marker(job));
+        kept.note = Some(crate::jobs::MARKER.to_string());
     }
     // What the agent said it waited for, in its words, from the job's context.
     kept.hold = kept.hold.map(|hold| match hold {
-        Hold::Operator(_) => Hold::Operator(crate::jobs::marker(job)),
-        Hold::Event(_) => Hold::Event(crate::jobs::marker(job)),
+        Hold::Operator(_) => Hold::Operator(crate::jobs::MARKER.to_string()),
+        Hold::Event(_) => Hold::Event(crate::jobs::MARKER.to_string()),
     });
     store_closing(Some(&kept), Some(job))?;
     Ok(Forgotten { removed: false, scrubbed, typed: None })
@@ -2022,10 +2022,10 @@ mod tests {
         init(&fixture.dir);
         let forgotten = forget_job("acme").unwrap();
         assert!(!forgotten.removed && forgotten.scrubbed && forgotten.typed.is_none());
-        assert_eq!(current().unwrap().hold, Some(Hold::Operator(crate::jobs::marker("acme"))), "still waiting, in no words of the job's");
+        assert_eq!(current().unwrap().hold, Some(Hold::Operator(crate::jobs::MARKER.to_string())), "still waiting, in no words of the job's");
         let kept = current().unwrap();
         assert_eq!(kept.objective, "fix acme's deploy", "set before the job, so not the job's");
-        assert_eq!(kept.note.as_deref(), Some(crate::jobs::marker("acme").as_str()));
+        assert_eq!(kept.note.as_deref(), Some(crate::jobs::MARKER));
         assert!(!kept.touched_by.contains(&"acme".to_string()));
     }
 }

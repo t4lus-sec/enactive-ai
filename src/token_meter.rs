@@ -371,6 +371,7 @@ mod decode_only {
     /// One generation: a prefill gap, then `chunks` chunks `chunk_ms` apart
     /// carrying `per_chunk` tokens each (and their text), then the closing
     /// report. Returns the rate the corner would keep afterwards.
+    #[allow(clippy::too_many_arguments)]
     fn generation(
         meter: &mut TokenMeter,
         base: Instant,

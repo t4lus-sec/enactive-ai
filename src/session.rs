@@ -27,15 +27,17 @@
 //!
 //! # From another machine
 //!
-//! `s0ma connect <ssh target>` runs `s0ma --bridge` there over SSH: the
-//! bridge joins that the agent's socket and passes the protocol through SSH's
-//! input and output, so a terminal on the operator's own machine attaches
-//! as one on the server would, through whatever carries SSH (the LAN, a
-//! VPN, a tailnet). Nothing listens on the network that SSH doesn't. Over
-//! such a connection the terminal also moves files: `/download <file in
-//! the share>` saves it on this machine, `/upload <path>` puts a file of
-//! this machine into the share (`transfer`). The tabs that read the
-//! server's own files say they aren't there yet (`is_remote`).
+//! `s0ma connect <ssh target>` runs s0ma's own terminal on the server over
+//! `ssh -t` (`s0ma --laptop <socket>`, `connect`): an attached terminal
+//! there, so every tab is the one a terminal on that machine shows, the
+//! same code reading the same files. SSH also forwards a socket from the
+//! server back to the operator's computer (`-R`): the file link
+//! (`laptop.rs`), over which the share tab's `a` and `s`, `/upload` and
+//! `/download` move files and folders between the two. Nothing listens on
+//! the network that SSH doesn't.
+//!
+//! `s0ma --bridge` (the far end of the `connect` before this) still passes
+//! the protocol through SSH for an older client.
 
 use crate::input::{ExternalSubmitter, InputEvent, InputReader, Steered};
 use crate::markdown::MarkdownStream;
@@ -198,6 +200,63 @@ enum Occupant {
     Unresponsive(u32),
     /// Nothing there.
     Absent,
+}
+
+/// The primary's settings from its environment, for a terminal attaching
+/// to it: the paths and machine it works with (its share and mirror, the
+/// projects folder in it, how it reaches the machine). A terminal started
+/// another way (over `s0ma connect`'s ssh, say) has none of them, and its
+/// tabs read other folders.
+const ENVIRONMENT: &str = "primary-env.json";
+
+/// Kept as this terminal's own: how it draws and where its downloads go.
+const OWN: [&str; 6] = ["S0MA_KEYBOARD_PROTOCOL", "S0MA_NOTIFY", "S0MA_DOWNLOAD_DIR", "S0MA_LAPTOP_HOME", "S0MA_REMOTE_COMMAND", "S0MA_COLOR"];
+
+fn carried(key: &str) -> bool {
+    (key.starts_with("S0MA_") && !OWN.contains(&key)) || key == "PATH"
+}
+
+/// The primary's: written as it starts (only its user may read it: it can
+/// hold a key).
+pub fn record_environment(data_dir: &Path) {
+    let values: std::collections::BTreeMap<String, String> = std::env::vars().filter(|(key, _)| carried(key)).collect();
+    let Ok(text) = serde_json::to_string_pretty(&values) else { return };
+    let path = data_dir.join(ENVIRONMENT);
+    let aside = data_dir.join(format!(".{ENVIRONMENT}.tmp"));
+    use std::os::unix::fs::OpenOptionsExt;
+    let written = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&aside).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+    });
+    if written.is_ok() {
+        let _ = std::fs::rename(&aside, &path);
+    }
+}
+
+/// A terminal about to attach: the running primary's settings taken as its
+/// own, those it lacks, those that differ and those only it has (its own
+/// drawing kept). Before any thread starts.
+pub fn take_environment(data_dir: &Path) {
+    // Whether one runs, by its pid: connecting to ask would be an attach
+    // the primary greets and finds gone (see `Occupant::Running`).
+    if !socket_path(data_dir).exists() || !recorded_owner(data_dir).is_some_and(process_alive) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(data_dir.join(ENVIRONMENT)) else { return };
+    let Ok(values) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text) else { return };
+    let only_here: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| key != "PATH" && carried(key) && !values.contains_key(key))
+        .collect();
+    // SAFETY (both): main calls this before it starts any thread.
+    for key in only_here {
+        unsafe { std::env::remove_var(&key) };
+    }
+    for (key, value) in values {
+        if carried(&key) && std::env::var(&key).ok().as_deref() != Some(value.as_str()) {
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
 }
 
 fn probe(data_dir: &Path) -> Occupant {
@@ -540,25 +599,15 @@ pub fn attach_if_running(data_dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Whether this terminal is attached from another machine (`connect`): the
-/// tabs that read the server's own files can't, here.
-static REMOTE: AtomicBool = AtomicBool::new(false);
-
-pub fn is_remote() -> bool {
-    REMOTE.load(Ordering::Relaxed)
-}
-
-/// A connection to the primary, whatever carries it: the socket, or SSH.
+/// A connection to the primary.
 struct Connection {
     reader: TimedReader,
     writer: Box<dyn Write + Send>,
-    /// Ends the connection (shuts the socket, or stops ssh).
+    /// Ends the connection (shuts the socket).
     close: Box<dyn FnOnce() + Send>,
 }
 
-/// The reading side, with a way to bound one read (the snapshot) when the
-/// transport can: a socket can; SSH's output is bounded by `connect`'s own
-/// wait instead.
+/// The reading side, with a way to bound one read (the snapshot).
 struct TimedReader {
     reader: Box<dyn BufRead + Send>,
     within: Box<dyn Fn(Option<Duration>) + Send>,
@@ -570,80 +619,35 @@ impl TimedReader {
     }
 }
 
-/// A connection to an agent on another machine, greeted, before its page.
-pub struct Remote {
-    child: std::process::Child,
-    reader: BufReader<std::process::ChildStdout>,
-    stdin: std::process::ChildStdin,
+/// `s0ma connect <target>`: s0ma's terminal on the server over `ssh -t`,
+/// with the file link forwarded back to this computer. The exit code ssh
+/// ended with.
+pub fn connect(target: &str, remote: &str) -> Result<i32> {
+    let tag = {
+        let mut bytes = [0u8; 8];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes));
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    // Named apart from the far end's, which may be on this same machine.
+    let local = std::env::temp_dir().join(format!("s0ma-link-{tag}.sock"));
+    let there = format!("/tmp/s0ma-laptop-{tag}.sock");
+    crate::laptop::serve(&local).map_err(|error| format!("the file link could not start here: {error}"))?;
+    eprintln!("[connect] {target}: starting {remote} over ssh…");
+    let status = std::process::Command::new("ssh")
+        .args(["-t", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"])
+        .arg("-R")
+        .arg(format!("{there}:{}", local.display()))
+        .args(["--", target])
+        .arg(format!("{remote} --laptop {there}"))
+        .status()
+        .map_err(|error| format!("ssh could not start: {error}"));
+    let _ = std::fs::remove_file(&local);
+    Ok(status?.code().unwrap_or(1))
 }
 
-/// `s0ma connect <target>`, first half: SSH to the server, run the bridge
-/// there, and take its greeting. Before the page, so ssh can ask for a
-/// password or a host key on the shell's own screen. `remote`: the command
-/// that runs the agent there (`s0ma` on its PATH by default).
-pub fn open_remote(target: &str, remote: &str) -> Result<Remote> {
-    use std::process::{Command, Stdio};
-    eprintln!("[connect] {target}: starting {remote} --bridge over ssh…");
-    let mut child = Command::new("ssh")
-        .args(["-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", "--", target])
-        .arg(format!("{remote} --bridge"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Its own messages (a host key to accept, a password) reach the
-        // operator as they would from ssh itself.
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("ssh could not start: {error}"))?;
-    let stdin = child.stdin.take().ok_or("ssh gave no input")?;
-    let stdout = child.stdout.take().ok_or("ssh gave no output")?;
-    let mut reader = BufReader::new(stdout);
-    let mut greeting = String::new();
-    // ssh may ask for a password first: no time limit here, ssh has its own.
-    let read = reader.read_line(&mut greeting);
-    if read.is_err() || greeting.trim_end() != HELLO {
-        let _ = child.kill();
-        let status = child.wait().ok();
-        let said = greeting.trim();
-        return Err(match (read, said.is_empty()) {
-            (Err(error), _) => format!("nothing came back from {target} ({error})"),
-            (Ok(_), true) => format!(
-                "{target} closed the connection{}: is s0ma running there, and is `{remote}` the command that runs it? \
-                 (`--remote <command>` names another)",
-                status.and_then(|s| s.code()).map(|c| format!(" (ssh exit {c})")).unwrap_or_default()
-            ),
-            (Ok(_), false) => format!("{target} answered {said:?}, not s0ma: is `{remote}` the command that runs it?"),
-        }
-        .into());
-    }
-    Ok(Remote { child, reader, stdin })
-}
-
-/// `s0ma connect <target>`, second half: the terminal, until detached.
-pub fn attach_remote(data_dir: &Path, remote: Remote) -> Result<()> {
-    let Remote { child, reader, stdin } = remote;
-    REMOTE.store(true, Ordering::Relaxed);
-    let child = Arc::new(Mutex::new(child));
-    let stopper = Arc::clone(&child);
-    let result = Terminal::run(
-        data_dir,
-        Connection {
-            reader: TimedReader::new(reader, Box::new(|_| {})),
-            writer: Box::new(stdin),
-            close: Box::new(move || {
-                let mut child = crate::util::locked(&stopper);
-                let _ = child.kill();
-                let _ = child.wait();
-            }),
-        },
-    );
-    let mut child = crate::util::locked(&child);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
-}
-
-/// `s0ma --bridge`: the far end of `connect`. Joins the agent running here
-/// and passes its protocol through this process's input and output.
+/// `s0ma --bridge`: the far end of an older client's `connect`. Joins the
+/// agent running here and passes its protocol through this process's input
+/// and output.
 pub fn bridge(data_dir: &Path) -> Result<()> {
     let stream = match probe(data_dir) {
         Occupant::Running(stream) => stream,
@@ -775,11 +779,12 @@ impl Terminal {
 
         let input = InputReader::spawn(Arc::clone(&interrupt), data_dir.join("input_history.txt"))?;
         let display = input.active_display();
-        // From another machine, the server's files aren't here to read.
-        if !is_remote() {
-            crate::tabs::init(&data_dir.join("hippocampus.jsonl"));
-            crate::mistakes::open_for_view(data_dir);
-        }
+        crate::tabs::init(&data_dir.join("hippocampus.jsonl"));
+        crate::projects::init_attached(&data_dir.join("hippocampus.jsonl"));
+        // The stores' paths, so the tabs can read them and a board made
+        // here (the projects tab's n b) is made; the primary does the work.
+        crate::audit::init_attached(&data_dir.join("hippocampus.jsonl"));
+        crate::mistakes::open_for_view(data_dir);
 
         let writer = Arc::new(Mutex::new(stream));
         let requests = Arc::new(Requests::default());
@@ -927,7 +932,14 @@ impl Terminal {
                     let start = crate::terminal::cursor_row();
                     let _defer = ClearOfPrompt(start);
                     self.display.apply(Mirrored::Entry(crate::terminal::operator_entry(&text)))?;
-                    let said = if self.features.iter().any(|f| f == "transfer") {
+                    // Started by `s0ma connect`: between the share and the
+                    // operator's computer, over the file link.
+                    let said = if crate::laptop::linked() {
+                        let display = self.display.clone();
+                        crate::laptop::command(&text, &mut |line| {
+                            let _ = display.transient(Some(&line));
+                        })
+                    } else if self.features.iter().any(|f| f == "transfer") {
                         let (writer, requests) = (Arc::clone(&self.writer), Arc::clone(&self.requests));
                         let display = self.display.clone();
                         crate::transfer::run_command(&text, &mut |request| match request {

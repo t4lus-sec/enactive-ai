@@ -267,9 +267,31 @@ pub fn decline(store: &AuditStore, name: &str, why: &str) -> Reply {
 
 // ------------------------------------------------------------------ the operator's controls
 
-/// The operator's change to a claim, by key. Each is logged.
+/// The operator's change to a claim, by key. Each is logged. `id` may name
+/// one of its checks (`c3/k2`): send back is then that check's.
 pub fn operator_claim(store: &AuditStore, audit: &str, id: &str, action: &str, text: &str) -> Reply {
+    let (id, slot) = match id.split_once('/') {
+        Some((claim, slot)) => (claim, Some(slot)),
+        None => (id, None),
+    };
     let a = store.audit(audit).map_err(err)?.ok_or(format!("no audit {audit}"))?;
+    let in_force = store.current_checks(audit, id).map_err(err)?;
+    let all = store.checks(audit, id).map_err(err)?;
+    // The deepest check it has now, for a deeper one asked for (`depth`).
+    let deepest = in_force.iter().map(|c| (c.kind.clone(), Level::of_kind(&c.kind))).max_by_key(|(_, level)| *level);
+    // The check a send-back or a rewording is for: the one named, else the
+    // one the claim's line speaks for.
+    let target = slot.map(str::to_string).or_else(|| audit::lead(&in_force).map(|c| c.slot().to_string()));
+    if action == "back"
+        && let Some(target) = &target
+    {
+        // Its result no longer counts; the claim reads from the others.
+        if let Some(mut check) = in_force.iter().find(|c| c.slot() == target).cloned() {
+            check.verdict = Verdict::Unchecked;
+            store.put_check(audit, &check).map_err(err)?;
+        }
+    }
+    let rolled = audit::roll_up(&store.current_checks(audit, id).map_err(err)?);
     let said = store
         .change_claim(audit, id, |claim| {
             Ok(match action {
@@ -295,6 +317,12 @@ pub fn operator_claim(store: &AuditStore, audit: &str, id: &str, action: &str, t
                     claim.text = audit::clip_text(text);
                     claim.author = "operator".into();
                     claim.review = Review::Accepted;
+                    // Its check was written for the old words: a worker
+                    // writes it again.
+                    claim.verdict = Verdict::Unchecked;
+                    claim.level = Level::Documented;
+                    claim.steer = Some("the operator reworded the claim: the check must fit the new wording".into());
+                    claim.steer_check = target.clone();
                     format!("reworded {id}: his wording is final")
                 }
                 "pick" => {
@@ -319,9 +347,12 @@ pub fn operator_claim(store: &AuditStore, audit: &str, id: &str, action: &str, t
                 }
                 "back" => {
                     claim.weaker = None;
-                    claim.verdict = Verdict::Unchecked;
-                    claim.level = Level::Documented;
-                    format!("sent {id}'s check back: {text}")
+                    (claim.verdict, claim.level) = rolled;
+                    // A worker writes it again, with the reason.
+                    let which = target.clone().unwrap_or_else(|| "k1".into());
+                    claim.steer = Some(format!("the operator sent the check {which} back: {text}"));
+                    claim.steer_check = Some(which.clone());
+                    format!("sent {id}'s check {which} back: {text}")
                 }
                 "take" => {
                     claim.taken = !claim.taken;
@@ -339,6 +370,11 @@ pub fn operator_claim(store: &AuditStore, audit: &str, id: &str, action: &str, t
                     claim.pinned = !claim.pinned;
                     format!("{} {id}", if claim.pinned { "pinned" } else { "unpinned" })
                 }
+                "skip" if claim.blocked.is_some() => {
+                    claim.blocked = None;
+                    claim.blocked_on = None;
+                    format!("unblocked {id}: it is tried again")
+                }
                 "skip" => {
                     claim.skipped = !claim.skipped;
                     format!("{} {id}", if claim.skipped { "skipped" } else { "unskipped" })
@@ -353,7 +389,17 @@ pub fn operator_claim(store: &AuditStore, audit: &str, id: &str, action: &str, t
                     let now = claim.depth.unwrap_or(Level::of_kind(&claim.tool));
                     let next = now.deeper(a.settings.depth.unwrap_or(ceiling).min(ceiling), a.settings.allows("tla"));
                     claim.depth = Some(next);
-                    format!("{id} at depth {}", next.label())
+                    // Checked already, less deeply: a worker adds a deeper
+                    // check beside the ones it has, which stand as they are.
+                    match &deepest {
+                        Some((kind, level)) if *level < next && !claim.taken => {
+                            let slot = audit::next_slot(&all);
+                            claim.steer = Some(format!("the operator asked for a deeper check, {} (its deepest now is a {kind} check)", next.label()));
+                            claim.steer_check = Some(slot.clone());
+                            format!("{id} at depth {}: a worker adds {slot}, a {} check", next.label(), next.label())
+                        }
+                        _ => format!("{id} at depth {}", next.label()),
+                    }
                 }
                 "post" => {
                     if claim.posted != Posted::Ready {
@@ -377,11 +423,24 @@ pub fn operator_claim(store: &AuditStore, audit: &str, id: &str, action: &str, t
         })
         .map_err(err)??;
     store.log(audit, Who::Operator, &said, text).map_err(err)?;
+    // A check to write again (sent back, reworded, deepened) reopens an
+    // audit that was done: the scheduler serves only open ones.
+    if matches!(action, "edit" | "back" | "depth") && store.claim(audit, id).map_err(err)?.is_some_and(|c| c.steer.is_some()) {
+        store
+            .change(audit, |a| {
+                if a.status == Status::Done {
+                    a.status = Status::Checking;
+                }
+                Ok(())
+            })
+            .map_err(err)??;
+        crate::audit::run::wake();
+    }
     // What the agent needs to hear, now or with his next message.
     match action {
-        "edit" => needs_s0ma(format!("· {audit}/{id}: the operator reworded it — re-formalize: \"{}\"", crate::util::clip(text, 200))),
+        "edit" => note(format!("{audit}/{id}: the operator reworded it (a worker rewrites its check): \"{}\"", crate::util::clip(text, 200))),
         "pick" => needs_s0ma(format!("· {audit}/{id}: the operator answered its question ({said})")),
-        "back" => needs_s0ma(format!("· {audit}/{id}: the operator sent its check back: {text}")),
+        "back" => note(format!("{audit}/{id}: the operator sent its check back (a worker rewrites it): {text}")),
         "steer" => note(format!("{audit}/{id}: a direction for its worker: {text}")),
         "post" => {
             post_result(store, audit, id, true).map_err(err)?;
@@ -449,6 +508,73 @@ pub fn stop(store: &AuditStore, name: &str) -> Reply {
     Ok(format!("[audit] {name} stopped; its results stay"))
 }
 
+/// The operator archives an audit (`on`) or brings it back. Archived, it
+/// leaves the portfolio, the projects tab and the agent's context, and
+/// anything under way stops first; everything it has is kept.
+pub fn archive(store: &AuditStore, name: &str, on: bool) -> Reply {
+    let audit = store.audit(name).map_err(err)?.ok_or(format!("no audit {name}"))?;
+    if audit.archived == on {
+        return Ok(format!("[audit] {name} is {} already", if on { "archived" } else { "not archived" }));
+    }
+    if !on {
+        store
+            .change(name, |a| {
+                a.archived = false;
+                a.archived_at = None;
+                Ok(())
+            })
+            .map_err(err)??;
+        store.log(name, Who::Operator, "brought it back from the archive", "").map_err(err)?;
+        return Ok(format!("[audit] {name} unarchived"));
+    }
+    let running = matches!(audit.status, Status::Harvesting | Status::Checking);
+    if running {
+        stop(store, name)?;
+    }
+    let stopped = crate::audit::run::stop_workers(name);
+    store
+        .change(name, |a| {
+            if a.status == Status::Proposed {
+                a.status = Status::Declined;
+            }
+            a.archived = true;
+            a.archived_at = Some(audit::now());
+            a.paused = false;
+            Ok(())
+        })
+        .map_err(err)??;
+    crate::audit::run::close_shell(&audit);
+    store.log(name, Who::Operator, "archived it", if stopped.is_empty() { "" } else { "its workers were stopped" }).map_err(err)?;
+    Ok(format!("[audit] {name} archived{}", if running || !stopped.is_empty() { " and stopped" } else { "" }))
+}
+
+/// The operator deletes an audit: its workers stopped, its record gone
+/// from the store, its work tree, its branch and its shared files removed.
+/// Findings it posted stay on their boards. Refused while a batch is on a
+/// command (the audit is stopped, and the batch ends after it).
+pub fn delete(store: &AuditStore, name: &str) -> Reply {
+    let audit = store.audit(name).map_err(err)?.ok_or(format!("no audit {name}"))?;
+    crate::audit::run::stop_workers(name);
+    if crate::audit::run::batch_running(name) {
+        let _ = store.change(name, |a| {
+            a.status = Status::Stopped;
+            Ok(())
+        });
+        return Err(format!("{name} has a check running: it is stopped now and its batch ends after that command; delete it again in a moment"));
+    }
+    if matches!(audit.status, Status::Harvesting | Status::Checking) {
+        close_lead(&audit, "deleted by the operator");
+    }
+    crate::audit::run::close_shell(&audit);
+    let files = crate::audit::run::remove_files(&audit);
+    store.delete_audit(name).map_err(err)?;
+    crate::audit::run::wake();
+    Ok(match files {
+        Ok(_) => format!("[audit] {name} deleted"),
+        Err(error) => format!("[audit] {name} deleted; files left: {error}"),
+    })
+}
+
 /// Its lead on its owner board, closed.
 pub fn close_lead(audit: &Audit, why: &str) {
     let (Some(board), Some(lead), Some(boards)) = (&audit.board, &audit.lead, audit::boards()) else { return };
@@ -462,7 +588,7 @@ pub fn set(store: &AuditStore, name: &str, pairs: &str) -> Reply {
     let changed = store.change(name, |audit| audit.settings.apply(pairs)).map_err(err)??;
     store.log(name, Who::Operator, &format!("set {}", changed.join(" ")), "").map_err(err)?;
     crate::audit::run::wake();
-    Ok(format!("[audit] {name}: {} — from the next check", changed.join(" ")))
+    Ok(format!("[audit] {name}: {}", changed.join(" ")))
 }
 
 pub fn detach(store: &AuditStore, name: &str) -> Reply {
@@ -800,7 +926,7 @@ pub const UPDATE_MARKER: &str = "[audits — update, rendered by the harness]";
 pub fn lines(store: &AuditStore) -> audit::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for audit in store.audits()? {
-        if !audit.status.live() || (audit.standing() && audit.rerun_proposed.is_none() && audit.status == Status::Standing) {
+        if !audit.shown() || (audit.standing() && audit.rerun_proposed.is_none() && audit.status == Status::Standing) {
             continue;
         }
         let claims = store.claims(&audit.name)?;
@@ -888,6 +1014,7 @@ pub const HELP: &str = "usage: /audit [list]\n       \
     /audit attach <name> <board> · /audit detach <name>\n       \
     /audit scope <name> add|remove <spec>\n       \
     /audit keep|letgo <name> · /audit merge <name> <into>\n       \
+    /audit archive|unarchive <name> · /audit delete <name>\n       \
     /audit start-all <dir> · /audit doctor <lang>\n       \
     /audit policy off|ask|auto     (the default for new projects)\n       \
     /board audits <board> off|ask|auto [steps=N depth=L workers=N] · /board gate <board> <audit>";
@@ -948,6 +1075,18 @@ pub fn handle_command(command: &str) -> Option<Reply> {
         }
         ["/audit", "attach", name, board] => attach(&store, name, board, Who::Operator, ""),
         ["/audit", "detach", name] => detach(&store, name),
+        ["/audit", "archive", name] => archive(&store, name, true),
+        ["/audit", "unarchive", name] => archive(&store, name, false),
+        ["/audit", "delete", name] => match store.audit(name) {
+            Ok(Some(audit)) => Ok(format!(
+                "[audit] /audit delete {name} confirm: deletes its record{}{}",
+                if audit.work.is_empty() { "" } else { ", work tree" },
+                if audit.branch.is_empty() { String::new() } else { format!(", branch {}", audit.branch) },
+            )),
+            Ok(None) => Err(format!("no audit {name}")),
+            Err(error) => Err(err(error)),
+        },
+        ["/audit", "delete", name, "confirm"] => delete(&store, name),
         ["/audit", "scope", name, verb @ ("add" | "remove"), spec] => crate::audit::scope::change_scope(&store, name, verb == &"add", spec),
         ["/audit", "keep", name] => crate::audit::run::after_project(&store, name, "keep", None),
         ["/audit", "letgo", name] | ["/audit", "let-go", name] => crate::audit::run::after_project(&store, name, "letgo", None),
@@ -1024,11 +1163,12 @@ fn list(store: &AuditStore) -> Reply {
 /// What the projects tab and the board show of the audits on a board.
 pub fn for_board(board: &str) -> Vec<Audit> {
     let Some(store) = audit::store() else { return Vec::new() };
-    let mut out: Vec<Audit> = store.audits().unwrap_or_default().into_iter().filter(|a| a.board.as_deref() == Some(board)).collect();
+    let mut out: Vec<Audit> = store.audits().unwrap_or_default().into_iter().filter(|a| a.board.as_deref() == Some(board) && !a.archived).collect();
     for link in store.links(None, Some(board)).unwrap_or_default() {
         if link.kind == "linked"
             && !out.iter().any(|a| a.name == link.audit)
             && let Ok(Some(audit)) = store.audit(&link.audit)
+            && !audit.archived
         {
             out.push(audit);
         }
@@ -1045,7 +1185,7 @@ pub fn any_live() -> bool {
 pub fn waiting() -> usize {
     let Some(store) = audit::store() else { return 0 };
     let mut n = 0;
-    for audit in store.audits().unwrap_or_default() {
+    for audit in store.audits().unwrap_or_default().into_iter().filter(|a| !a.archived) {
         if audit.status == Status::Proposed || audit.rerun_proposed.is_some() || audit.attach_proposed.is_some() {
             n += 1;
         }
@@ -1056,7 +1196,7 @@ pub fn waiting() -> usize {
             .claims(&audit.name)
             .unwrap_or_default()
             .iter()
-            .filter(|c| c.weaker.is_some() || (c.repro == Repro::ModelOnly && !c.model_only_accepted) || c.posted == Posted::Ready)
+            .filter(|c| c.waits_on(&audit))
             .count();
     }
     for lang in crate::audit::adapters::proposed() {

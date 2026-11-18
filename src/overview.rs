@@ -49,6 +49,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub worker_reasoning: String,
     pub looping: bool,
+    /// Approval mode: every command and subagent waits for the operator.
+    #[serde(default)]
+    pub approval: bool,
     pub voice_on: bool,
     pub voice: String,
     /// The daily sleep's time (`02:00`), and what the schedule says.
@@ -236,7 +239,8 @@ pub fn take_commands() -> Vec<String> {
 }
 
 /// What the overview may send: its settings, the goal's controls and MCP's
-/// reload, nothing else (it reaches the app from attached terminals too).
+/// reload, and the projects tab an audit's start; nothing else (it reaches
+/// the app from attached terminals too).
 pub fn allowed(command: &str) -> bool {
     let words: Vec<&str> = command.split_whitespace().collect();
     matches!(
@@ -256,6 +260,10 @@ pub fn allowed(command: &str) -> bool {
             | ["/model", "key", "clear"]
             | ["/embeddings", "on" | "off"]
             | ["/machine", "host" | "vm"]
+            | ["/approval", "on" | "off"]
+            | ["/audit", "policy", _]
+            // The projects tab's n a, from an attached terminal.
+            | ["/audit", "start", ..]
     )
 }
 

@@ -64,6 +64,12 @@ use std::{
 const OK_MARK: &str = "\x1b[92m";
 /// A tool call that failed.
 const FAILED_MARK: &str = "\x1b[91m";
+/// A request waiting for the operator (`Mark::Ask`): attention's colour, as
+/// the tab bar's `[!] approve`; its heading; the command in it; the rest.
+const ASK_MARK: &str = "\x1b[1;38;2;64;224;208m";
+const ASK_HEAD: &str = "\x1b[1;37m";
+const ASK_CODE: &str = "\x1b[36m";
+const ASK_QUIET: &str = "\x1b[90m";
 /// A tool call the operator stopped.
 const KILLED_MARK: &str = "\x1b[91m";
 
@@ -127,6 +133,10 @@ pub enum Mark {
     Work,
     Done,
     Problem,
+    /// `[!]`: waits for the operator's answer (an approval). Its brief is a
+    /// block of lines: the heading, a reason, the text asked about
+    /// (indented), the keys.
+    Ask,
 }
 
 /// One thing written to the transcript.
@@ -899,13 +909,44 @@ impl Renderer {
             Mark::Problem => (FAILED_MARK, "[-]", TEXT_STYLE),
             Mark::Done => (OK_MARK, "[+]", WORK_STYLE),
             Mark::Work => (WORK_STYLE, "[*]", WORK_STYLE),
+            Mark::Ask => (ASK_MARK, "[!]", TEXT_STYLE),
         };
         out.text.push_str(&" ".repeat(gutter));
         out.text.push_str(&format!("{mark_style}{mark}{RESET} "));
+        let hang = gutter + 4;
+        // A request's block, a line each: the heading bold, the reason as
+        // plain text, the text asked about as code, the rest quiet. A line
+        // too long for the screen goes on under its own text.
+        if mark == "[!]" {
+            for (at, line) in brief.lines().enumerate() {
+                if out.columns <= hang + 12 {
+                    out.text.push_str(&format!("{line}\r\n"));
+                    continue;
+                }
+                self.wrap.col = if at == 0 { hang } else { 0 };
+                self.wrap.indent = hang;
+                if at == 0 {
+                    self.wrap.push(&format!("{ASK_HEAD}{line}{RESET}\r\n"), out.columns, out.text);
+                } else if let Some(code) = line.strip_prefix("  ") {
+                    self.wrap.indent = hang + 2;
+                    self.wrap.push(&format!("{ASK_CODE}{code}{RESET}\r\n"), out.columns, out.text);
+                } else if let Some(reason) = line.strip_prefix("why  ") {
+                    // The space places the label before the indent moves.
+                    self.wrap.push(&format!("{ASK_QUIET}why{RESET} "), out.columns, out.text);
+                    self.wrap.indent = hang + 5;
+                    self.wrap.push(&format!(" {TEXT_STYLE}{reason}{RESET}\r\n"), out.columns, out.text);
+                } else {
+                    self.wrap.push(&format!("{ASK_QUIET}{line}{RESET}\r\n"), out.columns, out.text);
+                }
+            }
+            self.wrap.indent = hang;
+            self.sync_indent(out);
+            self.wrap.col = 0;
+            return;
+        }
         let text = format!("{text_style}{brief}{RESET}\r\n");
         // Wrapped even outside the display: the line starts at the left edge,
         // so the width it was last measured at is enough to go on.
-        let hang = gutter + 4;
         if out.columns > hang + 10 {
             self.wrap.col = hang;
             self.wrap.indent = hang;

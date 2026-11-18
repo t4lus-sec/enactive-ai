@@ -2003,8 +2003,7 @@ mod tests {
         let layers = layers();
         let messages = conversation();
         let handle = std::thread::spawn(|| -> Written { vec![Ok("a".into()), Ok("b".into())] });
-        let mut prep = FoldPrep::default();
-        prep.job = Some(job_for(&messages, &layers, handle));
+        let mut prep = FoldPrep { job: Some(job_for(&messages, &layers, handle)), ..FoldPrep::default() };
         let mut changed = messages.clone();
         changed[crate::memory::layers::MEMORY_INDEX + 1].content = "something else".into();
         // Below the prepare point, so nothing new is started in its place.
@@ -2107,8 +2106,7 @@ mod tests {
             done.store(true, Ordering::SeqCst);
             vec![Err("cancelled".into())]
         });
-        let mut prep = FoldPrep::default();
-        prep.job = Some(PrepJob {
+        let job = PrepJob {
             usable: Arc::new(AtomicUsize::new(2)),
             announced: false,
             open_job: None,
@@ -2117,7 +2115,8 @@ mod tests {
             plan,
             first_new_id: layers.next_item_id().unwrap(),
             cancel: Arc::clone(&cancel),
-        });
+        };
+        let mut prep = FoldPrep { job: Some(job), ..FoldPrep::default() };
 
         assert!(prep.take_valid(&live, &layers, &mut |_| {}).unwrap().is_none(), "stale");
         assert!(cancel.load(Ordering::SeqCst), "cancelled, not left running");

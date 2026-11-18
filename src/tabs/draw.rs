@@ -18,7 +18,7 @@ pub(super) fn draw(open: &mut Option<Open>, display: &ActiveDisplay) -> io::Resu
         View::Shell { .. } => crate::vm::terms::version(),
         View::History | View::Page => display.record_revision(),
         View::Board | View::Memory | View::Share | View::Overview | View::Audit | View::Edit => 0,
-        View::Review | View::Verification | View::Deliverables => 0,
+        View::Review | View::Verification | View::Deliverables | View::Projects => 0,
     };
     let version = feed.wrapping_add(POKED.load(std::sync::atomic::Ordering::SeqCst));
     let now = Instant::now();
@@ -28,7 +28,8 @@ pub(super) fn draw(open: &mut Option<Open>, display: &ActiveDisplay) -> io::Resu
         let since = now.duration_since(at);
         let changed = drawn_version != version || drawn_size != size;
         let board_due = (tab.view == View::Board && tab.board_read.as_ref().is_none_or(|read| now.duration_since(read.at) >= BOARD_POLL))
-            || matches!(tab.view, View::Review | View::Verification | View::Deliverables);
+            || matches!(tab.view, View::Review | View::Verification | View::Deliverables)
+            || (tab.view == View::Projects && super::projects_tree::busy());
         if since < FRAME || (!changed && !board_due && since < CLOCK) {
             return Ok(Outcome::Stay);
         }
@@ -90,23 +91,22 @@ pub(super) fn compose_frame(tab: &mut Open, display: &ActiveDisplay, (columns, r
     let top = (bar.len() + 1).min(rows.saturating_sub(4));
     BODY_TOP.store(top, std::sync::atomic::Ordering::Relaxed);
     let body_rows = rows.saturating_sub(top + 1 + usize::from(prompt)).max(1);
-    BODY_ROWS.store(body_rows, std::sync::atomic::Ordering::Relaxed);
+    // The conversation opened by a drag on the page keeps the page's rows.
+    let window = if tab.view == View::History { body_rows.saturating_sub(tab.lift).max(1) } else { body_rows };
+    BODY_ROWS.store(window, std::sync::atomic::Ordering::Relaxed);
     if let View::Subagent(number) = tab.view
         && tab.draft.is_empty()
     {
         tab.pinned = subagent_at(number).map(|worker| worker.run_id);
     }
     // A shell's key with no shell on it yet takes the first that comes.
-    if !server_only(&tab.view)
-        && let View::Shell { number, session: None } = tab.view
-    {
+    if let View::Shell { number, session: None } = tab.view {
         let session = crate::vm::terms::sessions().get(number - 1).cloned();
         tab.view = View::Shell { number, session };
     }
     let mut cursor_in_body = None;
     let mut history_loading = false;
     let (body, footer) = match &tab.view {
-        view if server_only(view) => remote_body(view, width),
         View::Subagent(number) => subagent_body(*number, tab.expanded, width, now),
         // The projects tab's first subtab: its line on top, then its
         // sections (the board, its files, notes and reports).
@@ -123,6 +123,7 @@ pub(super) fn compose_frame(tab: &mut Open, display: &ActiveDisplay, (columns, r
             projects_view::open_body(tab, item.as_ref(), width, body_rows)
         }
         View::Review | View::Verification | View::Deliverables => projects_view::body(tab, width, body_rows),
+        View::Projects => super::projects_tree::body(tab, width, body_rows),
         View::History => history_body(tab, display, width),
         View::Page => page_body(tab, display, width),
         View::Memory => memory_view::body(tab, width, body_rows),
@@ -145,13 +146,20 @@ pub(super) fn compose_frame(tab: &mut Open, display: &ActiveDisplay, (columns, r
     let mut frame = Vec::with_capacity(rows);
     frame.extend(bar.into_iter().take(top.saturating_sub(1)));
     frame.push(vec![(Style::Dim, "─".repeat(width))]);
-    let longest = body.len().saturating_sub(body_rows);
+    let mut body = body;
+    if tab.view == View::History
+        && tab.lift_idle
+        && body.last().is_some_and(|row| row.iter().all(|(_, text)| plain_text(text).trim().is_empty()))
+    {
+        body.pop();
+    }
+    let longest = body.len().saturating_sub(window);
     // A shell's history is on its way: keep the place asked for until it is.
     if !history_loading {
         tab.back = tab.back.min(longest);
     }
     let start = longest.saturating_sub(tab.back);
-    frame.extend(body.into_iter().skip(start).take(body_rows));
+    frame.extend(body.into_iter().skip(start).take(window));
     frame.resize(top + body_rows, Vec::new());
     // Text selected with the mouse: lined up with what this frame shows,
     // and shown.
@@ -213,7 +221,8 @@ impl Footer {
 
 /// A view with nothing to show yet: what it is, and (when it helps) how it fills.
 pub(super) fn empty(title: &str, detail: &str, width: usize) -> Vec<Line> {
-    let mut out = vec![Vec::new(), vec![(Style::Plain, format!("  {title}"))]];
+    let mut out = vec![Vec::new()];
+    out.extend(flow(&[(Style::Plain, format!("  {title}"))], width, 2));
     if !detail.is_empty() {
         out.extend(flow(&[(Style::Dim, format!("  {detail}"))], width, 2));
     }
@@ -317,27 +326,18 @@ pub(super) fn paint_to(stdout: &mut impl Write, previous: &[Line], frame: &[Line
             continue;
         }
         queue!(stdout, MoveTo(0, index as u16))?;
-        let mut used = 0;
-        'segments: for (style, text) in line {
+        // A row wider than the screen is cut, its text ending in `…`.
+        let plain: Line = line
+            .iter()
+            .map(|(style, text)| match style {
+                Style::Raw => (*style, text.clone()),
+                _ => (*style, text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()),
+            })
+            .collect();
+        let (shown, used) = super::cut_line(&plain, width);
+        for (style, text) in &shown {
             apply_style(stdout, *style)?;
-            if *style == Style::Raw {
-                // Cut to the width already (`page::rows`), codes and all.
-                queue!(stdout, Print(text))?;
-                used += crate::page::width(text);
-                continue;
-            }
-            let mut piece = String::new();
-            for c in text.chars() {
-                let c = if c.is_control() { ' ' } else { c };
-                let w = c.width().unwrap_or(0);
-                if used + w > width {
-                    queue!(stdout, Print(piece))?;
-                    break 'segments;
-                }
-                used += w;
-                piece.push(c);
-            }
-            queue!(stdout, Print(piece))?;
+            queue!(stdout, Print(text))?;
         }
         apply_style(stdout, Style::Plain)?;
         // A row that reaches the last column leaves the cursor waiting to
@@ -369,17 +369,20 @@ pub(super) fn paint_to(stdout: &mut impl Write, previous: &[Line], frame: &[Line
 pub(super) fn tab_bar(view: Option<&View>, working: Option<String>, width: usize) -> Vec<Line> {
     // Labels as long as they can be on two rows, then shorter, then closer;
     // never more than three rows (a narrow terminal keeps room for the tab).
-    let mut best: Vec<Line> = Vec::new();
+    // A label wider than its half is cut there: a bar with none cut is the
+    // better one, however many rows.
+    let mut best: Option<(bool, Vec<Line>)> = None;
     for (limit, gap) in [(18, 2), (12, 2), (8, 2), (8, 1), (5, 1)] {
-        let bar = tab_bar_with(view, working.as_deref(), limit, gap, width);
-        let fewer = best.is_empty() || bar.len() < best.len();
-        if fewer {
-            best = bar;
+        let (bar, cut) = tab_bar_with(view, working.as_deref(), limit, gap, width);
+        let better = best.as_ref().is_none_or(|(best_cut, best)| (cut, bar.len()) < (*best_cut, best.len()));
+        if better {
+            best = Some((cut, bar));
         }
-        if best.len() <= 2 {
+        if best.as_ref().is_some_and(|(cut, bar)| !cut && bar.len() <= 2) {
             break;
         }
     }
+    let mut best = best.map(|(_, bar)| bar).unwrap_or_default();
     best.truncate(MAX_BAR_ROWS);
     best
 }
@@ -490,7 +493,9 @@ pub(super) fn flow_items(lead: &str, items: Vec<Line>, room: usize) -> Vec<Line>
     rows
 }
 
-pub(super) fn tab_bar_with(view: Option<&View>, working: Option<&str>, limit: usize, gap: usize, width: usize) -> Vec<Line> {
+/// The bar with labels of at most `limit` characters, `gap` apart; and
+/// whether a row was wider than its half and cut.
+pub(super) fn tab_bar_with(view: Option<&View>, working: Option<&str>, limit: usize, gap: usize, width: usize) -> (Vec<Line>, bool) {
     let mut left: Vec<Line> = Vec::new();
     // [!]: something waits for the operator's approval (alt+a twice).
     let approve = (!crate::approval::pending().is_empty()).then_some((Style::Warn, "[!] approve"));
@@ -556,19 +561,23 @@ pub(super) fn tab_bar_with(view: Option<&View>, working: Option<&str>, limit: us
     }
     // The halves, and the pipe between them on every row.
     let half = width.saturating_sub(1) / 2;
+    let rest = width.saturating_sub(half + 1);
     let left = flow_items("", left, half);
-    let right = flow_items("", right, width.saturating_sub(half + 1));
+    let right = flow_items("", right, rest);
+    let cells = |line: &Line| line.iter().map(|(_, text)| text_width(text)).sum::<usize>();
+    let cut = left.iter().any(|line| cells(line) > half) || right.iter().any(|line| cells(line) > rest);
     let rows = left.len().max(right.len());
-    (0..rows)
+    let bar = (0..rows)
         .map(|at| {
-            let mut line: Line = left.get(at).cloned().unwrap_or_default();
-            let used: usize = line.iter().map(|(_, text)| text_width(text)).sum();
-            line.push((Style::Plain, " ".repeat(half.saturating_sub(used))));
+            // Each half in its own columns, so the pipe stays in one.
+            let mut line = super::fit_line(&left.get(at).cloned().unwrap_or_default(), half);
             line.push((Style::Dim, "│".into()));
-            line.extend(right.get(at).cloned().unwrap_or_default());
+            let right = right.get(at).cloned().unwrap_or_default();
+            line.extend(if cells(&right) > rest { super::fit_line(&right, rest) } else { right });
             line
         })
-        .collect()
+        .collect();
+    (bar, cut)
 }
 
 /// A netbox's mark in the tab bar: `[!]` the operator has the wheel, `[*]` a
@@ -661,7 +670,7 @@ pub(super) fn prompt_line(tab: &Open, width: usize) -> (Line, usize) {
     let (label, live) = match &tab.view {
         View::Page => (" you ›".to_string(), true),
         View::Shell { .. } | View::History | View::Memory | View::Share | View::Overview | View::Audit | View::Edit => return (Vec::new(), 0),
-        View::Review | View::Verification | View::Deliverables => return (Vec::new(), 0),
+        View::Review | View::Verification | View::Deliverables | View::Projects => return (Vec::new(), 0),
         View::Subagent(number) => match subagent_at(*number) {
             // Named for the one the draft is for, which `submit` checks.
             Some(worker) if worker.running => {

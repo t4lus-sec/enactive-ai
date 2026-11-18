@@ -26,7 +26,7 @@ pub const S0MA_TOOLS: [&str; 12] = [
 ];
 
 /// The tools a worker has.
-pub const WORKER_TOOLS: [&str; 4] = ["audit_read", "audit_check_submit", "audit_repro_submit", "audit_model_only"];
+pub const WORKER_TOOLS: [&str; 5] = ["audit_read", "audit_claims_propose", "audit_check_submit", "audit_repro_submit", "audit_model_only"];
 
 pub fn handles(name: &str) -> bool {
     S0MA_TOOLS.contains(&name) || WORKER_TOOLS.contains(&name)
@@ -105,7 +105,7 @@ checks/<claim>/mutants/*.patch it must catch; and // [n] anchors for each clause
             "audit_check_submit",
             "Hand a check to the harness: it reads check.toml, files it on the audit's branch, vets it (mutants must be caught; \
 a fresh reader back-translates it) and runs it in the audit's shell when the gate allows. You get no verdict here.",
-            json!({"type": "object", "required": ["audit", "claim", "dir"], "properties": {"audit": audit_param(), "claim": claim, "dir": {"type": "string", "description": "The check's directory, absolute or relative to the work tree (checks/c7)."}}}),
+            json!({"type": "object", "required": ["audit", "claim", "dir"], "properties": {"audit": audit_param(), "claim": claim, "check": {"type": "string", "description": "Which of the claim's checks this is: k1, k2… (your task names it). A new version replaces that one; the others stay."}, "dir": {"type": "string", "description": "The check's directory, absolute or relative to the work tree (checks/c7/k1)."}}}),
         ),
         ToolDefinition::function(
             "audit_repro_submit",
@@ -221,11 +221,21 @@ pub fn execute(call: &ToolCall, worker: &str) -> String {
             }
             let Some(claims) = arguments["claims"].as_array() else { return rejected("claims: a list") };
             let mut added = Vec::new();
+            // A harvest started again (the harness stopped mid-way) may
+            // propose what is already there: kept once.
+            let same = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            let mut known: Vec<String> = store.claims(&audit_name).unwrap_or_default().iter().map(|c| same(&c.text)).collect();
+            let mut already = Vec::new();
             for item in claims.iter().take(30) {
                 let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default().trim().to_string();
                 if field("text").len() < 8 {
                     return rejected("each claim needs its text");
                 }
+                if known.contains(&same(&field("text"))) {
+                    already.push(field("text"));
+                    continue;
+                }
+                known.push(same(&field("text")));
                 let kind = field("kind");
                 let readings: Vec<String> = item["readings"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
                 let claim = Claim {
@@ -271,14 +281,14 @@ pub fn execute(call: &ToolCall, worker: &str) -> String {
                 });
             }
             crate::audit::run::wake();
-            json!({"ok": true, "added": added, "note": "Unreviewed ([?]) until the operator triages them. Checking waits for his Go on the plan (unless the gate says otherwise)."}).to_string()
+            json!({"ok": true, "added": added, "already_proposed": already, "note": "Unreviewed ([?]) until the operator triages them. Checking waits for his Go on the plan (unless the gate says otherwise)."}).to_string()
         }
         "audit_plan_note" => {
             let claim_id = text("claim");
             let why = text("why");
             let mutant = text("mutant");
             if !mutant.is_empty() {
-                let reading = Evidence { claim: claim_id.clone(), kind: "reading".into(), name: mutant.clone(), path: String::new(), result: why.clone(), at: audit::now() };
+                let reading = Evidence { claim: claim_id.clone(), check: text("check"), kind: "reading".into(), name: mutant.clone(), path: String::new(), result: why.clone(), at: audit::now() };
                 return match store.add_evidence(&audit_name, &reading) {
                     Ok(()) => {
                         let _ = store.log(&audit_name, Who::S0ma, &format!("read survived mutant {mutant} of {claim_id}"), &why);
@@ -355,7 +365,10 @@ pub fn execute(call: &ToolCall, worker: &str) -> String {
                 Err(error) => rejected(error),
             }
         }
-        "audit_check_submit" => reply(crate::audit::run::submit_check(&store, &audit_name, &text("claim"), &text("dir"), if is_worker { worker } else { "s0ma" })),
+        "audit_check_submit" => {
+            let slot = text("check");
+            reply(crate::audit::run::submit_check(&store, &audit_name, &text("claim"), &text("dir"), if is_worker { worker } else { "s0ma" }, Some(slot.as_str()).filter(|s| !s.is_empty())))
+        }
         "audit_repro_submit" => reply(crate::audit::run::submit_repro(&store, &audit_name, &text("claim"), &text("test"), &text("run"))),
         "audit_model_only" => reply(crate::audit::run::model_only(&store, &audit_name, &text("claim"), &text("why"))),
         "audit_link" => {
@@ -414,7 +427,7 @@ fn read(store: &audit::AuditStore, name: &str, what: &str, claim_id: &str) -> St
             let checks = store.checks(name, claim_id).unwrap_or_default();
             let evidence = store.evidence(name, Some(claim_id)).unwrap_or_default();
             json!({"claim": claim_json(claim), "clauses": audit::clauses(&claim.text),
-                "checks": checks.iter().map(|c| json!({"version": c.version, "dir": c.dir, "kind": c.kind, "run": c.run, "by": c.by,
+                "checks": checks.iter().map(|c| json!({"check": c.slot(), "version": c.version, "verdict": c.verdict.label(), "level": c.level.label(), "dir": c.dir, "kind": c.kind, "run": c.run, "by": c.by, "by_job": c.by_job, "back_by": c.back_by,
                     "kills": c.kills, "survived": c.survived, "back_translation": c.back_translation, "held_weaker": c.held_weaker,
                     "superseded_by": c.superseded_by})).collect::<Vec<_>>(),
                 "evidence": evidence.iter().map(|e| json!({"kind": e.kind, "name": e.name, "result": crate::util::clip(&e.result, 1500)})).collect::<Vec<_>>(),

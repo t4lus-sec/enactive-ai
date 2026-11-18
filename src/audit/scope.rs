@@ -29,6 +29,8 @@ pub struct Slice {
     pub approximate: bool,
     /// `doc:` specs, mapped by the agent, not yet confirmed by the operator.
     pub unconfirmed_docs: Vec<String>,
+    /// What each inside file defines, for the tab's map.
+    pub by_file: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Slice {
@@ -60,6 +62,11 @@ pub fn valid_spec(spec: &str) -> std::result::Result<(), String> {
 /// The slice map, on the agent's machine: inside files from the specs, the
 /// symbols they define, and the calls across the boundary, by name matching.
 pub fn map(work: &str, scope: &[String]) -> std::result::Result<Slice, String> {
+    map_with(work, scope, &mut crate::vm::netboxes::machine)
+}
+
+/// The same, run by `run` (at set-up, in the audit's shell).
+pub fn map_with(work: &str, scope: &[String], run: &mut dyn FnMut(&str, u64) -> std::result::Result<crate::share::Ran, String>) -> std::result::Result<Slice, String> {
     for spec in scope {
         valid_spec(spec)?;
     }
@@ -118,8 +125,9 @@ for f in files:
     for name in syms:
         if len(name) > 3 and re.search(r'\b' + re.escape(name) + r'\s*\(', body):
             called_from.add('%s <- %s' % (name, f))
+by_file = {f: sorted(set(define.findall(text(f))))[:200] for f in sorted(inside)}
 print(json.dumps({'inside_files': sorted(inside), 'inside_symbols': syms, 'calls_out': sorted(calls_out)[:200],
-                  'called_from': sorted(called_from)[:200], 'approximate': True, 'unconfirmed_docs': docs}))
+                  'called_from': sorted(called_from)[:200], 'approximate': True, 'unconfirmed_docs': docs, 'by_file': by_file}))
 "#;
     let script = format!(
         "command -v python3 >/dev/null || {{ echo 'the slice map needs python3 on the machine' >&2; exit 3; }}; python3 -c {} {} {}",
@@ -127,7 +135,7 @@ print(json.dumps({'inside_files': sorted(inside), 'inside_symbols': syms, 'calls
         crate::util::shell_quote(work),
         crate::util::shell_quote(&specs)
     );
-    let ran = crate::vm::netboxes::machine(&script, 300)?;
+    let ran = run(&script, 300)?;
     if ran.exit_code != Some(0) {
         return Err(format!("the slice map: {}", ran.stderr.trim()));
     }

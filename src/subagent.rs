@@ -213,6 +213,34 @@ pub fn set_input_wake(signal: Arc<AtomicBool>) {
 
 /// Wake the idle prompt, so the app comes round (the operator's move in the
 /// projects tab: `board_flow`).
+/// A subagent the harness starts, not the agent (an audit's worker, a
+/// board's verifier), approved as the operator's, who started what it works
+/// for. On the main thread, where a spawn reaches the archive. Its job id,
+/// or why it did not start; statuses drained meanwhile go to `say`.
+pub fn spawn_for_harness(id: &str, task: &str, memory: &mut Hippocampus, say: &mut dyn FnMut(String)) -> Result<String, String> {
+    let call = ToolCall {
+        id: id.to_string(),
+        kind: "function".into(),
+        function: crate::types::FunctionCall { name: "subagent_spawn".into(), arguments: json!({"tasks": [{"task": task}]}).to_string() },
+    };
+    // Not the agent's to interrupt: its Ctrl+C stops its turn, not this.
+    let never = AtomicBool::new(false);
+    let spawned = crate::approval::by_operator(|| {
+        execute(&call, memory, &never, |status| {
+            say(status);
+            Ok(())
+        })
+    });
+    match spawned {
+        Ok(answer) => match serde_json::from_str::<serde_json::Value>(&answer) {
+            Ok(value) if value["ok"] == json!(true) => value["job_ids"][0].as_str().map(str::to_string).ok_or_else(|| "no job id".to_string()),
+            Ok(value) => Err(value["error"].as_str().unwrap_or("not started").to_string()),
+            Err(_) => Err(answer),
+        },
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub fn wake_prompt() {
     wake_input();
 }
@@ -1167,6 +1195,7 @@ fn compaction_grant(paused_input: usize) -> usize {
 /// Replace a worker's history with its own written notes, sized so the result
 /// fits the worker's `original` budget with its full output reservation.
 /// Returns the new history and the input tokens it measures.
+#[allow(clippy::too_many_arguments)]
 fn compact_history(
     messages: &[Message], task: &Task, tools: &[ToolDefinition], options: &ChatOptions,
     budget: &Budget, slot: usize, run_id: &str, cancel: &AtomicBool,
@@ -2134,6 +2163,18 @@ pub fn init(data_dir: &Path) -> Result<(), Box<dyn Error>> {
         Mutex::new(Manager { tx, rx, jobs: HashMap::new(), notifications: VecDeque::new(), statuses:VecDeque::new(),
             completed: VecDeque::new(), pending_audit: None, maintenance: HashMap::new() })
     });
+    // Workers don't outlive the harness: shells a stopped one left open on
+    // the machine are closed (and what still runs in them with them).
+    if !cfg!(test) {
+        let _ = std::thread::Builder::new().name("worker-shells-left".into()).spawn(|| {
+            let run = &mut crate::vm::netboxes::machine;
+            let Ok(open) = crate::vm::netboxes::list(run) else { return };
+            for netbox in open.iter().filter(|n| n.open && n.name.starts_with("w-")) {
+                let _ = crate::vm::netboxes::close(&mut crate::vm::netboxes::machine, &netbox.name, true);
+            }
+            crate::vm::terms::touch();
+        });
+    }
     // Read the pool now, so a bad S0MA_KV_POOL_TOKENS is said at startup.
     let from = if std::env::var_os("S0MA_KV_POOL_TOKENS").is_some() && !cfg!(test) { "S0MA_KV_POOL_TOKENS" } else { "built in" };
     crate::terminal::say_note(&format!(
@@ -2287,7 +2328,14 @@ error says so), use subagent_resize, or subagent_cancel.",
                 // A board's independent verifier: its report is kept on the
                 // board, held from the agent until the agent has filed its own check.
                 let verifier = crate::board::flow::verifier_finished(&id, &result.status, &result.result, result.error.as_deref());
+                // An audit's own worker (harvest, back-translation): its
+                // result is the audit's, and the agent hears a line.
+                let audit_worker = crate::audit::run::worker_finished(&id, &result.status, &result.result, result.error.as_deref());
+                if let Some(line) = &audit_worker {
+                    m.notifications.push_back(line.clone());
+                }
                 match &verifier {
+                    _ if audit_worker.is_some() => {}
                     Some(Some(note)) => m.notifications.push_back(note.clone()),
                     Some(None) => m.statuses.push_back(format!("[board] the verifier {id} finished; its report waits for s0ma's own check")),
                     None => m.notifications.push_back(format!(
@@ -2586,6 +2634,17 @@ pub fn steer_from_operator(id: &str, text: &str, wrap_up: bool) -> Result<String
     })
 }
 
+/// A direction from the harness itself (an audit's worker told to submit
+/// what it has), delivered as the agent's are.
+pub fn steer_from_harness(id: &str, text: &str) -> Result<(), String> {
+    {
+        let mut m = manager().map_err(|e| e.to_string())?;
+        steer(&mut m, &[id.to_owned()], text, false, crate::subagent::feed::Sender::S0ma)?;
+    }
+    wake_input();
+    Ok(())
+}
+
 pub fn execute<F>(
     call: &ToolCall, memory: &mut Hippocampus, interrupt: &AtomicBool, mut on_status: F,
 ) -> Result<String, Box<dyn Error>>
@@ -2704,10 +2763,13 @@ where F: FnMut(String) -> Result<(), Box<dyn Error>>,
     // Approval mode: the operator sees every task before any starts.
     {
         let n = args.tasks.len();
-        let first = args.tasks.first().map(|task| crate::approval::one_line(&task.task)).unwrap_or_default();
-        let what = if n == 1 { format!("start a subagent: {first}") } else { format!("start {n} subagents, the first: {first}") };
-        let detail = args.tasks.iter().enumerate().map(|(i, task)| format!("{}. {}", i + 1, task.task.trim())).collect::<Vec<_>>().join("\n");
-        if let Err(refused) = crate::approval::ask(&what, &detail) {
+        let what = if n == 1 { "start a subagent".to_string() } else { format!("start {n} subagents") };
+        let detail = if n == 1 {
+            args.tasks[0].task.trim().to_string()
+        } else {
+            args.tasks.iter().enumerate().map(|(i, task)| format!("{}. {}", i + 1, task.task.trim())).collect::<Vec<_>>().join("\n")
+        };
+        if let Err(refused) = crate::approval::ask_why(&what, "", &detail) {
             return Ok(json!({"ok": false, "error": refused}).to_string());
         }
     }

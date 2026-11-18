@@ -63,6 +63,8 @@ const RESIZED: &str = "resized";
 /// PgUp (`scroll:page`) or the wheel (`scroll:wheel`) at the idle prompt:
 /// the conversation further back (`tabs::history`).
 const SCROLL_BACK: &str = "scroll:";
+/// A drag on the page: its text selected (`tabs::select_from_page`).
+const SELECT: &str = "select";
 /// Ctrl+G at the idle prompt: the draft in the operator's editor.
 const EDIT_DRAFT: &str = "edit-draft";
 /// Ctrl+Shift+P at the idle prompt: two panes (`tabs::split_from_page`).
@@ -106,6 +108,11 @@ struct SomaCompleter;
 impl Completer for SomaCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
         let completion = completion::complete(line, pos);
+        // Nothing to complete: the draft as it is, taken at once, so the
+        // menu closes without its own notice under the prompt.
+        if completion.candidates.is_empty() {
+            return CompletionResult::fresh(vec![Suggestion { value: String::new(), span: Span::new(pos, pos), append_whitespace: false, ..Suggestion::default() }]);
+        }
         CompletionResult::fresh(
             completion
                 .candidates
@@ -122,7 +129,6 @@ impl Completer for SomaCompleter {
     }
 }
 
-/// `$VISUAL`, then `$EDITOR`, then nano / vim / vi from `PATH`.
 /// The idle prompt's keys (Emacs's, with the agent's bindings), and what the page
 /// needs instead of reedline's own handling: the wheel scrolls back through
 /// the conversation, and a resize draws the whole page again (reedline would
@@ -139,10 +145,26 @@ impl EditMode for PageKeys {
             Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 match crate::tabs::page_click(mouse.column, mouse.row).map(|key| ReedlineRawEvent::try_from(Event::Key(key))) {
                     Some(Ok(event)) => self.0.parse_event(event),
-                    _ => ReedlineEvent::None,
+                    _ => {
+                        // On the conversation: a drag from here selects.
+                        crate::tabs::page_press(Some((mouse.column, mouse.row)));
+                        ReedlineEvent::None
+                    }
                 }
             }
-            Event::Mouse(_) => ReedlineEvent::None,
+            Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if crate::tabs::page_dragged((mouse.column, mouse.row)) {
+                    ReedlineEvent::ExecuteHostCommand(SELECT.to_string())
+                } else {
+                    ReedlineEvent::None
+                }
+            }
+            Event::Mouse(mouse) => {
+                if matches!(mouse.kind, crossterm::event::MouseEventKind::Up(_)) {
+                    crate::tabs::page_press(None);
+                }
+                ReedlineEvent::None
+            }
             Event::Resize(..) => ReedlineEvent::ExecuteHostCommand(RESIZED.to_string()),
             other => match ReedlineRawEvent::try_from(other) {
                 Ok(event) => self.0.parse_event(event),
@@ -156,6 +178,7 @@ impl EditMode for PageKeys {
     }
 }
 
+/// `$VISUAL`, then `$EDITOR`, then nano / vim / vi from `PATH`.
 fn editor_command() -> Command {
     let configured = ["VISUAL", "EDITOR"]
         .iter()
@@ -177,8 +200,13 @@ fn editor_command() -> Command {
     command
 }
 
+/// Where the draft goes for the operator's editor: in this process's own
+/// temporary folder, which only its user can read.
 fn draft_file() -> PathBuf {
-    std::env::temp_dir().join(format!("s0ma-draft-{}.md", std::process::id()))
+    match crate::util::private_temp() {
+        Ok(dir) => dir.join("draft.md"),
+        Err(_) => std::env::temp_dir().join(format!("s0ma-draft-{}.md", std::process::id())),
+    }
 }
 
 /// Expand `@file` mentions; returns the content for the model and one note
@@ -1050,6 +1078,16 @@ impl InputReader {
                     continue;
                 }
 
+                Signal::HostCommand(command) if command == SELECT => {
+                    let (draft, cursor) = self.idle_draft();
+                    if let Err(error) = crate::tabs::select_from_page(&self.active_display, Some((&draft, cursor))) {
+                        crate::tabs::close();
+                        let _ = self.active_display.uncover();
+                        crate::terminal::warn_status(&format!("[input] the conversation could not be shown: {error}"));
+                    }
+                    continue;
+                }
+
                 Signal::HostCommand(command) if command == SPLIT_PANES => {
                     let (draft, cursor) = self.idle_draft();
                     match crate::tabs::split_from_page(&self.active_display, Some((&draft, cursor))) {
@@ -1143,6 +1181,7 @@ impl InputReader {
         let path = draft_file();
         std::fs::write(&path, &draft)?;
         crate::page::step_out();
+        let _paused = crate::freeze::pause();
         let status = editor_command().arg(&path).status();
         crate::page::back();
         crate::page::take_stale();
@@ -1205,6 +1244,7 @@ impl InputReader {
             self.tab_modes = true;
         }
         let outcome = loop {
+            crate::freeze::watch(true);
             if self.external_break_signal.load(Ordering::Relaxed) {
                 self.external_break_signal.store(false, Ordering::Relaxed);
                 break Ok(Some(InputEvent::Timeout));
@@ -1231,7 +1271,13 @@ impl InputReader {
                             break Ok(Some(submitted));
                         }
                     }
-                    Ok(crate::tabs::Outcome::Closed) => break Ok(None),
+                    Ok(crate::tabs::Outcome::Closed) => {
+                        // Typed in a pane and not sent: in the prompt again.
+                        if let Some(text) = crate::tabs::take_page_draft() {
+                            self.editor.run_edit_commands(&[EditCommand::InsertString(text)]);
+                        }
+                        break Ok(None);
+                    }
                     Ok(crate::tabs::Outcome::Interrupt) => break Ok(Some(InputEvent::Interrupt)),
                     Ok(crate::tabs::Outcome::Eof) => {
                         self.eof_signal.store(true, Ordering::SeqCst);
@@ -1252,6 +1298,7 @@ impl InputReader {
         if matches!(outcome, Ok(Some(InputEvent::Timeout))) && crate::tabs::is_open() {
             return outcome;
         }
+        crate::freeze::watch(false);
         self.tab_modes = false;
         disable_key_disambiguation();
         let _ = execute!(io::stdout(), DisableBracketedPaste);
@@ -1327,6 +1374,7 @@ impl InputReader {
 
         self.active = true;
         self.active_worker_enabled.store(true, Ordering::SeqCst);
+        crate::freeze::watch(true);
 
         Ok(())
     }
@@ -1361,6 +1409,8 @@ impl InputReader {
         let raw_result = disable_raw_mode();
 
         self.active = false;
+        // A tab still up is read by the idle loop next; the prompt is not watched.
+        crate::freeze::watch(crate::tabs::is_open());
 
         // Hand the unfinished draft back to Reedline so the idle prompt
         // shows it, and let Up there recall steers sent during the turn.
@@ -1515,6 +1565,7 @@ fn spawn_active_input_worker(
                 continue;
             }
 
+            crate::freeze::beat();
             let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // The wheel scrolls back through the conversation, or a tab
                 // up over the turn.
@@ -1652,7 +1703,16 @@ fn handle_active_event(
                 }
                 send_steered(display, submits, text, now)
             }
-            Ok(crate::tabs::Outcome::Closed) => switching_screens(|| display.uncover()),
+            Ok(crate::tabs::Outcome::Closed) => {
+                // Typed in a pane and not sent: in the steering pane again.
+                if let Some(text) = crate::tabs::take_page_draft()
+                    && let Ok(mut editor) = lock_editor(editor)
+                {
+                    editor.draft.insert_str(&text);
+                    let _ = display.set_input(editor.draft.text(), editor.draft.cursor());
+                }
+                switching_screens(|| display.uncover())
+            }
             Ok(crate::tabs::Outcome::Interrupt) => {
                 hard_interrupt.store(true, Ordering::SeqCst);
                 Ok(())
@@ -1694,8 +1754,31 @@ fn handle_active_event(
         Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             match crate::tabs::page_click(mouse.column, mouse.row) {
                 Some(key) => handle_active_event(Event::Key(key), editor, display, submits, hard_interrupt, eof_signal, focus),
-                None => Ok(()),
+                None => {
+                    // On the conversation: a drag from here selects.
+                    crate::tabs::page_press(Some((mouse.column, mouse.row)));
+                    Ok(())
+                }
             }
+        }
+
+        Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            if !crate::tabs::page_dragged((mouse.column, mouse.row)) {
+                return Ok(());
+            }
+            switching_screens(|| match crate::tabs::select_from_page(display, None) {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    crate::tabs::close();
+                    display.uncover()?;
+                    Err(error)
+                }
+            })
+        }
+
+        Event::Mouse(mouse) if matches!(mouse.kind, crossterm::event::MouseEventKind::Up(_)) => {
+            crate::tabs::page_press(None);
+            Ok(())
         }
 
         _ => Ok(()),
@@ -2250,6 +2333,7 @@ fn open_editor(editor: &SharedEditor, display: &ActiveDisplay) -> io::Result<()>
     // The editor on the shell's screen; the page is drawn again after.
     crate::page::step_out();
 
+    let _paused = crate::freeze::pause();
     let status = editor_command().arg(&path).status();
 
     crate::page::back();

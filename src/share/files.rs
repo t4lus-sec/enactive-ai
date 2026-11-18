@@ -102,9 +102,24 @@ pub fn shown(dir: &str, relative: &str) -> String {
 /// The path, decoded into `$p` on the far side: it never reaches the shell
 /// as text.
 fn path_var(relative: &str) -> String {
-    // The `x` keeps a name's trailing newlines, which `$(…)` would drop.
-    format!("p=$(printf %s '{}' | base64 -d; printf x); p=${{p%x}}", STANDARD.encode(relative.as_bytes()))
+    named_var("p", relative)
 }
+
+fn named_var(name: &str, relative: &str) -> String {
+    // The `x` keeps a name's trailing newlines, which `$(…)` would drop.
+    format!("{name}=$(printf %s '{}' | base64 -d; printf x); {name}=${{{name}%x}}", STANDARD.encode(relative.as_bytes()))
+}
+
+/// What of a stamp a move keeps: size, modification time and inode (the
+/// change time moves with it).
+pub fn identity(stamp: &str) -> &str {
+    stamp.rsplit_once(':').map_or(stamp, |(kept, _)| kept)
+}
+
+/// Hidden names the projects folder keeps and the sync carries: a folder's
+/// archive (`.folder`), the trash, the projects' own state, a trashed item's
+/// origin.
+pub const PROJECT_HIDDEN: [&str; 4] = [".folder", ".trash", ".s0ma", ".origin.json"];
 
 /// A file's version: size, modification time, inode and change time. The
 /// inode changes with every write here (a rename over it); the change time
@@ -135,9 +150,10 @@ pub fn list(dir: &str, run: Run) -> Result<Vec<Entry>, String> {
     let command = format!(
         "d={dir}\n\
          [ -d \"$d\" ] || {{ echo \"$d does not exist on s0ma's machine\" >&2; exit 3; }}\n\
-         cd \"$d\" && find . -mindepth 1 -maxdepth {DEPTH} \\( -name '.*' -o -name node_modules -o -name __pycache__ \\) -prune \
+         cd \"$d\" && find . -mindepth 1 -maxdepth {DEPTH} \\( \\( -name '.*' ! \\( -path './projects/*' \\( {kept} \\) \\) \\) -o -name node_modules -o -name __pycache__ \\) -prune \
          -o \\( -type f -o -type d \\) -printf '%y\\t%s\\t%T@\\t%i\\t%C@\\t%P\\0' | head -z -n {MAX_ENTRIES}",
-        dir = shell_quote(dir)
+        dir = shell_quote(dir),
+        kept = PROJECT_HIDDEN.iter().map(|name| format!("-name '{name}'")).collect::<Vec<_>>().join(" -o "),
     );
     Ok(parse_list(&step(run, &command)?.stdout))
 }
@@ -382,6 +398,30 @@ pub fn remove_tree(dir: &str, relative: &str, run: Run) -> Result<(), WriteError
     }
 }
 
+/// Move a file from `from` to `to`, if it is still the file whose identity
+/// (`identity`) was listed and nothing is at `to`; the folders it leaves
+/// empty go. Its new stamp.
+pub fn rename(dir: &str, from: &str, to: &str, identity_was: &str, run: Run) -> Result<String, WriteError> {
+    let command = format!(
+        "cd {dir} || exit 3\n{from}\n{to}\n{LOCK}\n\
+         cur=$(find \"./$p\" {STAMP} 2>/dev/null); [ \"${{cur%:*}}\" = {identity} ] || {{ echo {CONFLICT} >&2; exit 9; }}\n\
+         {{ [ -e \"./$q\" ] || [ -L \"./$q\" ]; }} && {{ echo {CONFLICT} >&2; exit 9; }}\n\
+         case $q in */*) mkdir -p -- \"./${{q%/*}}\" || exit 5;; esac\n\
+         mv -- \"./$p\" \"./$q\" || exit 8\n\
+         d=$(dirname -- \"./$p\"); while [ \"$d\" != . ] && rmdir -- \"$d\" 2>/dev/null; do d=$(dirname -- \"$d\"); done\n\
+         find \"./$q\" {STAMP}",
+        dir = shell_quote(dir),
+        from = path_var(from),
+        to = named_var("q", to),
+        identity = shell_quote(identity_was),
+    );
+    match step(run, &command) {
+        Ok(ran) => Ok(ran.stdout.trim().to_string()),
+        Err(error) if error.contains(CONFLICT) => Err(WriteError::Changed),
+        Err(error) => Err(WriteError::Failed(error)),
+    }
+}
+
 /// Delete a file, if it is still at `stamp` (a file's) — or a folder with
 /// nothing in it (`stamp` none).
 pub fn remove(dir: &str, relative: &str, stamp: Option<&str>, run: Run) -> Result<(), WriteError> {
@@ -471,6 +511,8 @@ pub enum Change {
     /// His edit could not go over a change of the agent's, so it was kept beside
     /// it as `kept_as`.
     KeptBeside { path: String, kept_as: String },
+    /// Moved (or renamed) on his machine.
+    Moved { from: String, to: String },
 }
 
 /// The texts a `Change` carries: small ones only.
@@ -524,6 +566,14 @@ pub fn take_note() -> Option<String> {
             Change::Removed { path } => {
                 note.push_str(&format!("- deleted {}\n", shown(&dir, &path)));
                 ledger(|ledger| ledger.seen.remove(&path));
+            }
+            Change::Moved { from, to } => {
+                note.push_str(&format!("- moved {} to {}\n", shown(&dir, &from), shown(&dir, &to)));
+                ledger(|ledger| {
+                    if let Some(seen) = ledger.seen.remove(&from) {
+                        ledger.seen.insert(to.clone(), seen);
+                    }
+                });
             }
             Change::KeptBeside { path, kept_as } => note.push_str(&format!(
                 "- edited {} while you changed it, so his version is beside it as {}\n",

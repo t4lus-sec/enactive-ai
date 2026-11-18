@@ -8,7 +8,9 @@
 //! - the goal tests a board runs (`vm::GoalTest`);
 //! - each `subagent_spawn`, with the tasks it would start.
 //!
-//! The call that asks waits here (`ask`): the page says what is asked, and
+//! The call that asks waits here (`ask`): the page says what is asked, in a
+//! block of its own (`block`: who and what on its first line, then why, then
+//! the command or tasks themselves, a line each), and
 //! the tab bar shows `[!] approve` while anything waits. Alt+A pressed twice
 //! approves the oldest request (the first press says what it would approve;
 //! the second, within `TWICE`, does it); Alt+X declines it. The keys work on
@@ -47,6 +49,57 @@ pub struct Pending {
     pub what: String,
     /// All of it: the whole command, every task.
     pub detail: String,
+    /// What it would do, without the command or text itself: `run in main`.
+    #[serde(default)]
+    pub head: String,
+    /// The reason the agent gave, when it gave one.
+    #[serde(default)]
+    pub why: String,
+}
+
+/// How much of a request Alt+A's first press repeats.
+const ARMED_CHARS: usize = 80;
+
+/// Lines and characters of a request's command or text that its block shows;
+/// past them it says how many more there are (Ctrl+O shows all of it).
+const BLOCK_LINES: usize = 8;
+const BLOCK_CHARS: usize = 600;
+
+/// A request as the page shows it, a line each: who asks and what, the
+/// reason, the command or text itself (indented; cut where it is long, and
+/// saying so), and the keys.
+pub fn block(request: &Pending) -> String {
+    let head = if request.head.is_empty() { &request.what } else { &request.head };
+    let mut out = format!("approve #{} · {} · {head}", request.id, request.who);
+    if !request.why.trim().is_empty() {
+        out.push_str(&format!("\nwhy  {}", request.why.split_whitespace().collect::<Vec<_>>().join(" ")));
+    }
+    let body = request.detail.trim_end();
+    if !body.trim().is_empty() && body.trim() != head.trim() {
+        let lines: Vec<&str> = body.lines().collect();
+        let mut shown = 0;
+        let mut used = 0;
+        for line in &lines {
+            let size = line.chars().count();
+            if shown == BLOCK_LINES || (shown > 0 && used + size > BLOCK_CHARS) {
+                break;
+            }
+            // One very long line: its start, and that it goes on.
+            let cut: String = if size > BLOCK_CHARS { format!("{}…", line.chars().take(BLOCK_CHARS).collect::<String>()) } else { (*line).to_string() };
+            out.push_str(&format!("\n  {cut}"));
+            shown += 1;
+            used += size;
+        }
+        let more = lines.len() - shown;
+        let long = lines.iter().take(shown).any(|line| line.chars().count() > BLOCK_CHARS);
+        if more > 0 {
+            out.push_str(&format!("\n+{more} more line{} · ctrl+o", if more == 1 { "" } else { "s" }));
+        } else if long {
+            out.push_str(&format!("\n{} chars in all · ctrl+o", body.chars().count()));
+        }
+    }
+    out.push_str("\nalt+a twice approves · alt+x declines");
+    out
 }
 
 #[derive(Default)]
@@ -272,7 +325,20 @@ pub fn ask(what: &str, detail: &str) -> Result<(), String> {
         return Ok(());
     }
     let who = crate::exec_feed::owner().map_or_else(|| "s0ma".to_string(), |run_id| crate::vm::netboxes::agent_label(&run_id));
-    wait(Pending { id: 0, who, what: visible(what), detail: visible(detail) }, WAIT, crate::kill::requested)
+    wait(Pending { id: 0, who, what: visible(what), detail: visible(detail), head: String::new(), why: String::new() }, WAIT, crate::kill::requested)
+}
+
+/// `ask`, said in its parts: `head` is what would be done (`run in main`),
+/// `why` the agent's reason for it (or nothing), `body` the command or text
+/// itself, whole.
+pub fn ask_why(head: &str, why: &str, body: &str) -> Result<(), String> {
+    if !enabled() || OPERATOR.with(Cell::get) {
+        return Ok(());
+    }
+    let who = crate::exec_feed::owner().map_or_else(|| "s0ma".to_string(), |run_id| crate::vm::netboxes::agent_label(&run_id));
+    let what = if body.trim().is_empty() { head.to_string() } else { format!("{head}: {}", one_line(body)) };
+    let request = Pending { id: 0, who, what: visible(&what), detail: visible(body), head: visible(head), why: visible(why.trim()) };
+    wait(request, WAIT, crate::kill::requested)
 }
 
 /// `ask` for one who is not the agent or a subagent (an audit's batch), and, when
@@ -282,7 +348,7 @@ pub fn ask_as(who: &str, what: &str, detail: &str, always: bool) -> Result<(), S
     if !(enabled() || always) || OPERATOR.with(Cell::get) {
         return Ok(());
     }
-    wait(Pending { id: 0, who: who.to_string(), what: visible(what), detail: visible(detail) }, WAIT, || false)
+    wait(Pending { id: 0, who: who.to_string(), what: visible(what), detail: visible(detail), head: String::new(), why: String::new() }, WAIT, || false)
 }
 
 fn wait(mut request: Pending, limit: Duration, stopped: impl Fn() -> bool) -> Result<(), String> {
@@ -294,15 +360,15 @@ fn wait(mut request: Pending, limit: Duration, stopped: impl Fn() -> bool) -> Re
         state.pending.clone()
     };
     changed(snapshot);
-    let full = if request.detail.trim().is_empty() || request.detail.trim() == request.what.trim() {
-        String::new()
-    } else {
-        format!("\n{}", request.detail.trim_end())
-    };
-    crate::terminal::say_status_as(
-        &format!("approval · #{} {} asks to {} · alt+a twice approves, alt+x declines", request.id, request.who, request.what),
-        &format!("[approval] #{} {} asks to {} (alt+a twice approves, alt+x declines){full}", request.id, request.who, request.what),
-    );
+    let head = if request.head.is_empty() { request.what.clone() } else { request.head.clone() };
+    let mut full = format!("[approval] #{} {} asks to {head} (alt+a twice approves, alt+x declines)", request.id, request.who);
+    if !request.why.is_empty() {
+        full.push_str(&format!("\nwhy: {}", request.why));
+    }
+    if !request.detail.trim().is_empty() && request.detail.trim() != head.trim() {
+        full.push_str(&format!("\n{}", request.detail.trim_end()));
+    }
+    crate::terminal::say_ask(&block(&request), &full);
     let started = Instant::now();
     let mut state = state();
     let outcome = loop {
@@ -330,7 +396,9 @@ fn wait(mut request: Pending, limit: Duration, stopped: impl Fn() -> bool) -> Re
     drop(state);
     changed(snapshot);
     match &outcome {
-        Ok(()) => crate::terminal::say_done(&format!("[approval] #{} approved: {}", request.id, request.what)),
+        // The request is on the page above: its number and what it was for.
+        Ok(()) => crate::terminal::say_done(&format!("[approval] #{} approved: {head}", request.id)),
+        Err(why) if why.contains("declined") => crate::terminal::warn_status(&format!("[approval] #{} declined: {head}", request.id)),
         Err(why) => crate::terminal::warn_status(&format!("[approval] #{} {}", request.id, why.trim_start_matches("not run: "))),
     }
     outcome
@@ -375,7 +443,12 @@ fn key_with(approve: bool, now: Instant, send: &mut dyn FnMut(u64, bool) -> Resu
             let armed = state.armed.is_some_and(|(id, at)| id == first.id && now.duration_since(at) <= TWICE);
             if !armed {
                 state.armed = Some((first.id, now));
-                return Ok(format!("[approval] #{} {}: {} · alt+a again approves it", first.id, first.who, first.what));
+                // Which one, briefly: all of it is on the page.
+                let mut what: String = first.what.chars().take(ARMED_CHARS).collect();
+                if first.what.chars().count() > ARMED_CHARS {
+                    what.push('…');
+                }
+                return Ok(format!("[approval] #{} {} · {what} · alt+a again approves", first.id, first.who));
             }
         }
         state.armed = None;
@@ -405,6 +478,13 @@ mod tests {
         assert_eq!(one_line("make\n  && make install\n"), "make ⏎   && make install", "a short one whole");
         let long = format!("make\n{}", "x".repeat(WHOLE_CHARS));
         assert!(one_line(&long).starts_with("make (+1 line, ") && one_line(&long).contains("ctrl+o"));
+        // The block: who and what, why, the command a line each, the keys.
+        let request = Pending { id: 3, who: "s0ma".into(), what: "run in main: make ⏎ make install".into(), detail: "make\nmake install".into(), head: "run in main".into(), why: " check the\nbuild ".into() };
+        assert_eq!(block(&request), "approve #3 · s0ma · run in main\nwhy  check the build\n  make\n  make install\nalt+a twice approves · alt+x declines");
+        let many = Pending { detail: (1..=20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"), why: String::new(), ..request.clone() };
+        assert!(block(&many).contains("\n  line 8\n+12 more lines · ctrl+o\n"), "{}", block(&many));
+        let plain = Pending { head: String::new(), detail: String::new(), why: String::new(), what: "press Enter in main".into(), ..request };
+        assert_eq!(block(&plain), "approve #3 · s0ma · press Enter in main\nalt+a twice approves · alt+x declines");
         // What runs is what is read: no carriage return, escape or Ctrl+U hides a part of it.
         assert_eq!(visible("ls\rrm -rf x\x1b[2K\x15"), "ls^Mrm -rf x^[[2K^U");
         assert_eq!(visible("a\u{202e}b"), "a\\u{202e}b");

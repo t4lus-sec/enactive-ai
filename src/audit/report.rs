@@ -111,12 +111,12 @@ pub fn rerun_cited(store: &AuditStore, name: &str, ids: &[&str]) -> std::result:
     for id in ids {
         let Some(claim) = store.claim(name, id).map_err(|e| e.to_string())? else { continue };
         // The check at the version cited: the current one, frozen since.
-        if let Some(check) = store.current_check(name, id).map_err(|e| e.to_string())? {
+        for check in store.current_checks(name, id).map_err(|e| e.to_string())? {
             let ran = crate::audit::run::in_shell(&clean_audit, id, "verification: re-run as cited", &check.run, check.timeout)?;
             let (verdict, _) = crate::audit::run::verdict_of(ran.exit, ran.interrupted);
-            let agrees = verdict == claim.verdict || (claim.verdict == Verdict::Vacuous && verdict == Verdict::Holds);
+            let agrees = verdict == check.verdict || (check.verdict == Verdict::Vacuous && verdict == Verdict::Holds);
             same &= agrees;
-            lines.push(format!("{name}/{id} check: {} (recorded {}){}", verdict.label(), claim.verdict.label(), if agrees { "" } else { " — DIFFERS" }));
+            lines.push(format!("{name}/{id} {}: {} (recorded {}){}", check.slot(), verdict.label(), check.verdict.label(), if agrees { "" } else { " — DIFFERS" }));
         }
         if claim.repro == Repro::Fails
             && let Some(spec) = &claim.repro_test

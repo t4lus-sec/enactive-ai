@@ -175,6 +175,11 @@ pub fn ceiling_for(languages: &[String]) -> Level {
 /// The ceiling preview: the languages found in scope, how much of the code
 /// each is, and the ceiling each reaches: `rust 61% ceiling bounded`.
 pub fn preview(work: &str, scope: &[String]) -> std::result::Result<Vec<String>, String> {
+    preview_with(work, scope, &mut crate::vm::netboxes::machine)
+}
+
+/// The same, run by `run` (at set-up, in the audit's shell).
+pub fn preview_with(work: &str, scope: &[String], run: &mut dyn FnMut(&str, u64) -> std::result::Result<crate::share::Ran, String>) -> std::result::Result<Vec<String>, String> {
     let paths = crate::audit::scope::paths_for(work, scope);
     let script = format!(
         "cd {} || exit 3; find {} -type f \\( -path '*/.git/*' -o -path '*/target/*' -o -path '*/node_modules/*' -o -path '*/checks/*' \\) -prune -o -type f -print 2>/dev/null \
@@ -182,7 +187,7 @@ pub fn preview(work: &str, scope: &[String]) -> std::result::Result<Vec<String>,
         crate::util::shell_quote(work),
         if paths.is_empty() { ".".to_string() } else { paths.iter().map(|p| crate::util::shell_quote(p)).collect::<Vec<_>>().join(" ") }
     );
-    let ran = crate::vm::netboxes::machine(&script, 60)?;
+    let ran = run(&script, 60)?;
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for line in ran.stdout.lines() {
         let mut parts = line.split_whitespace();
@@ -260,6 +265,13 @@ pub fn doctor_in_background(lang: String) -> std::result::Result<String, String>
     let bad = parsed.get("bad").map(|v| v.text()).unwrap_or_else(|| "false".into());
     let hash = format!("{:x}", crate::util::fnv1a64(text.as_bytes()));
     let detail = format!("{}\n{good}\n{bad}", setup.join("\n"));
+    {
+        let mut running = crate::util::locked(&DOCTORING);
+        if running.contains(&lang) {
+            return Ok(format!("[audit] the {lang} doctor run is already going"));
+        }
+        running.push(lang.clone());
+    }
     let thread_lang = lang.clone();
     let _ = std::thread::Builder::new().name("audit-doctor".into()).spawn(move || {
         let lang = thread_lang;
@@ -288,6 +300,7 @@ pub fn doctor_in_background(lang: String) -> std::result::Result<String, String>
                     state.doctor_passed = true;
                     state.doctor_note = note.clone();
                     crate::terminal::say_status(&format!("[audit] the {lang} adapter passed its doctor run"));
+                    crate::audit::run::unblock(&store, &lang);
                 }
                 Err(error) => {
                     state.doctor_passed = false;
@@ -297,6 +310,7 @@ pub fn doctor_in_background(lang: String) -> std::result::Result<String, String>
             }
             let _ = store.set_adapter_state(&lang, &state);
         }
+        crate::util::locked(&DOCTORING).retain(|l| l != &lang);
     });
     Ok(format!("[audit] doctor run for {lang} started"))
 }
@@ -310,14 +324,37 @@ pub fn usable(lang: &str, kind: &str) -> std::result::Result<(), String> {
         return Ok(());
     }
     let state = audit::store().and_then(|s| s.adapter_state(lang).ok().flatten()).unwrap_or_default();
+    let instead = "kinds usable now without it: test, command, differential, tla";
+    if crate::util::locked(&DOCTORING).iter().any(|l| l == lang) {
+        return Err(format!("the {lang} adapter's doctor run is going: it is used once that passes ({instead})"));
+    }
+    if state.doctor_at.is_none() && !cfg!(test) {
+        // Never run: it runs now, rather than waiting for the operator to
+        // think of it. The claim waits on it, blocked, not skipped.
+        let _ = doctor_in_background(lang.to_string());
+        return Err(format!("the {lang} adapter has not had its doctor run: it starts now, and is used once it passes ({instead})"));
+    }
     if changed_since_doctor(lang) {
         let _ = doctor_in_background(lang.to_string());
         return Err(format!("the {lang} adapter changed since its doctor run: it runs again now (an adapter is used only once it passes)"));
     }
     if !state.doctor_passed {
-        return Err(format!("the {lang} adapter has not passed its doctor run: /audit doctor {lang} (an adapter is used only once it passes)"));
+        return Err(format!(
+            "the {lang} adapter failed its doctor run ({}): /audit doctor {lang} runs it again ({instead})",
+            crate::util::clip(&state.doctor_note, 200)
+        ));
     }
     Ok(())
+}
+
+/// Doctor runs going now, by language.
+static DOCTORING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The adapter a refusal from `usable` names, if it was one.
+pub fn blocked_lang(reason: &str) -> Option<String> {
+    let rest = reason.strip_prefix("the ")?;
+    let (lang, after) = rest.split_once(' ')?;
+    (after.starts_with("adapter") && adapter(lang).is_some()).then(|| lang.to_string())
 }
 
 /// Whether an adapter changed since its doctor run (it runs again).

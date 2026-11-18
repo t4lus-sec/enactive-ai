@@ -39,13 +39,7 @@ pub const STATUS_STYLE: &str = "\x1b[2;36m";
 pub const RESET: &str = "\x1b[0m";
 
 const BANNER: &str = r#"
- ░▒▓███████▓▒░▒▓████████▓▒░▒▓██████████████▓▒░ ░▒▓██████▓▒░
-░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
-░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
- ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░
-       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
-       ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
-░▒▓███████▓▒░░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
+
 "#;
 
 const ACTIVE_INPUT_ROWS: u16 = 5;
@@ -69,7 +63,7 @@ pub fn banner() {
     say(
         r#"
   ________________
-< Hack the planet! >
+< Hello! >
   ----------------
          \   ^__^
           \  (oo)\_______
@@ -287,11 +281,12 @@ pub fn say_status(text: &str) {
     harness_output(Entry::Notice { brief: tagged_brief(&text), full: text.clone(), mark: Mark::Work }, || println!("{text}"));
 }
 
-/// `say_status` with its own collapsed wording, for a message too long to
-/// read at a glance.
-pub fn say_status_as(brief: &str, text: &str) {
+/// Something that waits for the operator's answer: collapsed, a `[!]` block
+/// of `brief`'s lines (its first the heading, indented ones the command or
+/// text asked about); expanded, `text`.
+pub fn say_ask(brief: &str, text: &str) {
     let text = safe_text(text);
-    harness_output(Entry::Notice { brief: safe_text(brief), full: text.clone(), mark: Mark::Work }, || println!("{text}"));
+    harness_output(Entry::Notice { brief: safe_text(brief), full: text.clone(), mark: Mark::Ask }, || println!("{text}"));
 }
 
 /// `say_status` for a step that finished: a green `[+]` line collapsed
@@ -406,6 +401,8 @@ pub enum Activity {
     Tool(String),
     /// A deep sleep: the keys are read, and its own lines say how it goes.
     Sleeping,
+    /// `/compact` at the prompt: the keys are read, as for a sleep.
+    Compacting,
 }
 
 impl Activity {
@@ -416,6 +413,7 @@ impl Activity {
             Activity::Writing => "writing".into(),
             Activity::Tool(name) => format!("running {name}"),
             Activity::Sleeping => "sleeping".into(),
+            Activity::Compacting => "compacting".into(),
         }
     }
 }
@@ -539,7 +537,8 @@ fn restore_codes(alternate: bool) -> String {
 /// back through the agent's conversation on its page (`tabs::history`). Not
 /// movement (crossterm's EnableMouseCapture asks for every motion too). Off
 /// whenever raw mode is, or the wheel's reports would be echoed as text.
-/// Selecting text with the mouse takes Shift in most terminals meanwhile.
+/// A drag selects text and copies it on release, in a tab or on the page
+/// (`tabs::select_from_page`); the terminal's own selection takes Shift.
 /// 1002 adds movement while a button is held (dragging a selection in the
 /// editor); plain movement is still not reported.
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -1145,10 +1144,12 @@ impl ActiveDisplay {
     /// A message was queued for the agent's next safe point: a status line now;
     /// the message itself goes into the transcript when the agent takes it.
     pub fn queued(&self, input: &str) -> io::Result<()> {
-        let sleeping = self.lock()?.activity == Activity::Sleeping;
+        let activity = self.lock()?.activity.clone();
         let mut note = queued_note(input);
-        if sleeping {
-            note = note.replacen("after the current step", "after the sleep", 1);
+        match activity {
+            Activity::Sleeping => note = note.replacen("after the current step", "after the sleep", 1),
+            Activity::Compacting => note = note.replacen("after the current step", "after the compaction", 1),
+            _ => {}
         }
         self.emit(status_notice(&note, &note))
     }
@@ -1668,6 +1669,16 @@ impl ActiveDisplay {
         stdout.flush()?;
         state.covered = Some(Cover { prompt });
         Ok(())
+    }
+
+    /// The screen row the idle prompt begins on, its draft and cursor given.
+    /// Asks the terminal where the cursor is: for the thread that reads the
+    /// keyboard.
+    pub fn idle_prompt_row(&self, draft: &str, cursor: usize) -> Option<u16> {
+        let (columns, _) = terminal::size().ok()?;
+        let (_, row) = position().ok()?;
+        let (above, _) = prompt_geometry(draft, cursor, columns);
+        Some(row.saturating_sub(above))
     }
 
     /// The tab is closed: the page is drawn again from the record, with what

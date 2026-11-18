@@ -220,6 +220,22 @@ impl App {
             return Ok(CommandOutcome::Handled);
         }
 
+        // /comment <on> <text>, /resolve <comment>: comments on boards and pages.
+        if let Some(rest) = command.strip_prefix("/comment ") {
+            let (on, text) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            match crate::projects::tools::operator_comment(on, text) {
+                Ok(said) => self.notify(&format!("[comment] {said}")),
+                Err(error) => self.notify_error(&format!("[comment] {error}")),
+            }
+            return Ok(CommandOutcome::Handled);
+        }
+        if let Some(id) = command.strip_prefix("/resolve ") {
+            match crate::projects::tools::operator_resolve(id) {
+                Ok(said) => self.notify(&format!("[comment] {said}")),
+                Err(error) => self.notify_error(&format!("[comment] {error}")),
+            }
+            return Ok(CommandOutcome::Handled);
+        }
         if matches!(command.split_whitespace().next(), Some("/board") | Some("/hint") | Some("/unhint")) {
             match board::handle_operator_command(&self.boards, command) {
                 Ok(message) => self.notify(&message),
@@ -346,10 +362,26 @@ impl App {
 
             "/compact" => {
                 self.compaction_started = false;
-                // Gists prepared for this context are no use once it's rotated.
-                self.fold_prep.quiesce();
-                self.compactor.flush(&self.memory)?;
-                match self.rotate_context()? {
+                // At the prompt, the keys are read meanwhile as during a
+                // turn: the tabs and their hotkeys work, and what is typed
+                // waits for the turn after it.
+                let began = !self.input.is_active();
+                if began {
+                    self.input.begin_active()?;
+                    let display = self.input.active_display();
+                    let _ = display.start_clock();
+                    let _ = display.set_activity(crate::terminal::Activity::Compacting);
+                }
+                let rotated = (|| {
+                    // Gists prepared for this context are no use once it's rotated.
+                    self.fold_prep.quiesce();
+                    self.compactor.flush(&self.memory)?;
+                    self.rotate_context()
+                })();
+                if began {
+                    self.input.end_active()?;
+                }
+                match rotated? {
                     Some((id,tokens))=>{
                         // The next input's header says the context was rebuilt.
                         crate::clock::mark_rebuilt(crate::clock::Rebuild::Compaction);

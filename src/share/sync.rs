@@ -30,9 +30,28 @@
 //! **Downloads** are written beside the file and renamed over it, only if
 //! the file here is still as listed.
 //!
-//! Hidden files and folders, `node_modules` and `__pycache__` are left out
-//! on both sides, and files over 32 MB are not copied. `S0MA_SHARE_SYNC=off`
-//! turns it off.
+//! **A move is a move:** a file gone from one path whose new path on the same
+//! side holds the same file (the same signature here; the same size, time and
+//! inode there), with the other side still as it was, is moved there too,
+//! rather than deleted (put aside) and copied. A board's file never leaves
+//! the operator's folder on the way, so the projects scan never stops its work.
+//!
+//! **Projects** (`projects/`) have their own rules, checked on
+//! `ProjectsLogSync.tla` and `ProjectsMoveSync.tla`:
+//! - A board's or audit's file is a log of lines with ids. Changed there, it
+//!   is merged by line id, never kept twice: read here under the file's lock
+//!   (so an append made meanwhile stays), written here, and uploaded only if
+//!   the agent's copy is still as read. Uploads read it under the lock too,
+//!   so no line goes half written. These carry no note for the agent.
+//! - A page (`.md`) changed on both sides is merged three ways against the
+//!   version last in step (kept in `.s0ma-sync-base/`); only a clash keeps
+//!   both, as anywhere else.
+//! - The hidden files a project keeps (`.folder`, `.trash/`, `.s0ma/`) are
+//!   synced.
+//!
+//! Other hidden files and folders, `node_modules` and `__pycache__` are left
+//! out on both sides, and files over 32 MB are not copied.
+//! `S0MA_SHARE_SYNC=off` turns it off.
 
 use crate::share::files::{Change, Expect, Run, WriteError};
 
@@ -133,8 +152,57 @@ fn signature(metadata: &std::fs::Metadata) -> String {
     format!("{}:{nanos}", metadata.len())
 }
 
-fn skipped(name: &str) -> bool {
+/// Left out: hidden names (but a project's own, inside `projects/`),
+/// `node_modules`, `__pycache__`. `prefix` is the folder the name is in.
+fn skipped(prefix: &str, name: &str) -> bool {
+    if prefix.starts_with("projects/") && crate::share::files::PROJECT_HIDDEN.contains(&name) {
+        return false;
+    }
     name.starts_with('.') || name == "node_modules" || name == "__pycache__"
+}
+
+/// A board's or audit's file: merged by line id.
+fn is_log(path: &str) -> bool {
+    path.starts_with("projects/") && !path.contains("/.trash/") && (path.ends_with(".board") || path.ends_with(".audit"))
+}
+
+/// A project page: merged three ways.
+fn is_page(path: &str) -> bool {
+    path.starts_with("projects/") && !path.contains("/.trash/") && path.ends_with(".md")
+}
+
+/// The projects' own files: no note for the agent of each change (the
+/// agent's work writes them; the projects tools read them).
+fn quiet(path: &str) -> bool {
+    path.starts_with("projects/") && (is_log(path) || path.split('/').any(|part| part.starts_with('.')))
+}
+
+/// Where a page's last version in step is kept, for the three-way merge.
+const BASES: &str = ".s0ma-sync-base";
+/// Pages bigger than this are not kept (a clash keeps both).
+const BASE_MAX: usize = 256 * 1024;
+
+fn keep_base(root: &Path, path: &str, bytes: &[u8]) {
+    if !is_page(path) {
+        return;
+    }
+    let kept = root.join(BASES).join(path);
+    if bytes.len() > BASE_MAX {
+        let _ = std::fs::remove_file(kept);
+        return;
+    }
+    if let Some(parent) = kept.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::util::write_atomic(&kept, bytes);
+}
+
+fn base_of(root: &Path, path: &str) -> Option<String> {
+    std::fs::read_to_string(root.join(BASES).join(path)).ok()
+}
+
+fn forget_base(root: &Path, path: &str) {
+    let _ = std::fs::remove_file(root.join(BASES).join(path));
 }
 
 /// The operator's folder: its files by path inside it.
@@ -145,7 +213,7 @@ pub(crate) fn scan(root: &Path) -> BTreeMap<String, LocalFile> {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.filter_map(Result::ok) {
             let Ok(name) = entry.file_name().into_string() else { continue };
-            if skipped(&name) || found.len() >= MAX_FILES {
+            if skipped(&prefix, &name) || found.len() >= MAX_FILES {
                 continue;
             }
             let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else { continue };
@@ -236,16 +304,17 @@ pub(crate) fn round(root: &Path, dir: &str, state: &mut SyncState, run: Run) -> 
         *state = SyncState { remote_dir: dir.to_string(), ..SyncState::default() };
     }
     std::fs::create_dir_all(root).map_err(|error| format!("cannot make {}: {error}", root.display()))?;
-    let remote: BTreeMap<String, RemoteFile> = crate::share::files::list(dir, run)?
+    let mut remote: BTreeMap<String, RemoteFile> = crate::share::files::list(dir, run)?
         .into_iter()
         .filter(|entry| !entry.dir)
         .map(|entry| (entry.path, RemoteFile { stamp: entry.stamp, bytes: entry.bytes }))
         .collect();
-    let local = scan(root);
+    let mut local = scan(root);
     // The first round: what was already here is announced by name only.
     let first = !state.primed;
-    let paths: BTreeSet<String> = local.keys().chain(remote.keys()).chain(state.files.keys()).cloned().collect();
     let mut did = Vec::new();
+    moves(root, dir, &mut local, &mut remote, state, run, &mut did);
+    let paths: BTreeSet<String> = local.keys().chain(remote.keys()).chain(state.files.keys()).cloned().collect();
     for path in paths {
         let (here, there) = (local.get(&path), remote.get(&path));
         if here.is_some_and(|file| file.bytes > MAX_BYTES) || there.is_some_and(|file| file.bytes > MAX_BYTES) {
@@ -257,17 +326,27 @@ pub(crate) fn round(root: &Path, dir: &str, state: &mut SyncState, run: Run) -> 
             Step::Nothing => Ok(None),
             Step::Forget => {
                 state.files.remove(&path);
+                forget_base(root, &path);
                 Ok(None)
             }
             Step::Upload => upload(root, dir, &path, here.expect("here"), there, base.as_ref(), first, state, run),
+            // A log changed there: merged by line id, whether or not it
+            // changed here too.
+            Step::Download | Step::Compare if is_log(&path) && here.is_some() => {
+                merge_log(root, dir, &path, here.expect("here"), there.expect("there"), &local, &remote, state, run)
+            }
             Step::Download => download(root, dir, &path, here, there.expect("there"), state, run),
+            Step::Compare if is_page(&path) => merge_page(root, dir, &path, here.expect("here"), there.expect("there"), &local, &remote, state, run),
             Step::Compare => compare(root, dir, &path, here.expect("here"), there.expect("there"), &local, &remote, state, run),
             Step::DeleteRemote => {
                 let there = there.expect("there");
                 match crate::share::files::remove(dir, &path, Some(&there.stamp), run) {
                     Ok(()) => {
                         state.files.remove(&path);
-                        crate::share::files::record(Change::Removed { path: path.clone() });
+                        forget_base(root, &path);
+                        if !quiet(&path) {
+                            crate::share::files::record(Change::Removed { path: path.clone() });
+                        }
                         Ok(Some(format!("deleted {path} on s0ma's side")))
                     }
                     // Changed there meanwhile: the next round downloads it.
@@ -281,6 +360,7 @@ pub(crate) fn round(root: &Path, dir: &str, state: &mut SyncState, run: Run) -> 
                 if local_sig(&file).as_deref() == here.map(|file| file.sig.as_str()) {
                     let kept = put_aside(root, &path)?;
                     state.files.remove(&path);
+                    forget_base(root, &path);
                     Ok(Some(format!("{DELETED}{path} · kept as {}", home_short(&kept))))
                 } else {
                     Ok(None)
@@ -310,11 +390,14 @@ fn upload(
     run: Run,
 ) -> Result<Option<String>, String> {
     let file = root.join(path);
+    // A log is read under its lock, so no line goes half written.
+    let locked = if is_log(path) { Some(crate::projects::log::Locked::shared(&file)?) } else { None };
     let bytes = std::fs::read(&file).map_err(|error| error.to_string())?;
     // Changing as it is read: the next round.
     if local_sig(&file).as_deref() != Some(here.sig.as_str()) {
         return Ok(None);
     }
+    drop(locked);
     // For the agent: what it was, when it is text small enough to show a diff.
     let before = match (there, base) {
         (Some(there), Some(_)) if there.bytes <= 256 * 1024 => crate::share::files::read(dir, path, there.bytes.max(1), true, run)
@@ -330,8 +413,12 @@ fn upload(
         Err(WriteError::Failed(error)) => return Err(error),
     };
     state.files.insert(path.to_string(), Synced { local: here.sig.clone(), remote: stamp.clone() });
+    keep_base(root, path, &bytes);
     crate::tabs::share_seen(dir, path, &stamp);
     wrote(dir, path, &stamp);
+    if quiet(path) {
+        return Ok(Some(format!("{path} → s0ma")));
+    }
     let after = crate::share::files::text_of(&bytes).and_then(crate::share::files::carried);
     crate::share::files::record(match there {
         Some(there) => Change::Edited { path: path.to_string(), before_stamp: there.stamp.clone(), before, after, stamp },
@@ -358,6 +445,7 @@ fn download(
         return Ok(None);
     };
     let _ = there;
+    keep_base(root, path, &read.bytes);
     state.files.insert(path.to_string(), Synced { local: sig, remote: read.stamp });
     Ok(Some(format!("{path} ← s0ma")))
 }
@@ -379,6 +467,7 @@ fn compare(
     let theirs = if here.bytes == there.bytes { Some(crate::share::files::read(dir, path, MAX_BYTES, true, run)?) } else { None };
     if let Some(theirs) = theirs.filter(|theirs| theirs.bytes == mine) {
         state.files.insert(path.to_string(), Synced { local: here.sig.clone(), remote: theirs.stamp });
+        keep_base(root, path, &mine);
         return Ok(None);
     }
     // Both changed: the operator's is kept beside, and both reach both sides.
@@ -390,6 +479,227 @@ fn compare(
     state.files.remove(path);
     crate::share::files::record(Change::KeptBeside { path: path.to_string(), kept_as: kept.clone() });
     Ok(Some(format!("{path} changed on both sides · yours is {kept}")))
+}
+
+// ------------------------------------------------------------------ moves
+
+/// Moves made on one side since the last round, made on the other as moves:
+/// a path gone from one side while the other still has it as it was, and a
+/// new path on the first side holding the same file (one only). The maps
+/// and records follow, so the paths' own rules find nothing left to do.
+fn moves(
+    root: &Path,
+    dir: &str,
+    local: &mut BTreeMap<String, LocalFile>,
+    remote: &mut BTreeMap<String, RemoteFile>,
+    state: &mut SyncState,
+    run: Run,
+    did: &mut Vec<String>,
+) {
+    let bases: Vec<(String, Synced)> = state.files.iter().map(|(path, base)| (path.clone(), base.clone())).collect();
+    for (from, base) in bases {
+        let (here, there) = (local.get(&from), remote.get(&from));
+        let new_here = |path: &String| !state.files.contains_key(path) && !remote.contains_key(path);
+        // Moved here: there, the same.
+        if here.is_none() && there.is_some_and(|there| there.stamp == base.remote) {
+            let to: Vec<String> = local.iter().filter(|(path, file)| file.sig == base.local && new_here(path)).map(|(path, _)| path.clone()).collect();
+            let [to] = to.as_slice() else { continue };
+            match crate::share::files::rename(dir, &from, to, crate::share::files::identity(&base.remote), run) {
+                Ok(stamp) => {
+                    let bytes = remote.remove(&from).map_or(0, |file| file.bytes);
+                    remote.insert(to.clone(), RemoteFile { stamp: stamp.clone(), bytes });
+                    state.files.remove(&from);
+                    state.files.insert(to.clone(), Synced { local: base.local.clone(), remote: stamp.clone() });
+                    move_base(root, &from, to);
+                    crate::tabs::share_seen(dir, to, &stamp);
+                    wrote(dir, to, &stamp);
+                    if !quiet(to) {
+                        crate::share::files::record(Change::Moved { from: from.clone(), to: to.clone() });
+                    }
+                    did.push(format!("{from} → {to} on s0ma's side"));
+                }
+                // Changed there meanwhile: each path's own rule.
+                Err(WriteError::Changed) => {}
+                Err(WriteError::Failed(error)) => did.push(format!("{from}: {error}")),
+            }
+            continue;
+        }
+        // Moved there: here, the same.
+        if there.is_none() && here.is_some_and(|here| here.sig == base.local) {
+            let identity = crate::share::files::identity(&base.remote).to_string();
+            let new_there = |path: &String| !state.files.contains_key(path) && !local.contains_key(path);
+            let to: Vec<String> = remote
+                .iter()
+                .filter(|(path, file)| crate::share::files::identity(&file.stamp) == identity && new_there(path))
+                .map(|(path, _)| path.clone())
+                .collect();
+            let [to] = to.as_slice() else { continue };
+            match move_local(root, &from, to, &base.local) {
+                Ok(true) => {
+                    if let Some(file) = local.remove(&from) {
+                        local.insert(to.clone(), file);
+                    }
+                    let stamp = remote.get(to).map(|file| file.stamp.clone()).unwrap_or_default();
+                    state.files.remove(&from);
+                    state.files.insert(to.clone(), Synced { local: base.local.clone(), remote: stamp });
+                    move_base(root, &from, to);
+                    did.push(format!("{from} → {to} ← s0ma"));
+                }
+                Ok(false) => {}
+                Err(error) => did.push(format!("{from}: {error}")),
+            }
+        }
+    }
+}
+
+/// `from` renamed to `to` here, if it is still `sig` and nothing is at `to`;
+/// the folders it leaves empty go. Under the projects' lock, so no store
+/// writes it and no scan looks while it moves.
+fn move_local(root: &Path, from: &str, to: &str, sig: &str) -> Result<bool, String> {
+    let (source, target) = (root.join(from), root.join(to));
+    crate::projects::while_writing(|| {
+        if local_sig(&source).as_deref() != Some(sig) || target.symlink_metadata().is_ok() {
+            return Ok(false);
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::rename(&source, &target).map_err(|error| error.to_string())?;
+        let mut folder = source.parent().map(Path::to_path_buf);
+        while let Some(dir) = folder.filter(|dir| dir.starts_with(root) && dir != root) {
+            if std::fs::remove_dir(&dir).is_err() {
+                break;
+            }
+            folder = dir.parent().map(Path::to_path_buf);
+        }
+        Ok(true)
+    })
+}
+
+fn move_base(root: &Path, from: &str, to: &str) {
+    let (source, target) = (root.join(BASES).join(from), root.join(BASES).join(to));
+    if source.exists() {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(source, target);
+    }
+}
+
+// ------------------------------------------------------------------ projects
+
+/// A board's or audit's file changed there (and maybe here): both as one, by
+/// line id. Read here under the file's lock, so a line the harness appends
+/// meanwhile is in the merge or after it, never written over; uploaded only
+/// if the agent's copy is still as read (else the next round merges again).
+/// Not a log, or another board's: as any file.
+#[allow(clippy::too_many_arguments)]
+fn merge_log(
+    root: &Path,
+    dir: &str,
+    path: &str,
+    here: &LocalFile,
+    there: &RemoteFile,
+    local: &BTreeMap<String, LocalFile>,
+    remote: &BTreeMap<String, RemoteFile>,
+    state: &mut SyncState,
+    run: Run,
+) -> Result<Option<String>, String> {
+    use crate::projects::log;
+    let read = crate::share::files::read(dir, path, MAX_BYTES, true, run)?;
+    let Ok(theirs) = log::parse(read.bytes.as_slice()) else {
+        return compare(root, dir, path, here, there, local, remote, state, run);
+    };
+    let file = root.join(path);
+    let locked = log::Locked::exclusive(&file)?;
+    let mine = log::read_from(&locked.file)?;
+    if mine.id() != theirs.id() || mine.kind() != theirs.kind() {
+        drop(locked);
+        return compare(root, dir, path, here, there, local, remote, state, run);
+    }
+    let merged = log::merge(&mine, &theirs);
+    let text = log::to_text(&merged)?;
+    let current = std::fs::read(&file).map_err(|error| error.to_string())?;
+    let sig = if text.as_bytes() != current.as_slice() {
+        log::rewrite_locked(&file, &locked, &merged)?;
+        // Lines may be appended to the new file at once: unknown, so the next
+        // round uploads whatever it holds then.
+        String::new()
+    } else {
+        local_sig(&file).unwrap_or_default()
+    };
+    drop(locked);
+    let stamp = if text.as_bytes() != read.bytes.as_slice() {
+        match crate::share::files::write(dir, path, text.as_bytes(), &Expect::Stamp(read.stamp.clone()), run) {
+            Ok(stamp) => {
+                crate::tabs::share_seen(dir, path, &stamp);
+                wrote(dir, path, &stamp);
+                stamp
+            }
+            Err(WriteError::Changed) => read.stamp.clone(),
+            Err(WriteError::Failed(error)) => return Err(error),
+        }
+    } else {
+        read.stamp.clone()
+    };
+    state.files.insert(path.to_string(), Synced { local: sig, remote: stamp });
+    Ok(Some(format!("{path} ⇄ merged")))
+}
+
+/// A page changed on both sides: the two edits as one, against the version
+/// last in step, when they don't clash; else both kept, as any file.
+#[allow(clippy::too_many_arguments)]
+fn merge_page(
+    root: &Path,
+    dir: &str,
+    path: &str,
+    here: &LocalFile,
+    there: &RemoteFile,
+    local: &BTreeMap<String, LocalFile>,
+    remote: &BTreeMap<String, RemoteFile>,
+    state: &mut SyncState,
+    run: Run,
+) -> Result<Option<String>, String> {
+    let file = root.join(path);
+    let merged = (|| {
+        let base = base_of(root, path)?;
+        let mine = std::fs::read_to_string(&file).ok()?;
+        let read = crate::share::files::read(dir, path, MAX_BYTES, true, run).ok()?;
+        let theirs = crate::share::files::text_of(&read.bytes)?.to_string();
+        let text = crate::editor::merge_text(&base, &mine, &theirs)?;
+        Some((text, theirs, read.stamp))
+    })();
+    let Some((text, theirs, theirs_stamp)) = merged else {
+        return compare(root, dir, path, here, there, local, remote, state, run);
+    };
+    let Some(sig) = put_local(&file, text.as_bytes(), Some(&here.sig))? else {
+        // Changed here meanwhile: the next round.
+        return Ok(None);
+    };
+    let stamp = if text != theirs {
+        match crate::share::files::write(dir, path, text.as_bytes(), &Expect::Stamp(theirs_stamp.clone()), run) {
+            Ok(stamp) => {
+                crate::tabs::share_seen(dir, path, &stamp);
+                wrote(dir, path, &stamp);
+                crate::share::files::record(Change::Edited {
+                    path: path.to_string(),
+                    before_stamp: theirs_stamp,
+                    before: crate::share::files::carried(&theirs),
+                    after: crate::share::files::carried(&text),
+                    stamp: stamp.clone(),
+                });
+                stamp
+            }
+            // Changed there again: merged again next round, from the same base.
+            Err(WriteError::Changed) => return Ok(None),
+            Err(WriteError::Failed(error)) => return Err(error),
+        }
+    } else {
+        theirs_stamp
+    };
+    state.files.insert(path.to_string(), Synced { local: sig, remote: stamp });
+    keep_base(root, path, text.as_bytes());
+    Ok(Some(format!("{path} changed on both sides · merged")))
 }
 
 // ------------------------------------------------------------------ running
@@ -634,5 +944,110 @@ mod tests {
         assert!(put_local(&path, b"s0ma's", sig.as_deref()).unwrap().is_some());
         assert_eq!(here.get("a.md"), "s0ma's");
         assert_eq!(std::fs::read_dir(&here.0).unwrap().count(), 1, "no temp file left");
+    }
+
+    fn exists(folder: &Folder, relative: &str) -> bool {
+        Path::new(&folder.0).join(relative).exists()
+    }
+
+    const HEADER: &str = "{\"s0ma\":\"board\",\"v\":1,\"id\":\"board-0001\"}\n";
+
+    fn line(n: &str, text: &str) -> String {
+        format!("{{\"n\":\"{n}\",\"at\":\"2026-11-13T10:00:00.{}Z\",\"op\":\"hint\",\"text\":\"{text}\"}}\n", &n[1..])
+    }
+
+    /// A board's file appended to on both sides: every line on both, once,
+    /// and no copy kept beside it.
+    #[test]
+    fn a_log_changed_on_both_sides_is_merged_by_line() {
+        let _notes = NOTES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pair = Pair::new("sync-log");
+        let board = "projects/calc/edit-lost.board";
+        pair.here.put(board, &format!("{HEADER}{}", line("a.1", "one")));
+        pair.round();
+        assert_eq!(pair.there.get(board), pair.here.get(board));
+        pair.here.put(board, &format!("{HEADER}{}{}", line("a.1", "one"), line("a.2", "two here")));
+        pair.there.put(board, &format!("{HEADER}{}{}", line("a.1", "one"), line("b.1", "three there")));
+        let did = pair.round();
+        assert!(did.iter().any(|l| l.contains("merged")), "{did:?}");
+        pair.round();
+        for side in [&pair.here, &pair.there] {
+            let text = side.get(board);
+            assert!(text.contains("two here") && text.contains("three there") && text.matches("\"one\"").count() == 1, "{text}");
+        }
+        assert_eq!(pair.here.get(board), pair.there.get(board));
+        assert!(!exists(&pair.here, "projects/calc/edit-lost (operator copy).board"));
+        assert!(pair.round().is_empty(), "in step");
+        assert!(crate::share::files::take_note().is_none(), "no note for the agent of a board's lines");
+    }
+
+    /// A page edited on both sides, in different places: both edits on both.
+    #[test]
+    fn a_page_changed_on_both_sides_is_merged() {
+        let _notes = NOTES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pair = Pair::new("sync-page");
+        let page = "projects/calc/index.md";
+        pair.here.put(page, "# calc\n\nfirst\n\nmiddle\n\nlast\n");
+        pair.round();
+        pair.here.put(page, "# calc\n\nfirst, the operator's\n\nmiddle\n\nlast\n");
+        pair.there.put(page, "# calc\n\nfirst\n\nmiddle\n\nlast, the agent's\n");
+        let did = pair.round();
+        assert!(did.iter().any(|l| l.contains("merged")), "{did:?}");
+        let both = "# calc\n\nfirst, the operator's\n\nmiddle\n\nlast, the agent's\n";
+        assert_eq!(pair.here.get(page), both);
+        assert_eq!(pair.there.get(page), both);
+        assert!(pair.round().is_empty());
+        // The same line changed on both: both kept, as anywhere.
+        pair.here.put(page, "# calc, mine\n");
+        pair.there.put(page, "# calc, theirs\n");
+        pair.round();
+        assert!(exists(&pair.here, "projects/calc/index (operator copy).md"));
+        let _ = crate::share::files::take_note();
+    }
+
+    /// Moved on either side: moved on the other, nothing put aside, the
+    /// folders left empty gone.
+    #[test]
+    fn a_move_is_a_move() {
+        let _notes = NOTES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pair = Pair::new("sync-move");
+        pair.here.put("projects/inbox/edit-lost.board", HEADER);
+        pair.here.put("projects/calc/index.md", "# calc\n");
+        pair.round();
+        // Here.
+        std::fs::rename(Path::new(&pair.here.0).join("projects/inbox/edit-lost.board"), Path::new(&pair.here.0).join("projects/calc/edit-lost.board")).unwrap();
+        let did = pair.round();
+        assert!(did.iter().any(|l| l.contains("on s0ma's side") && l.contains("→")), "{did:?}");
+        assert!(exists(&pair.there, "projects/calc/edit-lost.board"));
+        assert!(!exists(&pair.there, "projects/inbox"), "the empty folder went");
+        assert!(pair.round().is_empty());
+        // There.
+        let there = Path::new(&pair.there.0);
+        std::fs::create_dir_all(there.join("projects/.trash/1")).unwrap();
+        std::fs::rename(there.join("projects/calc/edit-lost.board"), there.join("projects/.trash/1/edit-lost.board")).unwrap();
+        let did = pair.round();
+        assert!(did.iter().any(|l| l.contains("← s0ma")), "{did:?}");
+        assert!(exists(&pair.here, "projects/.trash/1/edit-lost.board"), "the trash is synced");
+        assert!(!exists(&pair.here, ".s0ma-deleted"), "nothing put aside");
+        assert!(pair.round().is_empty());
+        let _ = crate::share::files::take_note();
+    }
+
+    /// A project's hidden files are synced; others are not.
+    #[test]
+    fn a_projects_hidden_files_are_synced() {
+        let _notes = NOTES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pair = Pair::new("sync-hidden");
+        pair.here.put("projects/calc/.folder", "{\"s0ma\":\"folder\",\"v\":1}\n");
+        pair.here.put(".private", "mine");
+        pair.here.put("notes/.hidden", "mine");
+        pair.round();
+        assert!(exists(&pair.there, "projects/calc/.folder"));
+        assert!(!exists(&pair.there, ".private") && !exists(&pair.there, "notes/.hidden"));
+        // And back.
+        pair.there.put("projects/calc/.folder", "{\"s0ma\":\"folder\",\"v\":1}\n{\"op\":\"archived\"}\n");
+        pair.round();
+        assert!(pair.here.get("projects/calc/.folder").contains("archived"));
+        let _ = crate::share::files::take_note();
     }
 }

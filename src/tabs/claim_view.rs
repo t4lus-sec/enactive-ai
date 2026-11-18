@@ -69,6 +69,8 @@ pub(super) struct State {
     pub audit: String,
     /// The claim (None: code first, a file with its claims).
     pub claim: Option<String>,
+    /// Which of its checks (`k2`); None: the one its line speaks for.
+    pub check: Option<String>,
     pub pane: usize,
     pub scroll: [usize; 3],
     /// The code pane's line, and which file.
@@ -93,10 +95,26 @@ impl State {
     /// The view of `claim`: its code and spec read from the work tree on a
     /// thread of their own.
     pub(super) fn open(audit: &Audit, claim: &Claim) -> State {
+        State::open_check(audit, claim, None)
+    }
+
+    /// The view of one of `claim`'s checks (`k2`).
+    pub(super) fn open_check(audit: &Audit, claim: &Claim, check: Option<&str>) -> State {
         let mut state = State::blank(&audit.name, Some(claim.id.clone()));
-        state.steps = audit::store().map(|store| trace_steps(&store, &audit.name, claim)).unwrap_or_default();
-        state.load(audit, claim_files(audit, claim));
+        state.check = check.map(str::to_string);
+        state.steps = state.check_now().map(|k| trace_steps(&audit.name, claim, &k)).unwrap_or_default();
+        state.load(audit, claim_files(audit, claim, state.check_now().as_ref()));
         state
+    }
+
+    /// The check shown: the one named, else the one the claim's line speaks for.
+    pub(super) fn check_now(&self) -> Option<audit::Check> {
+        let store = audit::store()?;
+        let claim = self.claim.as_deref()?;
+        match &self.check {
+            Some(slot) => store.current_checks(&self.audit, claim).ok()?.into_iter().find(|k| k.slot() == slot),
+            None => store.current_check(&self.audit, claim).ok().flatten(),
+        }
     }
 
     /// Code first: `file` with every claim about it in the gutter.
@@ -112,6 +130,7 @@ impl State {
         State {
             audit: audit.to_string(),
             claim,
+            check: None,
             pane: 0,
             scroll: [0; 3],
             cursor: 0,
@@ -136,14 +155,11 @@ impl State {
         let slot: Slot<Loaded> = Arc::new(Mutex::new(None));
         self.loading = Some(slot.clone());
         let work = audit.work.clone();
-        let claim = self.claim.clone();
-        let survived: Vec<String> = claim
-            .as_deref()
-            .and_then(|c| audit::store().and_then(|s| s.current_check(&audit.name, c).ok().flatten()))
-            .map(|check| check.survived)
-            .unwrap_or_default();
+        let check = self.check_now();
+        let survived: Vec<String> = check.as_ref().map(|k| k.survived.clone()).unwrap_or_default();
+        let dir = check.map(|k| k.dir);
         let _ = std::thread::Builder::new().name("claim-view".into()).spawn(move || {
-            let read = read_tree(&work, claim.as_deref(), &files).map(|mut loaded| {
+            let read = read_tree(&work, dir.as_deref(), &files).map(|mut loaded| {
                 for mutant in &mut loaded.mutants {
                     mutant.killed = !survived.contains(&mutant.name);
                 }
@@ -211,8 +227,7 @@ impl State {
         let claim = self.claim_now()?;
         let file = self.file.clone()?;
         let lines = self.lines();
-        let check = audit::store().and_then(|s| s.current_check(&self.audit, &claim.id).ok().flatten());
-        let targets = check.map(|c| c.targets).unwrap_or_default();
+        let targets = self.check_now().map(|c| c.targets).unwrap_or_default();
         for target in targets {
             if let Some((path, symbol)) = target.split_once(':')
                 && path == file
@@ -243,7 +258,7 @@ impl State {
 
 /// The files a claim's code is in: its check's targets, the files its spec
 /// maps with `@code`, its source, the scope's paths.
-fn claim_files(audit: &Audit, claim: &Claim) -> Vec<String> {
+fn claim_files(audit: &Audit, claim: &Claim, check: Option<&audit::Check>) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
     let mut add = |file: &str| {
         let file = file.trim().trim_start_matches("./").to_string();
@@ -251,9 +266,7 @@ fn claim_files(audit: &Audit, claim: &Claim) -> Vec<String> {
             files.push(file);
         }
     };
-    if let Some(store) = audit::store()
-        && let Ok(Some(check)) = store.current_check(&audit.name, &claim.id)
-    {
+    if let Some(check) = check {
         for target in &check.targets {
             add(target.split(':').next().unwrap_or(target));
         }
@@ -274,7 +287,7 @@ fn claim_files(audit: &Audit, claim: &Claim) -> Vec<String> {
 
 /// The files, the claim's spec, its mutants and coverage, from the work tree
 /// on the agent's machine, in one command.
-fn read_tree(work: &str, claim: Option<&str>, files: &[String]) -> Result<Loaded, String> {
+fn read_tree(work: &str, dir: Option<&str>, files: &[String]) -> Result<Loaded, String> {
     let q = crate::util::shell_quote;
     let mut script = format!(
         "cd {} || exit 3\nemit(){{ printf '\\n@@@S0MA %s %s\\n' \"$1\" \"$2\"; head -c 400000 \"$3\"; }}\n",
@@ -283,11 +296,11 @@ fn read_tree(work: &str, claim: Option<&str>, files: &[String]) -> Result<Loaded
     for file in files {
         script.push_str(&format!("[ -f {f} ] && emit code {f} {f}\n", f = q(file)));
     }
-    if let Some(claim) = claim {
-        let dir = q(&format!("checks/{claim}"));
+    if let Some(raw) = dir {
+        let dir = q(raw);
         script.push_str(&format!(
             "if [ -d {dir} ]; then\n\
-             for f in $(find {dir} -type f ! -path '*/mutants/*' ! -name coverage.lines | sort | head -20); do emit spec \"${{f#checks/{claim}/}}\" \"$f\"; done\n\
+             for f in $(find {dir} -maxdepth 3 -type f ! -path '*/mutants/*' ! -path '{raw}/k[0-9]*/*' ! -name coverage.lines | sort | head -20); do emit spec \"${{f#{raw}/}}\" \"$f\"; done\n\
              for f in {dir}/mutants/*; do [ -f \"$f\" ] && emit mutant \"$(basename \"$f\")\" \"$f\"; done\n\
              [ -f {dir}/coverage.lines ] && emit coverage x {dir}/coverage.lines\n\
              for f in $(grep -rhoE '@code [^: ]+' {dir} 2>/dev/null | awk '{{print $2}}' | sort -u | head -8); do [ -f \"$f\" ] && emit code \"$f\" \"$f\"; done\n\
@@ -374,8 +387,9 @@ pub(super) fn parse_patch(name: &str, patch: &str) -> Option<Mutant> {
 /// The claim's counterexample, from its trace evidence, as steps: a TLC
 /// trace's states, or the source locations of a Kani trace or a failing
 /// test's output, or a shrunk case.
-fn trace_steps(store: &audit::AuditStore, audit: &str, claim: &Claim) -> Vec<Step> {
-    let Some(trace) = &claim.trace else { return Vec::new() };
+fn trace_steps(audit: &str, claim: &Claim, check: &audit::Check) -> Vec<Step> {
+    let Some(store) = audit::store() else { return Vec::new() };
+    let Some(trace) = check.trace.as_ref().or(claim.trace.as_ref()) else { return Vec::new() };
     let text = store.evidence(audit, Some(&claim.id)).unwrap_or_default().into_iter().rev().find(|e| e.kind == "trace" && e.path == *trace).map(|e| e.result).unwrap_or_default();
     parse_trace(&text)
 }
@@ -615,7 +629,7 @@ fn step_line(state: &State) -> Option<(usize, bool)> {
 /// The claim pane, whole.
 fn claim_pane(state: &State, claim: &Claim, width: usize) -> Vec<Line> {
     let store = audit::store();
-    let check = store.as_ref().and_then(|s| s.current_check(&state.audit, &claim.id).ok().flatten());
+    let check = state.check_now();
     let mut out: Vec<Line> = Vec::new();
     let (mark, tone) = claim.mark();
     let tone = match tone {
@@ -637,9 +651,11 @@ fn claim_pane(state: &State, claim: &Claim, width: usize) -> Vec<Line> {
     }
     out.push(Vec::new());
     // The clauses, each with what the spec says about it.
-    out.push(vec![(Style::Status, "clauses".into()), (Style::Dim, "  ←→ selects one: its lines light in every pane".into())]);
+    out.push(vec![(Style::Status, "clauses".into())]);
     let back = check.as_ref().and_then(|c| c.back_translation.clone());
-    let sentences: Vec<String> = back.as_deref().map(|b| b.split_inclusive(['.', ';']).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    // Its sentences, and apart from them whether its reader read it all.
+    let (read, said) = back.as_deref().map(super::audit_tree::read_back).unwrap_or((None, String::new()));
+    let sentences: Vec<String> = sentences_of(&said);
     let mut placed = vec![false; sentences.len()];
     for (i, clause) in audit::clauses(&claim.text).iter().enumerate() {
         let k = i + 1;
@@ -664,16 +680,19 @@ fn claim_pane(state: &State, claim: &Claim, width: usize) -> Vec<Line> {
     if !unplaced.is_empty() {
         out.extend(super::flow(&[(Style::Work, format!("says (back-translation)  {}", unplaced.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")))], width, 2));
     } else if check.is_some() && back.is_none() {
-        out.push(vec![(Style::Dim, "says    (back-translation not back yet)".into())]);
+        out.push(vec![(Style::Dim, "says    pending".into())]);
+    }
+    if let Some((whole, note)) = read {
+        out.extend(super::flow(&[(if whole { Style::Dim } else { Style::Warn }, format!("read    {note}"))], width, 8));
     }
     out.push(Vec::new());
     // The result.
     match &check {
-        None => out.push(vec![(Style::Dim, "check   no spec yet".into())]),
+        None => out.push(vec![(Style::Dim, "check   none yet".into())]),
         Some(check) => {
             out.push(vec![(Style::Status, "check   ".into()), (Style::Plain, format!("{} · {} · v{}{}", check.kind, check.lang, check.version, if check.by == "operator" { " · yours" } else { "" }))]);
             match check.kills {
-                Some((k, t)) => out.push(vec![(Style::Status, "mutants ".into()), (if k == 0 { Style::Danger } else { Style::Plain }, format!("{k}/{t} killed")), (Style::Dim, if k == 0 { " · vacuous: counts as documented".into() } else { String::new() })]),
+                Some((k, t)) => out.push(vec![(Style::Status, "mutants ".into()), (if k == 0 { Style::Danger } else { Style::Plain }, format!("{k}/{t} killed")), (Style::Dim, if k == 0 { " · vacuous".into() } else { String::new() })]),
                 None => out.push(vec![(Style::Dim, "mutants not run yet".into())]),
             }
             let readings: Vec<audit::Evidence> = store.as_ref().map(|s| s.evidence(&state.audit, Some(&claim.id)).unwrap_or_default().into_iter().filter(|e| e.kind == "reading").collect()).unwrap_or_default();
@@ -682,11 +701,11 @@ fn claim_pane(state: &State, claim: &Claim, width: usize) -> Vec<Line> {
                 out.push(vec![(if here { Style::Cursor } else { Style::Danger }, format!("  {}[-] {name}", if here { "❯" } else { " " }))]);
                 match readings.iter().rev().find(|r| r.name == *name) {
                     Some(reading) => out.extend(super::flow(&[(Style::Work, format!("      s0ma's reading: {}", reading.result))], width, 6)),
-                    None => out.push(vec![(Style::Dim, "      no reading from s0ma yet: a gap, or outside the claim?".into())]),
+                    None => out.push(vec![(Style::Dim, "      no reading yet".into())]),
                 }
             }
             if check.kind == "tla" && claim.repro != Repro::Fails && claim.verdict == Verdict::Fails {
-                out.push(vec![(Style::Danger, "model only: the code pane follows s0ma's mapping, not checked".into())]);
+                out.push(vec![(Style::Danger, "model only: mapping not checked".into())]);
             }
         }
     }
@@ -696,8 +715,8 @@ fn claim_pane(state: &State, claim: &Claim, width: usize) -> Vec<Line> {
     }
     if let Some(test) = &claim.repro_test {
         let said = match claim.repro {
-            Repro::Fails => format!("fails on the real code: {}", crate::util::clip(claim.repro_output.as_deref().unwrap_or("").lines().last().unwrap_or(""), 60)),
-            Repro::Passes => "passes on the real code: not a repro".into(),
+            Repro::Fails => format!("fails: {}", crate::util::clip(claim.repro_output.as_deref().unwrap_or("").lines().last().unwrap_or(""), 60)),
+            Repro::Passes => "passes: not a repro".into(),
             _ => "waiting to run".into(),
         };
         text(&mut out, if claim.repro == Repro::Fails { Style::Danger } else { Style::Plain }, format!("repro   {} · {said}", test.split(" :: ").next().unwrap_or(test)));
@@ -712,7 +731,7 @@ fn claim_pane(state: &State, claim: &Claim, width: usize) -> Vec<Line> {
     // The counterexample.
     if !state.steps.is_empty() {
         out.push(Vec::new());
-        out.push(vec![(Style::Status, "counterexample".into()), (Style::Dim, format!("  {} steps · [ ] step through", state.steps.len()))]);
+        out.push(vec![(Style::Status, "counterexample".into()), (Style::Dim, format!("  {} steps", state.steps.len()))]);
         for (i, step) in state.steps.iter().enumerate() {
             let here = state.step == Some(i);
             out.push(vec![(if here { Style::Cursor } else { Style::Plain }, format!("{}{:>2} ", if here { "[*]" } else { "   " }, i + 1)), (if here { Style::Bold } else { Style::Plain }, crate::util::clip(&step.label, width.saturating_sub(6)))]);
@@ -738,7 +757,7 @@ fn claims_by_line(state: &State) -> HashMap<usize, Vec<String>> {
     let lines = state.lines();
     for claim in store.claims(&state.audit).unwrap_or_default() {
         let mut at: Vec<usize> = Vec::new();
-        if let Ok(Some(check)) = store.current_check(&state.audit, &claim.id) {
+        for check in store.current_checks(&state.audit, &claim.id).unwrap_or_default() {
             for target in &check.targets {
                 if let Some((path, symbol)) = target.split_once(':')
                     && path == file
@@ -765,7 +784,7 @@ fn claims_by_line(state: &State) -> HashMap<usize, Vec<String>> {
 fn code_pane(state: &mut State, width: usize, rows: usize) -> Vec<Line> {
     let mut out: Vec<Line> = Vec::new();
     let Some(file) = state.file.clone() else {
-        out.push(vec![(Style::Dim, if state.loaded.is_none() { "reading the work tree…".into() } else { "no code file for this claim (its check names its targets)".to_string() })]);
+        out.push(vec![(Style::Dim, if state.loaded.is_none() { "reading the work tree…".into() } else { "no code file".to_string() })]);
         return out;
     };
     let lines: Vec<String> = state.lines().to_vec();
@@ -789,7 +808,7 @@ fn code_pane(state: &mut State, width: usize, rows: usize) -> Vec<Line> {
         head.push((Style::Dim, " · outside the scope".into()));
     }
     if mapped {
-        head.push((Style::Danger, " · [*] s0ma's mapping, not checked".into()));
+        head.push((Style::Danger, " · [*] mapping, unchecked".into()));
     }
     if loaded.files.len() > 1 {
         head.push((Style::Dim, format!(" · f: {} files", loaded.files.len())));
@@ -802,6 +821,8 @@ fn code_pane(state: &mut State, width: usize, rows: usize) -> Vec<Line> {
     if state.cursor >= state.scroll[1] + rows {
         state.scroll[1] = state.cursor + 1 - rows;
     }
+    // Never past the end: the last line at the bottom at most.
+    state.scroll[1] = state.scroll[1].min(lines.len().saturating_sub(rows));
     let number_width = lines.len().to_string().len().max(3);
     let language = crate::editor::highlight::language(&file);
     let shown_mutant = current_mutant(state).map(str::to_string);
@@ -864,6 +885,26 @@ fn current_mutant(state: &State) -> Option<&str> {
     state.loaded.as_ref()?.mutants.iter().filter(|m| !m.killed).nth(i).map(|m| m.name.as_str())
 }
 
+/// Sentences: split after `.` or `;` only where a space or the end
+/// follows, so `check.py` stays whole.
+fn sentences_of(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        current.push(c);
+        if matches!(c, '.' | ';') && chars.peek().is_none_or(|next| next.is_whitespace()) {
+            out.push(current.trim().to_string());
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out.retain(|s| !s.is_empty());
+    out
+}
+
 /// What an assumption is about: its first `a::b` or `name(` symbol, by its
 /// last segment (what a call names).
 fn assumed_symbol(text: &str) -> Option<String> {
@@ -881,21 +922,18 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 /// The spec pane, whole: every file of the check, its anchors lit.
-fn spec_pane(state: &mut State, claim: Option<&Claim>, width: usize) -> Vec<Line> {
+fn spec_pane(state: &mut State, claim: Option<&Claim>, _width: usize) -> Vec<Line> {
     let mut out: Vec<Line> = Vec::new();
     let Some(loaded) = state.loaded.clone() else {
         out.push(vec![(Style::Dim, "reading the work tree…".into())]);
         return out;
     };
     if loaded.spec.is_empty() {
-        out.push(vec![(Style::Dim, "no spec yet".into())]);
-        if claim.is_some_and(|c| c.taken) {
-            out.extend(super::flow(&[(Style::Dim, "Yours: e writes its check.toml in the editor, s submits it to the harness.".to_string())], width, 0));
-        }
+        out.push(vec![(Style::Dim, if claim.is_some_and(|c| c.taken) { "no spec yet · e writes it" } else { "no spec yet" }.into())]);
         return out;
     }
     let taken = claim.is_some_and(|c| c.taken);
-    out.push(vec![(Style::Dim, if taken { "yours · e edits it, s submits it".into() } else { "read-only · t takes the claim to edit it".to_string() })]);
+    out.push(vec![(Style::Dim, if taken { "yours".into() } else { "read-only".to_string() })]);
     let step_action = state.step.and_then(|i| state.steps.get(i)).and_then(|s| s.action.clone());
     let step_def = |lines: &[String]| step_action.as_deref().and_then(|a| definition(lines, a));
     for (name, lines) in &loaded.spec {
@@ -935,6 +973,88 @@ fn spec_pane(state: &mut State, claim: Option<&Claim>, width: usize) -> Vec<Line
         }
     }
     out
+}
+
+/// The code beside the audit tree (one pane, full width): the claim's code
+/// with the check's marks in the gutter, then the check's own files. Read
+/// only; ⏎ or o opens the whole view.
+pub(super) fn preview(state: &mut State, width: usize, rows: usize) -> Vec<Line> {
+    let _ = state.poll();
+    let claim = state.claim_now();
+    let check = state.check_now();
+    let mut out: Vec<Line> = Vec::new();
+    match (&claim, &check) {
+        (Some(c), Some(k)) => {
+            let (mark, look) = match k.verdict {
+                Verdict::Fails => ("[-]", Style::Danger),
+                Verdict::Holds => ("[+]", Style::Success),
+                Verdict::Unchecked => ("[ ]", Style::Dim),
+                _ => ("[~]", Style::Dim),
+            };
+            out.push(vec![(Style::Bold, format!("{} · {}", c.id, k.slot())), (Style::Plain, format!("  {}  ", k.kind)), (look, format!("{mark} {}", k.verdict.label())), (Style::Dim, format!("  {}", k.dir))]);
+        }
+        (Some(c), None) => out.push(vec![(Style::Bold, c.id.clone()), (Style::Dim, "  no check yet".into())]),
+        _ => {}
+    }
+    // Every line clickable: a click on the code or the check puts the keys
+    // and the wheel there (and on a code line, the cursor).
+    let mut out: Vec<Line> = out.into_iter().map(|line| gui_view::pick_row(line, Click::Pick(Pick::Preview(0, usize::MAX)))).collect();
+    let has_spec = state.loaded.as_ref().is_some_and(|l| !l.spec.is_empty());
+    let code_rows = if has_spec { rows.saturating_sub(out.len()) * 3 / 5 } else { rows.saturating_sub(out.len()) };
+    let code = code_pane(state, width, code_rows);
+    let first = state.scroll[1];
+    for (i, line) in code.into_iter().take(code_rows).enumerate() {
+        let at = if i == 0 { usize::MAX } else { first + i - 1 };
+        out.push(gui_view::pick_row(line, Click::Pick(Pick::Preview(0, at))));
+    }
+    if has_spec && out.len() + 2 < rows {
+        let look = if state.pane == 2 { Style::Cursor } else { Style::Dim };
+        let spec = spec_pane(state, claim.as_ref(), width);
+        // Its own files, check.toml last: the code that states the clauses first.
+        let room = rows.saturating_sub(out.len() + 1);
+        state.scroll[2] = state.scroll[2].min(spec.len().saturating_sub(1 + room));
+        let more = spec.len().saturating_sub(1 + state.scroll[2] + room);
+        let place = match (state.scroll[2], more) {
+            (0, 0) => String::new(),
+            (0, more) => format!(" · {more} more ↓"),
+            (above, 0) => format!(" · ↑ {above} above"),
+            (above, more) => format!(" · ↑ {above} above · {more} more ↓"),
+        };
+        let head = vec![(look, format!("── check · {}{place} ", check.as_ref().map(|k| k.dir.clone()).unwrap_or_default()))];
+        out.push(gui_view::pick_row(head, Click::Pick(Pick::Preview(1, usize::MAX))));
+        for (i, line) in spec.into_iter().skip(1 + state.scroll[2]).take(room).enumerate() {
+            out.push(gui_view::pick_row(line, Click::Pick(Pick::Preview(1, state.scroll[2] + i))));
+        }
+    }
+    out.into_iter().map(|line| fit(&line, width)).collect()
+}
+
+/// The code beside the audit tab's tree, scrolled `by` lines: the code
+/// (its cursor and the view together, so the view moves at once) or the
+/// check, whichever has the keys (`pane` 1 or 2).
+pub(super) fn preview_scroll(state: &mut State, by: isize) {
+    if state.pane == 2 {
+        state.scroll[2] = (state.scroll[2] as isize + by).max(0) as usize;
+        return;
+    }
+    let last = state.lines().len().saturating_sub(1) as isize;
+    state.scroll[1] = (state.scroll[1] as isize + by).clamp(0, last) as usize;
+    state.cursor = (state.cursor as isize + by).clamp(0, last) as usize;
+}
+
+/// The code's cursor moved `by` lines (the view follows it), or the check
+/// scrolled.
+pub(super) fn preview_move(state: &mut State, by: isize) {
+    if state.pane == 2 {
+        preview_scroll(state, by);
+    } else {
+        scroll(state, by);
+    }
+}
+
+/// Whether the code beside the tree has a check under it to scroll.
+pub(super) fn preview_has_check(state: &State) -> bool {
+    state.loaded.as_ref().is_some_and(|l| !l.spec.is_empty())
 }
 
 pub(super) fn body(tab: &mut Open, width: usize, rows: usize) -> (Vec<Line>, Footer) {
@@ -1003,7 +1123,7 @@ pub(super) fn body(tab: &mut Open, width: usize, rows: usize) -> (Vec<Line>, Foo
     if state.pane == 1 {
         hints.push(("⏎", "definition"));
         if !state.back.is_empty() {
-            hints.push(("^o", "back"));
+            hints.push(("^o", "jump back"));
         }
         if state.loaded.as_ref().is_some_and(|l| l.files.len() > 1) {
             hints.push(("f", "next file"));
@@ -1206,8 +1326,11 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent) -> bool {
         }
         KeyCode::Char('e') if claim.as_ref().is_some_and(|c| c.taken) => {
             let c = claim.clone().expect("claim");
-            if let Some(audit) = audit::store().and_then(|s| s.audit(&state.audit).ok().flatten()) {
-                let path = state.loaded.as_ref().and_then(|l| l.spec.iter().find(|(n, _)| n == "check.toml").or(l.spec.first())).map(|(n, _)| format!("checks/{}/{n}", c.id)).unwrap_or_else(|| format!("checks/{}/check.toml", c.id));
+            if let Some((audit, store)) = audit::store().and_then(|s| s.audit(&state.audit).ok().flatten().map(|a| (a, s))) {
+                let all = store.checks(&state.audit, &c.id).unwrap_or_default();
+                let slot = state.check_now().map_or_else(|| "k1".to_string(), |k| k.slot().to_string());
+                let dir = audit::check_dir(&c.id, &slot, &all);
+                let path = state.loaded.as_ref().and_then(|l| l.spec.iter().find(|(n, _)| n == "check.toml").or(l.spec.first())).map(|(n, _)| format!("{dir}/{n}")).unwrap_or_else(|| format!("{dir}/check.toml"));
                 let text = state
                     .loaded
                     .as_ref()
@@ -1215,7 +1338,7 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent) -> bool {
                     .map(|(_, lines)| lines.join("\n") + "\n")
                     .unwrap_or_else(|| format!("claim   = \"{}\"\nlang    = \"\"\nkind    = \"test\"\nrun     = \"\"\ntimeout = 600\ntargets = []\n", c.id));
                 if !cfg!(test) {
-                    let _ = crate::vm::netboxes::machine(&format!("mkdir -p {}", crate::util::shell_quote(&format!("{}/checks/{}", audit.work, c.id))), 20);
+                    let _ = crate::vm::netboxes::machine(&format!("mkdir -p {}", crate::util::shell_quote(&format!("{}/{dir}", audit.work))), 20);
                 }
                 super::editor_view::open(&audit.work, &path, &text, None);
                 let _ = super::go_to(tab, super::Target::View(super::View::Edit));
@@ -1224,7 +1347,9 @@ pub(super) fn key(tab: &mut Open, key: &KeyEvent) -> bool {
         }
         KeyCode::Char('s') if claim.as_ref().is_some_and(|c| c.taken) => {
             if let (Some(c), Some(store)) = (&claim, audit::store()) {
-                said = Some(crate::audit::run::submit_check(&store, &state.audit, &c.id, &format!("checks/{}", c.id), "operator"));
+                let all = store.checks(&state.audit, &c.id).unwrap_or_default();
+                let slot = state.check_now().map_or_else(|| "k1".to_string(), |k| k.slot().to_string());
+                said = Some(crate::audit::run::submit_check(&store, &state.audit, &c.id, &audit::check_dir(&c.id, &slot, &all), "operator", Some(&slot)));
             }
         }
         _ => {}
@@ -1252,6 +1377,9 @@ pub(super) fn pick_line(tab: &mut Open, line: usize) {
     if let Some(state) = tab.audit.view.as_mut() {
         state.cursor = line;
         state.pane = 1;
+    } else {
+        // The code beside the audit tab's tree.
+        super::audit_view::pick_preview(tab, 0, line);
     }
 }
 
@@ -1264,6 +1392,15 @@ pub(super) fn wheel(tab: &mut Open, up: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_back_translation_reads_as_sentences_with_its_reading_apart() {
+        assert_eq!(sentences_of("It runs check.py once. It covers [1]; not [2]."), vec!["It runs check.py once.", "It covers [1];", "not [2]."]);
+        let (read, said) = super::super::audit_tree::read_back("[~] partial review: check.py was not confirmed read\nIt checks one pair.");
+        assert_eq!((read.map(|(whole, _)| whole), said.as_str()), (Some(false), "It checks one pair."));
+        let (read, said) = super::super::audit_tree::read_back("It checks one pair.\n[+] read whole: 1 file, each to its last line");
+        assert_eq!((read.map(|(whole, _)| whole), said.as_str()), (Some(true), "It checks one pair."));
+    }
 
     #[test]
     fn a_tlc_trace_becomes_steps_with_what_changed() {
